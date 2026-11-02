@@ -1,0 +1,97 @@
+# Local test profile for a kind cluster on Docker Desktop. Use with values.yaml:
+#
+#   kind create cluster --name kg-test
+#   docker build -t kg-pipeline:0.2.4 --build-arg WITH_JAVA=0 --build-arg WITH_DOTNET=0 pipeline/
+#   docker build -t kg-mcp:0.2.0 mcp/
+#   kind load docker-image kg-pipeline:0.2.4 kg-mcp:0.2.0 --name kg-test
+#   helm install kg deploy/helm/knowledge-graph -n kg --create-namespace -f deploy/helm/knowledge-graph/values-kind.yaml
+#
+# Embeddings and the LLM run in Ollama on the host (host.docker.internal), not in the cluster:
+# TEI on CPU inside Docker Desktop can stall the VM. Docling is off (large image); Markdown
+# documents still work. Requests total about 2 vCPU / 4 GiB.
+
+neo4j:
+  heapSize: 1G
+  pageCacheSize: 512M
+  persistence:
+    size: 5Gi
+  resources:
+    requests: { cpu: 250m, memory: 2Gi }
+    limits: { memory: 3Gi }
+
+postgres:
+  persistence:
+    size: 2Gi
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 1Gi }
+
+docling:
+  enabled: false
+
+models:
+  selfHosted: false
+  provider: openai
+  externalUrl: http://host.docker.internal:11434
+  embeddings:
+    model: qwen3-embedding:0.6b
+    dimensions: 1024
+
+llm:
+  enabled: false          # roles and entities only; set true to call qwen3.6 on the host (slow on CPU)
+  provider: ollama
+  baseUrl: http://host.docker.internal:11434
+
+archive:
+  size: 2Gi
+
+sources:
+  git:
+    repositories:
+      - https://github.com/pallets/itsdangerous.git
+
+mcp:
+  enabled: true
+  image: kg-mcp:0.2.0
+  aclGroups: "*"
+  defaultRepo: itsdangerous
+
+dagster:
+  dagsterWebserver:
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits: { memory: 1Gi }
+  dagsterDaemon:
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits: { memory: 1Gi }
+  runLauncher:
+    config:
+      k8sRunLauncher:
+        imagePullPolicy: IfNotPresent
+        resources:
+          requests: { cpu: 250m, memory: 512Mi }
+          limits: { memory: 3Gi }
+  dagster-user-deployments:
+    deployments:
+      - name: kg-pipeline
+        image:
+          repository: kg-pipeline
+          tag: 0.2.4
+          pullPolicy: IfNotPresent
+        dagsterApiGrpcArgs: ["--module-name", "kg_pipeline.definitions"]
+        port: 3030
+        includeConfigInLaunchedRuns:
+          enabled: true
+        envConfigMaps:
+          - name: kg-endpoints
+        envSecrets:
+          - name: kg-credentials
+          - name: kg-source-credentials
+        volumes:
+          - name: source-archive
+            persistentVolumeClaim:
+              claimName: kg-source-archive
+        volumeMounts:
+          - name: source-archive
+            mountPath: /archive

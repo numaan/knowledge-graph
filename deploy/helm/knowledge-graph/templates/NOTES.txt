@@ -1,0 +1,24 @@
+{{- $name := include "kg.name" . -}}
+Knowledge graph platform installed in namespace {{ .Release.Namespace }}.
+
+Graph backend: {{ .Values.graph.backend }}
+
+Dagster UI:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ if contains "dagster" .Release.Name }}{{ .Release.Name }}{{ else }}{{ .Release.Name }}-dagster{{ end }}-webserver 8080:80
+  open http://localhost:8080
+{{- if eq .Values.graph.backend "neo4j" }}
+
+Neo4j Browser:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $name }}-neo4j 7474:7474 7687:7687
+  open http://localhost:7474  (user: neo4j)
+{{- end }}
+
+Passwords (generated once, kept across upgrades):
+  kubectl -n {{ .Release.Namespace }} get secret {{ $name }}-credentials -o jsonpath='{.data.POSTGRES_PASSWORD}' | base64 -d
+  kubectl -n {{ .Release.Namespace }} get secret {{ $name }}-credentials -o jsonpath='{.data.NEO4J_PASSWORD}' | base64 -d
+
+Service addresses for your pipeline and MCP images are in ConfigMap {{ $name }}-endpoints.
+{{- if not .Values.mcp.enabled }}
+
+The MCP server is disabled. Set mcp.enabled=true and mcp.image to deploy it.
+{{- end }}

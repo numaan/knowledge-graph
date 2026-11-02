@@ -1,0 +1,66 @@
+{{- if .Values.mcp.enabled }}
+{{- $name := include "kg.name" . -}}
+{{- $m := .Values.mcp -}}
+{{- $sel := dict "ctx" $ "component" "mcp" -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-mcp
+  labels: {{- include "kg.labels" . | nindent 4 }}
+spec:
+  selector: {{- include "kg.selector" $sel | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $m.port }}
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}-mcp
+  labels: {{- include "kg.labels" . | nindent 4 }}
+spec:
+  replicas: {{ $m.replicas }}
+  selector:
+    matchLabels: {{- include "kg.selector" $sel | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "kg.selector" $sel | nindent 8 }}
+    spec:
+      containers:
+        - name: mcp
+          image: {{ required "mcp.image is required when mcp.enabled=true" $m.image }}
+          envFrom:
+            - configMapRef:
+                name: {{ $name }}-endpoints
+            - secretRef:
+                name: {{ $name }}-credentials
+            - secretRef:
+                name: {{ $name }}-source-credentials
+          env:
+            - name: MCP_HTTP_ADDR
+              value: {{ printf ":%v" $m.port | quote }}
+            - name: KG_ACL_GROUPS
+              value: {{ $m.aclGroups | quote }}
+            {{- with $m.defaultRepo }}
+            - name: KG_DEFAULT_REPO
+              value: {{ . | quote }}
+            {{- end }}
+            {{- range $k, $v := $m.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ $m.port }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 30
+          resources: {{- toYaml $m.resources | nindent 12 }}
+{{- end }}

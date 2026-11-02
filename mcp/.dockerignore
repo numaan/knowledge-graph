@@ -1,0 +1,3 @@
+*.exe
+kg-mcp
+*_test.go

@@ -1,0 +1,207 @@
+# Prefix for every resource this chart creates. The Dagster values below
+# refer to "kg-postgres", "kg-credentials", etc. If you change the prefix,
+# change those references too.
+namePrefix: kg
+
+# StorageClass for all PVCs created by this chart ("" = cluster default).
+storageClass: ""
+
+# Graph store: "neo4j" (default) or "age" (PostgreSQL + Apache AGE).
+# With "age", the Neo4j StatefulSet is not deployed.
+graph:
+  backend: neo4j
+
+# ---------------------------------------------------------------------------
+# PostgreSQL: Dagster storage, pipeline metadata (checkpoints, queue,
+# permissions, publication state) and, with graph.backend=age, the graph.
+# ---------------------------------------------------------------------------
+postgres:
+  image: postgres:17.11-bookworm
+  user: kg
+  database: knowledge
+  # Leave empty to generate a random password (kept across upgrades).
+  password: ""
+  extensions:
+    # Create the "vector" and "age" extensions in the knowledge database.
+    enabled: true
+    # Install the extensions with apt-get at container start. This needs
+    # egress to apt.postgresql.org. For production, build
+    # images/postgres-age-pgvector/Dockerfile, set postgres.image to it and
+    # set install to false.
+    install: true
+    packages:
+      - postgresql-17-age=1.7.0~rc0-1.pgdg12+1
+      - postgresql-17-pgvector=0.8.7-1.pgdg12+1
+  persistence:
+    size: 50Gi
+  resources:
+    requests: { cpu: "1", memory: 2Gi }
+    limits: { memory: 4Gi }
+
+# ---------------------------------------------------------------------------
+# Neo4j Community: graph + vector + full-text indexes.
+# Community has no RBAC: keep it internal and let the MCP server apply
+# Jira/Confluence permission filters.
+# ---------------------------------------------------------------------------
+neo4j:
+  image: neo4j:2026.10.1-community
+  # Leave empty to generate a random password (kept across upgrades).
+  password: ""
+  plugins: '["apoc"]'
+  # Sized for about 10 million relationships. Measure and adjust.
+  heapSize: 4G
+  pageCacheSize: 4G
+  persistence:
+    size: 100Gi
+  resources:
+    requests: { cpu: "2", memory: 9Gi }
+    limits: { memory: 10Gi }
+
+# ---------------------------------------------------------------------------
+# Docling Serve: PDF / DOCX / PPTX / HTML to structured JSON.
+# ---------------------------------------------------------------------------
+docling:
+  enabled: true
+  image: quay.io/docling-project/docling-serve:v1.38.2
+  replicas: 1
+  env: {}
+  resources:
+    requests: { cpu: "1", memory: 2Gi }
+    limits: { memory: 6Gi }
+
+# ---------------------------------------------------------------------------
+# Embeddings and reranker.
+# selfHosted=true runs Hugging Face Text Embeddings Inference (CPU).
+# selfHosted=false deploys nothing; set provider and put the API key in
+# sources.credentials (for example VOYAGE_API_KEY).
+# ---------------------------------------------------------------------------
+models:
+  selfHosted: true
+  provider: voyage # used only when selfHosted=false
+  # selfHosted=false: an OpenAI-compatible /v1/embeddings endpoint, e.g. Ollama
+  # (http://ollama.ollama.svc:11434) with embeddings.model qwen3-embedding:0.6b.
+  externalUrl: ""
+  image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4
+  embeddings:
+    model: Qwen/Qwen3-Embedding-0.6B
+    dimensions: 1024
+    cacheSize: 10Gi
+    resources:
+      requests: { cpu: "2", memory: 4Gi }
+      limits: { memory: 8Gi }
+  reranker:
+    enabled: true
+    model: BAAI/bge-reranker-v2-m3
+    cacheSize: 10Gi
+    resources:
+      requests: { cpu: "2", memory: 4Gi }
+      limits: { memory: 8Gi }
+
+# ---------------------------------------------------------------------------
+# LLM for domain extraction and requirement checks. The chart does not run
+# the LLM: point it at Ollama, vLLM or any OpenAI-compatible endpoint. Put an
+# API key in sources.credentials.LLM_API_KEY when the endpoint needs one.
+# enabled=false extracts roles and entities only (no LLM calls).
+# ---------------------------------------------------------------------------
+llm:
+  enabled: true
+  provider: ollama        # ollama | openai (any OpenAI-compatible API)
+  baseUrl: http://ollama.ollama.svc:11434
+  model: qwen3.6:35b-a3b
+  contextTokens: 16384
+
+# ---------------------------------------------------------------------------
+# Source archive: raw snapshots of every ingested item, for replay and audit.
+# Use a ReadWriteMany StorageClass when Dagster run pods can land on
+# different nodes. Move to SeaweedFS (S3) when the archive outgrows a PVC.
+# ---------------------------------------------------------------------------
+archive:
+  size: 100Gi
+  accessMode: ReadWriteOnce
+  mountPath: /archive
+
+# ---------------------------------------------------------------------------
+# Source systems. Non-secret settings go to the kg-endpoints ConfigMap.
+# credentials go to the kg-source-credentials Secret. Set createSecret=false
+# to manage that Secret yourself (same name, same keys).
+# ---------------------------------------------------------------------------
+sources:
+  jira:
+    baseUrl: ""   # https://your-org.atlassian.net
+    projects: []  # project keys, e.g. [PREC, OPS]
+    acceptanceField: ""  # custom field with acceptance criteria, e.g. customfield_10042
+  confluence:
+    baseUrl: ""   # https://your-org.atlassian.net (site root, without /wiki)
+    spaces: []    # space keys, e.g. [ENG]
+  git:
+    repositories: [] # list of clone URLs
+  createSecret: true
+  credentials: {}
+  #  ATLASSIAN_EMAIL: bot@example.com
+  #  ATLASSIAN_API_TOKEN: ...
+  #  GIT_TOKEN: ...
+  #  VOYAGE_API_KEY: ...
+  #  ANTHROPIC_API_KEY: ...
+
+# ---------------------------------------------------------------------------
+# Agent-facing MCP server (your image). Disabled until you have an image.
+# ---------------------------------------------------------------------------
+mcp:
+  enabled: false
+  image: ""      # registry/kg-mcp:0.1.0, built from mcp/Dockerfile (Go, read-only, ~15 MB)
+  replicas: 1
+  port: 8000
+  # ACL groups this server sees: "*" for all, or e.g. "repo:precept,jira:PREC,confluence:ENG".
+  # Run one release per audience; read_cypher is off unless the value is "*".
+  aclGroups: "*"
+  defaultRepo: ""
+  env: {}
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { memory: 256Mi }
+
+# ---------------------------------------------------------------------------
+# Dagster (official chart). Uses the PostgreSQL above, not its own.
+# ---------------------------------------------------------------------------
+global:
+  postgresqlSecretName: kg-dagster-postgresql
+
+dagster:
+  enabled: true
+  generatePostgresqlPasswordSecret: false
+  postgresql:
+    enabled: false
+    postgresqlHost: kg-postgres
+    postgresqlUsername: kg
+    postgresqlDatabase: dagster
+    service:
+      port: 5432
+  dagster-user-deployments:
+    enabled: true
+    deployments:
+      # Replace the image with the kg-pipeline image (pipeline/Dockerfile):
+      #   image: { repository: <registry>/kg-pipeline, tag: 0.1.0 }
+      #   dagsterApiGrpcArgs: ["--module-name", "kg_pipeline.definitions"]
+      - name: kg-pipeline
+        image:
+          repository: docker.io/dagster/user-code-example
+          tag: 1.13.28
+          pullPolicy: IfNotPresent
+        dagsterApiGrpcArgs:
+          - "--python-file"
+          - "/example_project/example_repo/repo.py"
+        port: 3030
+        includeConfigInLaunchedRuns:
+          enabled: true
+        envConfigMaps:
+          - name: kg-endpoints
+        envSecrets:
+          - name: kg-credentials
+          - name: kg-source-credentials
+        volumes:
+          - name: source-archive
+            persistentVolumeClaim:
+              claimName: kg-source-archive
+        volumeMounts:
+          - name: source-archive
+            mountPath: /archive

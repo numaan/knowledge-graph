@@ -1,0 +1,4 @@
+[
+  {"id": "10100", "name": "1.4.0", "released": true, "releaseDate": "2026-09-30", "description": "Scenario builder"},
+  {"id": "10101", "name": "1.5.0", "released": false}
+]

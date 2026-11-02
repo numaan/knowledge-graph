@@ -1,0 +1,80 @@
+{{- if .Values.models.selfHosted }}
+{{- $name := include "kg.name" . -}}
+{{- $servers := list (dict "component" "embeddings" "cfg" .Values.models.embeddings) -}}
+{{- if .Values.models.reranker.enabled }}
+{{- $servers = append $servers (dict "component" "reranker" "cfg" .Values.models.reranker) -}}
+{{- end }}
+{{- range $servers }}
+{{- $sel := dict "ctx" $ "component" .component }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}-{{ .component }}-cache
+  labels: {{- include "kg.labels" $ | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- include "kg.storageClass" $ | nindent 2 }}
+  resources:
+    requests:
+      storage: {{ .cfg.cacheSize }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-{{ .component }}
+  labels: {{- include "kg.labels" $ | nindent 4 }}
+spec:
+  selector: {{- include "kg.selector" $sel | nindent 4 }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}-{{ .component }}
+  labels: {{- include "kg.labels" $ | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # the model cache PVC is ReadWriteOnce
+  selector:
+    matchLabels: {{- include "kg.selector" $sel | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "kg.selector" $sel | nindent 8 }}
+    spec:
+      containers:
+        - name: tei
+          image: {{ $.Values.models.image }}
+          args: ["--model-id", {{ .cfg.model | quote }}, "--port", "8080"]
+          env:
+            - name: HUGGINGFACE_HUB_CACHE
+              value: /data
+          ports:
+            - name: http
+              containerPort: 8080
+          # The first start downloads the model.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 90
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+          resources: {{- toYaml .cfg.resources | nindent 12 }}
+          volumeMounts:
+            - name: cache
+              mountPath: /data
+      volumes:
+        - name: cache
+          persistentVolumeClaim:
+            claimName: {{ $name }}-{{ .component }}-cache
+{{- end }}
+{{- end }}

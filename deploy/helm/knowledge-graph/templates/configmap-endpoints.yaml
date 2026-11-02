@@ -1,0 +1,51 @@
+{{- $name := include "kg.name" . -}}
+# Service addresses for the pipeline and the MCP server (envFrom).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-endpoints
+  labels: {{- include "kg.labels" . | nindent 4 }}
+data:
+  GRAPH_BACKEND: {{ .Values.graph.backend | quote }}
+  POSTGRES_HOST: {{ $name }}-postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: {{ .Values.postgres.user | quote }}
+  POSTGRES_DB: {{ .Values.postgres.database | quote }}
+  {{- if eq .Values.graph.backend "neo4j" }}
+  NEO4J_URI: bolt://{{ $name }}-neo4j:7687
+  NEO4J_USER: neo4j
+  {{- else }}
+  AGE_GRAPH: kg
+  {{- end }}
+  {{- if .Values.docling.enabled }}
+  DOCLING_URL: http://{{ $name }}-docling:5001
+  {{- end }}
+  {{- if .Values.models.selfHosted }}
+  EMBEDDINGS_PROVIDER: tei
+  EMBEDDINGS_URL: http://{{ $name }}-embeddings:8080
+  {{- if .Values.models.reranker.enabled }}
+  RERANKER_URL: http://{{ $name }}-reranker:8080
+  RERANKER_MODEL: {{ .Values.models.reranker.model | quote }}
+  {{- end }}
+  {{- else }}
+  EMBEDDINGS_PROVIDER: {{ .Values.models.provider | quote }}
+  {{- with .Values.models.externalUrl }}
+  EMBEDDINGS_URL: {{ . | quote }}
+  {{- end }}
+  {{- end }}
+  EMBEDDINGS_MODEL: {{ .Values.models.embeddings.model | quote }}
+  EMBEDDINGS_DIMENSIONS: {{ .Values.models.embeddings.dimensions | quote }}
+  DOMAIN_LLM: {{ ternary "on" "off" .Values.llm.enabled | quote }}
+  LLM_PROVIDER: {{ .Values.llm.provider | quote }}
+  LLM_BASE_URL: {{ .Values.llm.baseUrl | quote }}
+  LLM_MODEL: {{ .Values.llm.model | quote }}
+  LLM_CONTEXT_TOKENS: {{ .Values.llm.contextTokens | quote }}
+  SOURCE_ARCHIVE_PATH: {{ .Values.archive.mountPath | quote }}
+  JIRA_BASE_URL: {{ .Values.sources.jira.baseUrl | quote }}
+  JIRA_PROJECTS: {{ join "," .Values.sources.jira.projects | quote }}
+  {{- with .Values.sources.jira.acceptanceField }}
+  JIRA_ACCEPTANCE_FIELD: {{ . | quote }}
+  {{- end }}
+  CONFLUENCE_BASE_URL: {{ .Values.sources.confluence.baseUrl | quote }}
+  CONFLUENCE_SPACES: {{ join "," .Values.sources.confluence.spaces | quote }}
+  GIT_REPOSITORIES: {{ join "," .Values.sources.git.repositories | quote }}

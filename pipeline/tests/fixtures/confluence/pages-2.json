@@ -1,0 +1,5 @@
+{"results": [
+  {"id": "2", "title": "Runbook: failed scenario run", "parentId": "1", "version": {"number": 1},
+   "_links": {"webui": "/spaces/KGT/pages/2"},
+   "body": {"storage": {"value": "<p>When a scenario run fails, check the simulation logs and retry with a shorter duration.</p><ac:structured-macro ac:name=\"code\"><ac:plain-text-body><![CDATA[kubectl logs deploy/simulator]]></ac:plain-text-body></ac:structured-macro>"}}}
+ ]}

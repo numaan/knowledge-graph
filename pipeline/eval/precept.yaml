@@ -1,0 +1,94 @@
+# Evaluation set for the precept repository.
+#
+# search:       a question and the symbols (qualified name, short name or path suffix) that a good
+#               answer must contain. The case passes when one of them is in the top k results.
+# impact:       a symbol and symbols that must be among its affected code within `depth` hops.
+# requirements: expected verdicts of checked requirements (from the last kg-verify run).
+#
+# Write questions the way a developer asks them, not with the names in the code.
+repo: precept
+k: 8
+
+search:
+  - q: how does a user sign in with email and password
+    expect: [login, authStore.ts]
+  - q: sign the current user out and end the session
+    expect: [logout]
+  - q: change my own profile name
+    expect: [update_me]
+  - q: accept an invitation link to join an organisation
+    expect: [accept_invitation, get_invitation_public]
+  - q: invite many people to an org at once
+    expect: [bulk_invite, UsersView.onBulkInvite]
+  - q: send an invitation email again
+    expect: [resend_invitation]
+  - q: cancel a pending invitation
+    expect: [revoke_invitation]
+  - q: change the role of a member in an organisation
+    expect: [set_member_role]
+  - q: who did what in the organisation, audit trail
+    expect: [list_audit]
+  - q: suspend a user account and later reactivate it
+    expect: [suspend_user, reactivate_user]
+  - q: export all data of a user (GDPR)
+    expect: [export_user]
+  - q: soft delete a user
+    expect: [soft_delete_user]
+  - q: run a fault injection scenario against a topology
+    expect: [run_scenario]
+  - q: list the past runs of a scenario
+    expect: [list_scenario_runs]
+  - q: create or update a scenario and keep the list in sync
+    expect: [scenarioStore.ts, ScenariosView.onSave, create_scenario, update_scenario]
+  - q: which fault types can a scenario inject
+    expect: [scenarioToRun, targetKindOf, scenario.ts]
+  - q: stream simulation progress to the browser in real time
+    expect: [stream_simulation]
+  - q: start a simulation in the background without waiting
+    expect: [run_async]
+  - q: save a new architecture topology
+    expect: [create_topology]
+  - q: activate one of the configured LLM models
+    expect: [activate_model, activateModel]
+  - q: add or change an LLM provider and its credentials
+    expect: [upsert_provider, llm_providers.py, upsertProvider]
+  - q: search the knowledge base of patterns and runbooks
+    expect: [search, KnowledgeView]
+  - q: rate a knowledge article
+    expect: [set_rating]
+  - q: generate an architecture from a description with AI
+    expect: [generate_endpoint, routers/generate.py, generateModel]
+  - q: brainstorm interview that asks the user questions
+    expect: [interview_endpoint, routers/interview.py, generateInterview]
+  - q: analyse an architecture and report risks
+    expect: [analyze_endpoint, routers/analysis.py, services/analysis.py]
+  - q: run an orchestration of several scenarios
+    expect: [run_orchestration_endpoint]
+  - q: keep a history of generated architectures and clear it
+    expect: [list_history, record_history, clear_history]
+  - q: manage reference architectures
+    expect: [upsert_reference, list_references]
+  - q: define custom component types for the canvas
+    expect: [upsert_component_type, list_component_types]
+  - q: which screen is shown for each menu entry
+    expect: [App]
+
+impact:
+  - symbol: login
+    depth: 3
+    expect_any: [test_, Test]        # known miss: tests call /auth/login over HTTP, not login()
+  - symbol: ScenariosView
+    depth: 2
+    expect: [App]
+
+requirements:
+  - ref: FR-P10-03-01
+    verdict: supported
+  - ref: FR-P10-03-02
+    verdict: supported
+  - ref: FR-P10-03-06
+    verdict: supported
+  - ref: FR-P10-03-09
+    verdict: supported
+  - ref: FR-P10-03-10
+    verdict: supported

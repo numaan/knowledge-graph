@@ -1,0 +1,14 @@
+apiVersion: v2
+name: knowledge-graph
+description: >-
+  One-shot deployment of the knowledge graph platform for coding agents:
+  Dagster, PostgreSQL (AGE + pgvector), Neo4j, Docling, self-hosted
+  embeddings/reranker, source archive and the agent MCP server.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+dependencies:
+  - name: dagster
+    version: 1.13.28
+    repository: https://dagster-io.github.io/helm
+    condition: dagster.enabled

@@ -1,0 +1,55 @@
+{{- if .Values.docling.enabled }}
+{{- $name := include "kg.name" . -}}
+{{- $d := .Values.docling -}}
+{{- $sel := dict "ctx" $ "component" "docling" -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-docling
+  labels: {{- include "kg.labels" . | nindent 4 }}
+spec:
+  selector: {{- include "kg.selector" $sel | nindent 4 }}
+  ports:
+    - name: http
+      port: 5001
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}-docling
+  labels: {{- include "kg.labels" . | nindent 4 }}
+spec:
+  replicas: {{ $d.replicas }}
+  selector:
+    matchLabels: {{- include "kg.selector" $sel | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "kg.selector" $sel | nindent 8 }}
+    spec:
+      containers:
+        - name: docling
+          image: {{ $d.image }}
+          {{- with $d.env }}
+          env:
+            {{- range $k, $v := . }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: 5001
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+          resources: {{- toYaml $d.resources | nindent 12 }}
+{{- end }}

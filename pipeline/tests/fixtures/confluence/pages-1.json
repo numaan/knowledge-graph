@@ -1,0 +1,5 @@
+{"results": [
+  {"id": "1", "title": "Scenario builder ADR", "parentId": null, "version": {"number": 3, "createdAt": "2026-09-01T10:00:00Z"},
+   "_links": {"webui": "/spaces/KGT/pages/1"},
+   "body": {"storage": {"value": "<h1>Context</h1><p>Scenarios are saved through <code>scenarioStore.ts</code> and the API, not in browser storage.</p><h2>Decision</h2><ul><li>Upsert by id on save.</li><li>Newest scenarios first in the list.</li></ul>"}}}
+ ], "_links": {"next": "/wiki/api/v2/spaces/98/pages?cursor=abc&limit=100"}}

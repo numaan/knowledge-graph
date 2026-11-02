@@ -1,0 +1,64 @@
+# Small-cluster profile. Use with the default values.yaml:
+#   helm install kg . -n kg --create-namespace -f values-small.yaml
+#
+# Target: 1 node with 8 vCPU / 32 GB, or 3 nodes with 4 vCPU / 16 GB each.
+# Scope: pilot size (a few repositories, one or two Jira projects,
+# up to about 250k embedded chunks). Requests total about 6 vCPU / 15 GiB.
+
+neo4j:
+  heapSize: 2G
+  pageCacheSize: 2G
+  persistence:
+    size: 30Gi
+  resources:
+    requests: { cpu: "1", memory: 5Gi }
+    limits: { memory: 6Gi }
+
+postgres:
+  persistence:
+    size: 20Gi
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits: { memory: 2Gi }
+
+docling:
+  env:
+    # One conversion at a time keeps peak memory inside the limit.
+    DOCLING_SERVE_ENG_LOC_NUM_WORKERS: "1"
+  resources:
+    requests: { cpu: 500m, memory: 1536Mi }
+    limits: { memory: 4Gi }
+
+models:
+  embeddings:
+    cacheSize: 5Gi
+    resources:
+      requests: { cpu: "1", memory: 2Gi }
+      limits: { memory: 4Gi }
+  # The reranker is optional for a pilot. Turn it on when retrieval needs it.
+  reranker:
+    enabled: false
+
+archive:
+  size: 30Gi
+
+dagster:
+  dagsterWebserver:
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits: { memory: 1Gi }
+  dagsterDaemon:
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits: { memory: 1Gi }
+  runLauncher:
+    config:
+      k8sRunLauncher:
+        resources:
+          requests: { cpu: "1", memory: 2Gi }
+          limits: { memory: 6Gi }
+  # At most 2 pipeline runs at the same time.
+  concurrency:
+    enabled: true
+    runs:
+      maxConcurrentRuns: 2
