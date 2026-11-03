@@ -160,6 +160,25 @@ mcp:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { memory: 256Mi }
 
+# Web UI for humans (web/Dockerfile). It calls the REST layer of the MCP server (/api), so it
+# sees what mcp.aclGroups allows. Off by default.
+web:
+  enabled: false
+  image: ""      # registry/kg-web:0.1.0
+  replicas: 1
+  port: 3000
+  apiUrl: ""     # default http://<release>-mcp:<mcp.port>
+  # Optional login with Keycloak or another OIDC issuer; empty issuer = open (local mode).
+  oidc:
+    issuer: ""           # e.g. https://keycloak.example.com/realms/kg
+    clientId: kg-web
+    url: ""              # public URL of the web app, e.g. https://kg.example.com
+    existingSecret: ""   # keys OIDC_CLIENT_SECRET and AUTH_SECRET
+  env: {}
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { memory: 512Mi }
+
 # ---------------------------------------------------------------------------
 # Dagster (official chart). Uses the PostgreSQL above, not its own.
 # ---------------------------------------------------------------------------

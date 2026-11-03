@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -221,5 +223,46 @@ func TestRESTCallerNotSpoofable(t *testing.T) {
 	}
 	if b, _ := json.Marshal(res.StructuredContent); strings.Contains(string(b), "admin") {
 		t.Errorf("MCP client spoofed the caller: %s", b)
+	}
+}
+
+// Integration test: REST over the real tools and graph. Needs NEO4J_PASSWORD and an ingested repo.
+func TestRESTIntegration(t *testing.T) {
+	if os.Getenv("NEO4J_PASSWORD") == "" {
+		t.Skip("NEO4J_PASSWORD not set")
+	}
+	ctx := context.Background()
+	graph, err := NewGraph(env("NEO4J_URI", "bolt://localhost:7687"), env("NEO4J_USER", "neo4j"), os.Getenv("NEO4J_PASSWORD"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close(ctx)
+	if err := graph.Verify(ctx); err != nil {
+		t.Skip("neo4j not reachable:", err)
+	}
+	s := &Server{graph: graph, emb: NewEmbedder(env("EMBEDDINGS_URL", "http://localhost:11434"),
+		env("EMBEDDINGS_MODEL", "qwen3-embedding:0.6b"), ""), defaultRepo: env("KG_TEST_REPO", "precept"), groups: map[string]bool{"*": true}}
+	api, err := newREST(ctx, s, newMCPServer(s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer api.Close()
+	mux := http.NewServeMux()
+	api.Mount(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	code, out := do(t, "POST", srv.URL+"/api/tools/find_symbol", `{"name": "Invit*", "kind": "Class"}`)
+	rows, _ := out["results"].([]any)
+	if code != 200 || len(rows) == 0 {
+		t.Fatalf("find_symbol: %d %v", code, out)
+	}
+	id := rows[0].(map[string]any)["id"].(string)
+	code, out = do(t, "GET", srv.URL+"/api/node/"+url.PathEscape(id), "")
+	if code != 200 || out["node"].(map[string]any)["properties"].(map[string]any)["id"] != id {
+		t.Errorf("node %s: %d %v", id, code, out)
+	}
+	if code, _ = do(t, "GET", srv.URL+"/api/requirements", ""); code != 200 {
+		t.Errorf("requirements: %d", code)
 	}
 }

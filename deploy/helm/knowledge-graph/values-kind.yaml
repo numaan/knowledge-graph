@@ -3,7 +3,8 @@
 #   kind create cluster --name kg-test
 #   docker build -t kg-pipeline:0.2.4 --build-arg WITH_JAVA=0 --build-arg WITH_DOTNET=0 pipeline/
 #   docker build -t kg-mcp:0.2.0 mcp/
-#   kind load docker-image kg-pipeline:0.2.4 kg-mcp:0.2.0 --name kg-test
+#   docker build -t kg-web:0.1.0 web/
+#   kind load docker-image kg-pipeline:0.2.4 kg-mcp:0.2.0 kg-web:0.1.0 --name kg-test
 #   helm install kg deploy/helm/knowledge-graph -n kg --create-namespace -f deploy/helm/knowledge-graph/values-kind.yaml
 #
 # Embeddings and the LLM run in Ollama on the host (host.docker.internal), not in the cluster:
@@ -55,6 +56,10 @@ mcp:
   image: kg-mcp:0.2.0
   aclGroups: "*"
   defaultRepo: itsdangerous
+
+web:
+  enabled: true
+  image: kg-web:0.1.0    # kubectl -n kg port-forward svc/kg-web 3000
 
 dagster:
   dagsterWebserver:
