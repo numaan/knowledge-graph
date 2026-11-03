@@ -26,6 +26,7 @@ kg-eval = "kg_pipeline.evaluate:main"
 kg-jira = "kg_pipeline.sources.jira:main"
 kg-git-history = "kg_pipeline.sources.history:main"
 kg-docs = "kg_pipeline.sources.documents:main"
+kg-links = "kg_pipeline.code.links:main"
 
 [build-system]
 requires = ["setuptools>=69"]

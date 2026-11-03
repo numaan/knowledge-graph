@@ -15,6 +15,7 @@ from pathlib import Path
 
 import dagster as dg
 
+from .code import links
 from .code.ingest import build_graph
 from .domain.extract import extract
 from .graph.neo4j_writer import Neo4jWriter
@@ -48,6 +49,7 @@ def code_snapshot(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
         graph = build_graph(work, name, scip_mode="auto", scip_cache=ARCHIVE / "cache" / "scip")
     with _writer() as writer:
         result = writer.write_delta(graph)
+        context.log.info("links: %s", links.sync(writer, links.load_config(None)))  # HTTP calls and topics across repos
     stats = graph.stats()
     context.log.info("graph stats: %s", stats)
     return dg.MaterializeResult(metadata={

@@ -1,0 +1,13 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Invoice {
+  id      Int      @id @default(autoincrement())
+  orderId Int      @map("order_id")
+  total   Decimal
+  paid    Boolean?
+
+  @@map("invoices")
+}

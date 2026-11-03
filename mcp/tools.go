@@ -122,6 +122,7 @@ type Doc struct {
 
 func (s *Server) register(m *mcp.Server) {
 	s.registerSources(m)
+	s.registerContracts(m)
 	mcp.AddTool(m, &mcp.Tool{Name: "search_graph", Description: "Find code for a question in natural language. " +
 		"Hybrid search (vectors + full text + domain concepts) over code chunks, then graph expansion: each result has the " +
 		"symbol, its domain concepts, business rules, callers, callees, related tests and a code excerpt. Start here."},
@@ -185,7 +186,8 @@ func (s *Server) register(m *mcp.Server) {
 		})
 
 	mcp.AddTool(m, &mcp.Tool{Name: "impact_analysis", Description: "What can break if a symbol changes: every caller, " +
-		"subtype and user up to N hops, split into production code and tests, plus affected HTTP endpoints, " +
+		"subtype and user up to N hops (also HTTP callers in other repositories, HTTP tests and consumers of topics it " +
+		"publishes to), split into production code and tests, plus affected HTTP endpoints, " +
 		"linked requirements and domain concepts. Use before you edit shared code."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in ImpactIn) (*mcp.CallToolResult, Doc, error) {
 			id, err := s.resolve(ctx, in.Symbol, s.repo(in.Repo))
@@ -195,14 +197,21 @@ func (s *Server) register(m *mcp.Server) {
 			depth := clamp(in.Depth, 1, 4, 3)
 			affected, err := s.graph.Read(ctx, fmt.Sprintf(`
 				MATCH (t:Code {id: $id})
-				MATCH p = (a:Symbol)-[:CALLS|USES_TYPE|IMPLEMENTS|EXTENDS|OVERRIDES*1..%d]->(t)
+				MATCH p = (a:Symbol|File)-[:%s*1..%d]->(t)
 				WHERE $repos IS NULL OR a.repo IN $repos
 				WITH a, min(length(p)) AS distance
-				RETURN a.id AS id, a.qualname AS qualname, a.kind AS kind, a.path AS path, a.role AS role,
-				       a.http_method AS http_method, a.route AS route, distance, a.path =~ $testPath AS is_test
-				ORDER BY distance, a.path LIMIT 300`, depth), map[string]any{"id": id, "testPath": testPathRegex})
+				RETURN a.id AS id, coalesce(a.qualname, a.path) AS qualname, a.kind AS kind, a.path AS path, a.repo AS repo,
+				       CASE WHEN a.endpoint_route IS NOT NULL THEN 'endpoint' ELSE a.role END AS role,
+				       coalesce(a.http_method, a.endpoint_method) AS http_method, coalesce(a.route, a.endpoint_route) AS route,
+				       distance, a.path =~ $testPath AS is_test
+				ORDER BY distance, a.path LIMIT 300`, impactEdges, depth), map[string]any{"id": id, "testPath": testPathRegex})
 			if err != nil {
 				return nil, Doc{}, err
+			}
+			// Consumers of topics that the symbol publishes to are affected across the broker.
+			for _, sub := range s.topicSubscribers(ctx, []string{id}) {
+				sub["distance"], sub["via"] = 1, "topic:"+fmt.Sprint(sub["topic"])
+				affected = append(affected, sub)
 			}
 			code, tests, endpoints := []map[string]any{}, []map[string]any{}, []map[string]any{}
 			ids := []string{id}
@@ -232,7 +241,8 @@ func (s *Server) register(m *mcp.Server) {
 		})
 
 	mcp.AddTool(m, &mcp.Tool{Name: "find_related_tests", Description: "Tests that exercise a symbol: test code that " +
-		"calls or uses it directly or through up to 2 intermediate calls. Run these after you change the symbol."},
+		"calls or uses it directly or through up to 2 intermediate calls, including HTTP tests of the endpoints that " +
+		"reach it (TestClient, supertest, MockMvc, httptest, ...). Run these after you change the symbol."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in SymbolIn) (*mcp.CallToolResult, Rows, error) {
 			id, err := s.resolve(ctx, in.Symbol, s.repo(in.Repo))
 			if err != nil {
@@ -240,9 +250,17 @@ func (s *Server) register(m *mcp.Server) {
 			}
 			rows, err := s.graph.Read(ctx, `
 				MATCH (t:Code {id: $id})
-				MATCH p = (x:Symbol)-[:CALLS|USES_TYPE*1..3]->(t) WHERE x.path =~ $testPath
-				WITH x, min(length(p)) AS distance
-				RETURN x.id AS id, x.qualname AS test, x.path AS path, x.start_line AS line, distance
+				CALL (t) {
+				  MATCH p = (x:Symbol|File)-[:`+testEdges+`*1..3]->(t) RETURN x, length(p) AS distance, 'code' AS via
+				  UNION
+				  // tests that drive a publisher of a topic this symbol consumes
+				  MATCH (t)-[:SUBSCRIBES]->(:Topic)<-[:PUBLISHES]-(pub)
+				  MATCH p = (x:Symbol|File)-[:`+testEdges+`*1..2]->(pub) RETURN x, length(p) + 1 AS distance, 'topic' AS via
+				}
+				WITH x, distance, via WHERE x.path =~ $testPath AND ($repos IS NULL OR x.repo IN $repos)
+				WITH x, min(distance) AS distance, collect(DISTINCT via) AS via
+				RETURN x.id AS id, coalesce(x.qualname, x.path) AS test, x.path AS path, x.repo AS repo, x.start_line AS line,
+				       distance, via
 				ORDER BY distance, x.path LIMIT 50`, map[string]any{"id": id, "testPath": testPathRegex})
 			note := ""
 			if err == nil && len(rows) == 0 {
@@ -252,7 +270,8 @@ func (s *Server) register(m *mcp.Server) {
 		})
 
 	mcp.AddTool(m, &mcp.Tool{Name: "get_neighbors", Description: "Walk the graph from any node: typed edges " +
-		"(CALLS, IMPORTS, DEFINES, CONTAINS, EXTENDS, IMPLEMENTS, USES_TYPE, REALISES, IMPLEMENTED_BY, VALIDATED_BY, COVERS, ...)."},
+		"(CALLS, IMPORTS, DEFINES, CONTAINS, EXTENDS, IMPLEMENTS, USES_TYPE, REALISES, IMPLEMENTED_BY, VALIDATED_BY, COVERS, " +
+		contractDoc + ", ...)."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in NeighborsIn) (*mcp.CallToolResult, Rows, error) {
 			if err := checkEdgeTypes(in.EdgeTypes); err != nil {
 				return nil, Rows{}, err
@@ -358,8 +377,9 @@ func (s *Server) register(m *mcp.Server) {
 	mcp.AddTool(m, &mcp.Tool{Name: "read_cypher", Description: "Run a read-only Cypher query when the other tools do " +
 		"not fit. Writes and most procedures are rejected; at most 500 rows; 15 s timeout. Labels: File, Symbol " +
 		"(Class, Interface, Enum, Function, Method), Chunk, Module, Repository, DomainConcept, BusinessRule, Capability, " +
-		"Requirement. Edges: CONTAINS, DEFINES, PART_OF, IMPORTS, CALLS, USES_TYPE, EXTENDS, IMPLEMENTS, OVERRIDES, " +
-		"REALISES, IMPLEMENTED_BY, CONTRADICTED_BY, VALIDATED_BY, COVERS, USES_CONCEPT."},
+		"Requirement, ApiOperation, Schema, Table, Column, Topic. Edges: CONTAINS, DEFINES, PART_OF, IMPORTS, CALLS, " +
+		"USES_TYPE, EXTENDS, IMPLEMENTS, OVERRIDES, REALISES, IMPLEMENTED_BY, CONTRADICTED_BY, VALIDATED_BY, COVERS, " +
+		"USES_CONCEPT, " + contractDoc + "."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in CypherIn) (*mcp.CallToolResult, Rows, error) {
 			if !s.groups["*"] {
 				return nil, Rows{}, fmt.Errorf("read_cypher is off for scoped servers (KG_ACL_GROUPS is not *)")
