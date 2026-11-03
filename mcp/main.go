@@ -1,7 +1,7 @@
 // kg-mcp: read-only MCP server over the knowledge graph for coding agents.
 //
 //	kg-mcp                      stdio (Claude Code, Cursor, Codex)
-//	kg-mcp -http :8000          Streamable HTTP at /mcp (Kubernetes)
+//	kg-mcp -http :8000          Streamable HTTP at /mcp and REST at /api (Kubernetes)
 //
 // Environment: NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, EMBEDDINGS_URL, EMBEDDINGS_MODEL,
 // EMBEDDINGS_API_KEY, KG_DEFAULT_REPO, MCP_HTTP_ADDR (same as -http).
@@ -75,6 +75,11 @@ func main() {
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil))
+	api, err := newREST(ctx, s, server) // REST for the web UI; see rest.go
+	if err != nil {
+		log.Fatalf("rest: %v", err)
+	}
+	api.Mount(mux)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if err := graph.Verify(r.Context()); err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
