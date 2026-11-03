@@ -142,9 +142,26 @@ read the old names.
 
 ## 4. Limits
 
-- **Not measured:** the effect of the reranker on hit@k and MRR. Docker Desktop was stopped, so no
-  Neo4j with precept data was available. Run step 3 of section 3 before you turn the reranker on.
-- Not run: `TestAskIntegration` and the Helm templates (`helm` is not installed on the build machine).
+- **Reranker effect not measured yet.** Baseline without the reranker, on a local Neo4j with precept
+  (Tree-sitter only, `kg-domain --no-llm`, so 19 concepts and no LLM concepts):
+
+  | Metric | RRF only | RRF + reranker |
+  |---|---|---|
+  | Search hit@8 | 74 % | not measured |
+  | Search hit@3 | 58 % | not measured |
+  | MRR | 0.392 | not measured |
+  | Seconds per query | 2.71 | not measured |
+
+  The reranker run stopped because the Docker Desktop API failed (HTTP 500) while the TEI container
+  warmed up `bge-reranker-v2-m3` on the CPU. Run step 3 of section 3 before you turn the reranker on.
+- The TEI CPU image found no ONNX files for `bge-reranker-v2-m3` and fell back to `model.safetensors`
+  (2.2 GB). The download from Hugging Face broke twice. A resumable `curl` download into a folder and
+  `--model-id /model` worked. In a cluster, give the reranker PVC the time and space for that download.
+- `TestToolsIntegration` and `TestAskIntegration` ran against the local Neo4j and failed: the host was
+  overloaded (8 sessions, several Neo4j containers, TEI warm-up) and a one-line concept query took
+  15.5 s, above the 15 s transaction timeout of the MCP server. `domain_overview` returned no concepts
+  and `search_graph` inside `ask` was skipped. Run them again on a quiet host.
+- Not run: the Helm templates (`helm` is not installed on the build machine).
 - One real call to Ollama (`qwen3.6:35b-a3b`, `/v1/chat/completions`, `reasoning_effort: none`)
   returned a one-word router answer in 43 s with the shared server under load.
 - The reranker client speaks the TEI API only (`query`, `texts`). Cohere-style `/v1/rerank` servers need
