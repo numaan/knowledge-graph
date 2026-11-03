@@ -135,11 +135,17 @@ sources:
     spaces: []    # space keys, e.g. [ENG]
   git:
     repositories: [] # list of clone URLs
+  github:          # pull requests and reviews; token: GITHUB_TOKEN in credentials
+    repositories: [] # owner/repo or owner/repo=graph-name; empty uses the github.com URLs of git.repositories
+    apiUrl: ""       # GitHub Enterprise: https://host/api/v3
+  people:
+    aliasesFile: ""  # path of people-aliases.yaml in the run pods (explicit identity merges)
   createSecret: true
   credentials: {}
   #  ATLASSIAN_EMAIL: bot@example.com
   #  ATLASSIAN_API_TOKEN: ...
   #  GIT_TOKEN: ...
+  #  GITHUB_TOKEN: ...
   #  VOYAGE_API_KEY: ...
   #  ANTHROPIC_API_KEY: ...
 

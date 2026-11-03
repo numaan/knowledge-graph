@@ -54,9 +54,9 @@ def _concept_texts(w: Neo4jWriter, repo: str) -> list[dict]:
 
 
 def _source_texts(w: Neo4jWriter) -> list[dict]:
-    """Tickets and document sections (commits are short and found through tickets and code)."""
+    """Tickets, document sections, pull requests and reviews (commits are short and found through tickets and code)."""
     rows = w._run("""
-        MATCH (n:Source) WHERE n:Ticket OR n:Section
+        MATCH (n:Source) WHERE n:Ticket OR n:Section OR n:PullRequest OR n:Review OR n:ReviewComment
         OPTIONAL MATCH (n)-[:PART_OF]->(d:Document)
         RETURN n.id AS id, n.embedding_hash AS hash, n.key AS key, n.type AS type, n.title AS title,
                n.text AS text, d.title AS doc""").records

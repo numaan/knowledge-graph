@@ -1,0 +1,4 @@
+[
+  {"filename": "services/cart/src/store.py", "status": "modified", "additions": 12, "deletions": 3},
+  {"filename": "services/cart/src/test_store.py", "status": "added", "additions": 30, "deletions": 0}
+]

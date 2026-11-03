@@ -23,12 +23,13 @@ import os
 import re
 
 from ..graph.neo4j_writer import Neo4jWriter
+from ..people import jira_identity
 from .atlassian import Atlassian, adf_to_markdown
 
 log = logging.getLogger("kg_pipeline.jira")
 
 FIELDS = ["summary", "description", "issuetype", "status", "priority", "labels", "components", "fixVersions",
-          "parent", "issuelinks", "created", "updated", "resolutiondate", "comment", "project"]
+          "parent", "issuelinks", "created", "updated", "resolutiondate", "comment", "project", "assignee", "reporter"]
 PROJECT_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,19}$")
 TEXT_CHARS = 12_000
 COMMENTS = 10
@@ -77,6 +78,7 @@ def ticket_row(api: Atlassian, issue: dict, acceptance_field: str | None) -> dic
         "components": [c["name"] for c in f.get("components") or []],
         "created": f.get("created"), "updated": f.get("updated"), "resolved": f.get("resolutiondate"),
         "url": f"{api.base}/browse/{issue['key']}", "acl": [f"jira:{project}"], "source": "jira",
+        **jira_identity(f),  # assignee and reporter for kg-people; emails only as hashes
     }
 
 

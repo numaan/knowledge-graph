@@ -122,6 +122,7 @@ type Doc struct {
 
 func (s *Server) register(m *mcp.Server) {
 	s.registerSources(m)
+	s.registerPeople(m)
 	mcp.AddTool(m, &mcp.Tool{Name: "search_graph", Description: "Find code for a question in natural language. " +
 		"Hybrid search (vectors + full text + domain concepts) over code chunks, then graph expansion: each result has the " +
 		"symbol, its domain concepts, business rules, callers, callees, related tests and a code excerpt. Start here."},

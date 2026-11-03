@@ -201,6 +201,7 @@ def sync_confluence(w: Neo4jWriter, api: Atlassian, space_key: str) -> dict:
         doc = {"id": doc_id, "name": p["title"], "title": p["title"], "collection": f"confluence:{space_key}",
                "version": version, "url": api.base + "/wiki" + ((p.get("_links") or {}).get("webui") or ""),
                "updated": (p.get("version") or {}).get("createdAt"), "source": "confluence",
+               "author_id": p.get("authorId"), "owner_id": p.get("ownerId"),   # Atlassian account ids for kg-people
                "acl": [f"confluence:{space_key}"]}
         stats["sections"] += _write_document(w, doc, markdown)
         stats["documents"] += 1

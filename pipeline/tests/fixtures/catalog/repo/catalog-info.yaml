@@ -1,0 +1,48 @@
+apiVersion: backstage.io/v1alpha1
+kind: System
+metadata:
+  name: shop
+  description: Online shop
+spec:
+  owner: team-checkout
+---
+apiVersion: backstage.io/v1alpha1
+kind: Group
+metadata:
+  name: team-checkout
+spec:
+  type: team
+  profile:
+    displayName: Checkout team
+  parent: engineering
+  children: []
+  members: [alice]
+---
+apiVersion: backstage.io/v1alpha1
+kind: Group
+metadata:
+  name: engineering
+spec:
+  type: department
+  children: [team-checkout]
+---
+apiVersion: backstage.io/v1alpha1
+kind: User
+metadata:
+  name: alice
+  annotations:
+    github.com/user-login: alice-gh
+spec:
+  profile:
+    displayName: Alice Smith
+    email: Alice@Example.com
+  memberOf: []
+---
+apiVersion: backstage.io/v1alpha1
+kind: User
+metadata:
+  name: dave
+spec:
+  profile:
+    displayName: Dave Jones
+  memberOf: [team-checkout]

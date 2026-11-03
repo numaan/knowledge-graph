@@ -1,0 +1,6 @@
+[
+  {"number": 40, "title": "Old cleanup", "state": "closed", "draft": false, "user": {"login": "dependabot[bot]"},
+   "html_url": "https://github.com/acme/shop/pull/40", "body": "Bumps a library.",
+   "created_at": "2026-07-01T08:00:00Z", "updated_at": "2026-08-01T09:00:00Z", "closed_at": "2026-08-01T09:00:00Z",
+   "merged_at": null, "merge_commit_sha": "x40", "base": {"ref": "main"}, "head": {"ref": "deps"}, "labels": []}
+]

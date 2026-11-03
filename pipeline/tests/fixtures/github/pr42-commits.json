@@ -1,0 +1,6 @@
+[
+  {"sha": "c1a0000000000000000000000000000000000001", "author": {"login": "alice-gh"},
+   "commit": {"author": {"name": "Alice Smith", "email": "alice@example.com", "date": "2026-09-20T08:00:00Z"}, "message": "Upsert by id"}},
+  {"sha": "c1a0000000000000000000000000000000000002", "author": null,
+   "commit": {"author": {"name": "Alice Smith", "email": "alice@example.com", "date": "2026-09-21T08:00:00Z"}, "message": "Tests"}}
+]

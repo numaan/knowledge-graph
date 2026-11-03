@@ -49,3 +49,10 @@ data:
   CONFLUENCE_BASE_URL: {{ .Values.sources.confluence.baseUrl | quote }}
   CONFLUENCE_SPACES: {{ join "," .Values.sources.confluence.spaces | quote }}
   GIT_REPOSITORIES: {{ join "," .Values.sources.git.repositories | quote }}
+  GITHUB_REPOSITORIES: {{ join "," (.Values.sources.github).repositories | quote }}
+  {{- with (.Values.sources.github).apiUrl }}
+  GITHUB_API_URL: {{ . | quote }}
+  {{- end }}
+  {{- with (.Values.sources.people).aliasesFile }}
+  PEOPLE_ALIASES: {{ . | quote }}
+  {{- end }}

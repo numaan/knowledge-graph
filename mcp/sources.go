@@ -15,7 +15,7 @@ type TicketIn struct {
 }
 type KnowledgeIn struct {
 	Query string `json:"query" jsonschema:"question in natural language"`
-	Kind  string `json:"kind,omitempty" jsonschema:"Ticket, Section (documents and wiki pages) or empty for both"`
+	Kind  string `json:"kind,omitempty" jsonschema:"Ticket, Section (documents and wiki pages), PullRequest (pull requests and reviews) or empty for all"`
 	K     int    `json:"k,omitempty" jsonschema:"number of results, 1-20 (default 8)"`
 }
 type HistoryIn struct {
@@ -76,19 +76,21 @@ func (s *Server) registerSources(m *mcp.Server) {
 			return nil, Doc{Data: data}, nil
 		})
 
-	mcp.AddTool(m, &mcp.Tool{Name: "search_knowledge", Description: "Search Jira tickets and document or wiki " +
-		"sections (specifications, ADRs, runbooks) by meaning and keywords. Use it for why and what questions; " +
+	mcp.AddTool(m, &mcp.Tool{Name: "search_knowledge", Description: "Search Jira tickets, document or wiki " +
+		"sections (specifications, ADRs, runbooks) and pull requests with their reviews by meaning and keywords. Use it for why and what questions; " +
 		"use search_graph for where-in-the-code questions."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in KnowledgeIn) (*mcp.CallToolResult, Rows, error) {
-			if in.Kind != "" && in.Kind != "Ticket" && in.Kind != "Section" {
-				return nil, Rows{}, fmt.Errorf("kind must be Ticket, Section or empty")
+			if in.Kind != "" && in.Kind != "Ticket" && in.Kind != "Section" && in.Kind != "PullRequest" {
+				return nil, Rows{}, fmt.Errorf("kind must be Ticket, Section, PullRequest or empty")
 			}
 			vec, err := s.emb.Query(ctx, in.Query)
 			if err != nil {
 				return nil, Rows{}, err
 			}
 			p := map[string]any{"v": vec, "q": lucene(in.Query), "kind": in.Kind}
-			filter := `($kind = '' OR $kind IN labels(node)) AND (node:Ticket OR node:Section)`
+			// Reviews and review comments are found with their pull request (kind PullRequest).
+			filter := `($kind = '' OR $kind IN labels(node) OR ($kind = 'PullRequest' AND (node:Review OR node:ReviewComment))) AND
+				(node:Ticket OR node:Section OR node:PullRequest OR node:Review OR node:ReviewComment)`
 			byVector, err := s.graph.Read(ctx, `CALL db.index.vector.queryNodes('source_embedding', 60, $v) YIELD node, score
 				WHERE `+filter+` RETURN node.id AS id ORDER BY score DESC LIMIT 30`, p)
 			if err != nil {
@@ -99,7 +101,9 @@ func (s *Server) registerSources(m *mcp.Server) {
 			if err != nil {
 				return nil, Rows{}, err
 			}
-			fused := rrf(ids(byVector), ids(byText))
+			byReview := must(s.graph.Read(ctx, `CALL db.index.fulltext.queryNodes('review_text', $q, {limit: 60}) YIELD node, score
+				WHERE `+filter+` RETURN node.id AS id ORDER BY score DESC LIMIT 30`, p)) // no index before kg-github
+			fused := rrf(ids(byVector), ids(byText), ids(byReview))
 			fused = fused[:min(len(fused), clamp(in.K, 1, 20, 8))]
 			idList := make([]string, len(fused))
 			for i, f := range fused {
@@ -124,7 +128,7 @@ func (s *Server) registerSources(m *mcp.Server) {
 		})
 
 	mcp.AddTool(m, &mcp.Tool{Name: "get_change_history", Description: "Recent commits that changed a symbol or " +
-		"file: who, when, why (message) and the tickets they reference. Use it to understand why code is the way it is."},
+		"file: who, when, why (message and pull request description) and the tickets they reference. Use it to understand why code is the way it is."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in HistoryIn) (*mcp.CallToolResult, Rows, error) {
 			repo := s.repo(in.Repo)
 			id := ""
@@ -144,8 +148,12 @@ func (s *Server) registerSources(m *mcp.Server) {
 				MATCH (c:Commit)-[m:MODIFIES]->(t) WHERE t = x OR t = file
 				WITH c, max(CASE WHEN t = x THEN 1 ELSE 0 END) AS exact, collect(m.change)[0] AS change
 				OPTIONAL MATCH (c)-[:REFERENCES]->(k:Ticket)
+				WITH c, exact, change, collect(k.key + ': ' + k.title) AS tickets
+				OPTIONAL MATCH (pr:PullRequest)-[:CONTAINS]->(c) WHERE $repos IS NULL OR pr.repo IN $repos
 				RETURN c.sha AS sha, c.date AS date, c.author AS author, c.title AS title, left(c.text, 600) AS message,
-				       change, exact = 1 AS touched_symbol, collect(k.key + ': ' + k.title) AS tickets
+				       change, exact = 1 AS touched_symbol, tickets,
+				       collect(pr.key + ': ' + pr.title + ' (' + coalesce(pr.url, '') + ')' + coalesce('
+' + left(pr.text, 400), '')) AS pull_requests
 				ORDER BY date DESC LIMIT $limit`, map[string]any{"id": id, "limit": clamp(in.Limit, 1, 50, 15)})
 			note := ""
 			if err == nil && len(rows) == 0 {

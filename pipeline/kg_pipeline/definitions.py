@@ -8,6 +8,7 @@ NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, LLM_PROVIDER, LLM_BASE_URL, LLM_MODEL, EM
 EMBEDDINGS_MODEL, EMBEDDINGS_DIMENSIONS. Set DOMAIN_LLM=off to extract roles and entities only.
 Jira: JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECTS (comma-separated keys).
 Confluence: CONFLUENCE_BASE_URL, CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN, CONFLUENCE_SPACES.
+GitHub, catalog and people: see people_assets.py (github_prs, service_catalog, people).
 """
 
 import os
@@ -19,6 +20,7 @@ from .code.ingest import build_graph
 from .domain.extract import extract
 from .graph.neo4j_writer import Neo4jWriter
 from .models import LLM, Embedder
+from .people_assets import github_prs, people_asset, service_catalog_asset
 from .sources import documents, git, history, jira
 from .sources.atlassian import Atlassian
 from .vectors import embed_repo, embed_sources
@@ -113,7 +115,7 @@ def confluence_pages(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     return dg.MaterializeResult(metadata={"spaces": dg.MetadataValue.json(out)})
 
 
-@dg.asset(deps=[jira_issues, confluence_pages], kinds={"neo4j"}, group_name="sources")
+@dg.asset(deps=[jira_issues, confluence_pages, github_prs], kinds={"neo4j"}, group_name="sources")
 def source_vectors(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Embeddings for changed tickets and document sections."""
     with _writer() as w:
@@ -121,8 +123,11 @@ def source_vectors(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     return dg.MaterializeResult(metadata={"sources": dg.MetadataValue.json(stats["sources"])})
 
 
-CODE = [code_snapshot, git_history, domain_model, vector_index]
-SOURCES = [jira_issues, confluence_pages, source_vectors]
+service_catalog = service_catalog_asset(repo_partitions, code_snapshot, REPOS, BRANCH, ARCHIVE)
+people = people_asset([git_history, jira_issues, confluence_pages, github_prs, service_catalog])
+
+CODE = [code_snapshot, git_history, domain_model, vector_index, service_catalog]
+SOURCES = [jira_issues, confluence_pages, github_prs, source_vectors, people]
 
 
 # Incremental runs are cheap (only changes are written), so code runs every hour, sources every 15 minutes.

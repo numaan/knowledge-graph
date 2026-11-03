@@ -1,0 +1,5 @@
+# Default owners
+*                         @acme/platform
+/services/cart/           @acme/team-checkout   # cart
+/services/payments/       @carol dave@example.com
+*.md                      @acme/docs
