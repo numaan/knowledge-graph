@@ -11,6 +11,8 @@ import time
 import urllib.error
 import urllib.request
 
+from .privacy import mask
+
 # Qwen3-Embedding is trained with an instruction on the query side only.
 QUERY_INSTRUCTION = "Instruct: Given a question about a software system, retrieve relevant code and domain concepts\nQuery: "
 
@@ -42,8 +44,8 @@ class LLM:
         return f"{self.provider}:{self.model}"
 
     def json(self, system: str, user: str, schema: dict) -> dict:
-        """One chat call that must return JSON matching schema."""
-        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        """One chat call that must return JSON matching schema. Secrets and PII are masked first (KG_PII_MODE)."""
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": mask(user)}]
         if self.provider == "ollama":
             r = _post(f"{self.base}/api/chat", {
                 "model": self.model, "messages": messages, "stream": False, "think": False,

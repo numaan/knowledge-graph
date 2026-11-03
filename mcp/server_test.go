@@ -240,3 +240,24 @@ func TestACLIntegration(t *testing.T) {
 		t.Error("read_cypher must be off for a scoped server")
 	}
 }
+
+func TestCollapseDuplicates(t *testing.T) {
+	rows := []map[string]any{
+		{"id": "doc:a#s0", "canonical": "confluence:X:1#s0", "title": "A", "url": "file:///a"},
+		{"id": "jira:X-1", "canonical": "jira:X-1", "title": "T"},
+		{"id": "confluence:X:1#s0", "canonical": "confluence:X:1#s0", "title": "C", "url": "https://c"},
+		{"id": "doc:b#s0", "title": "B"},
+		{"id": "doc:c#s0", "canonical": "doc:c#s0", "title": "C2"},
+	}
+	got := collapseDuplicates(rows, 3)
+	if len(got) != 3 || got[0]["id"] != "doc:a#s0" || got[1]["id"] != "jira:X-1" || got[2]["id"] != "doc:b#s0" {
+		t.Fatalf("wrong rows: %+v", got)
+	}
+	also, _ := got[0]["also_in"].([]map[string]any)
+	if len(also) != 1 || also[0]["id"] != "confluence:X:1#s0" || also[0]["url"] != "https://c" {
+		t.Fatalf("copy not listed: %+v", got[0])
+	}
+	if _, ok := got[0]["canonical"]; ok {
+		t.Fatal("canonical must not be returned")
+	}
+}

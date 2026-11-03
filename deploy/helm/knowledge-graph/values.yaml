@@ -135,6 +135,11 @@ sources:
     spaces: []    # space keys, e.g. [ENG]
   git:
     repositories: [] # list of clone URLs
+  # Data trust: secret and PII masking before graph writes, embeddings and LLM calls (mask | off),
+  # and extra allow-list entries (literal values or re:<regex>), e.g. [ci@your-org.com]
+  privacy:
+    mode: mask
+    allow: []
   createSecret: true
   credentials: {}
   #  ATLASSIAN_EMAIL: bot@example.com

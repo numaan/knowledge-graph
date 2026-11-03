@@ -13,6 +13,10 @@ from typing import Callable
 Fetch = Callable[[str], dict]   # url -> JSON; tests pass a fake
 
 
+class NotFound(RuntimeError):
+    """HTTP 404 or 410: the item was deleted or is not visible to the account."""
+
+
 class Atlassian:
     """Basic auth with an account email and API token (env), retries on 429/5xx with Retry-After."""
 
@@ -33,6 +37,8 @@ class Atlassian:
                 with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=120) as resp:
                     return json.load(resp)
             except urllib.error.HTTPError as e:
+                if e.code in (404, 410):
+                    raise NotFound(f"GET {url.split('?')[0]} failed: HTTP {e.code}") from e
                 if e.code not in (429, 500, 502, 503, 504) or attempt == retries - 1:
                     raise RuntimeError(f"GET {url.split('?')[0]} failed: HTTP {e.code}") from e
                 time.sleep(float(e.headers.get("Retry-After") or 2 ** attempt))

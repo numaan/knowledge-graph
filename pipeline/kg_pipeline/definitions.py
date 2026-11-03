@@ -135,4 +135,6 @@ def hourly_code(context: dg.ScheduleEvaluationContext):
 sources_every_15_min = dg.ScheduleDefinition(name="sources_every_15_min", target=SOURCES, cron_schedule="*/15 * * * *",
                                              default_status=dg.DefaultScheduleStatus.STOPPED)
 
-defs = dg.Definitions(assets=CODE + SOURCES, schedules=[hourly_code, sources_every_15_min])
+from .trust_assets import TRUST, daily_reconcile  # noqa: E402  data trust: deletes, moves, duplicates
+
+defs = dg.Definitions(assets=CODE + SOURCES + TRUST, schedules=[hourly_code, sources_every_15_min, daily_reconcile])
