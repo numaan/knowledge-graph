@@ -1,5 +1,5 @@
 import { normaliseAnswer, splitCitations } from "@/lib/answer";
-import { badges, displayProps, entityHref, entityKind, entityTitle, groupNeighbors, languageOf, sourceLink } from "@/lib/entity";
+import { badges, breadcrumb, displayProps, entityHref, entityKind, entityTitle, groupNeighbors, languageOf, sourceLink } from "@/lib/entity";
 import type { Neighbor } from "@/lib/types";
 
 describe("normaliseAnswer", () => {
@@ -53,6 +53,10 @@ describe("entity helpers", () => {
   it("hides internal and long properties", () => {
     const rows = displayProps({ id: "x", content_hash: "h", acl: ["a"], text: "t", tags: ["a", "b"], empty: [], description: "d".repeat(200), n: 3 });
     expect(rows).toEqual([["n", "3"], ["tags", "a, b"]]);
+  });
+  it("collapses repeated breadcrumb parts", () => {
+    expect(breadcrumb("Doc > Doc > Design > Scope")).toBe("Doc > Design > Scope");
+    expect(breadcrumb("A > B > A")).toBe("A > B > A");
   });
   it("maps file extensions to languages", () => {
     expect(languageOf("a/B.java")).toBe("java");

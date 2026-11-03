@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { SearchForm } from "@/components/SearchForm";
 import { ToolError } from "@/components/ToolError";
-import { entityHref } from "@/lib/entity";
+import { breadcrumb, entityHref } from "@/lib/entity";
 import { callTool } from "@/lib/kg";
 import type { CodeHit, KnowledgeHit, Result } from "@/lib/types";
 
@@ -82,7 +82,7 @@ function KnowledgeResults({ rows }: { rows: KnowledgeHit[] }) {
       {rows.map((r) => (
         <li key={r.id} className="card result">
           <h3>
-            <Link href={entityHref(r.id)}>{r.key ? `${r.key}: ` : ""}{r.title}</Link>{" "}
+            <Link href={entityHref(r.id)}>{r.key ? `${r.key}: ` : ""}{breadcrumb(r.title)}</Link>{" "}
             <span className="badge">{r.kind === "Section" ? "Document" : r.kind}</span>
             {r.status && <> <span className="badge">{r.status}</span></>}
           </h3>
