@@ -122,6 +122,7 @@ type Doc struct {
 
 func (s *Server) register(m *mcp.Server) {
 	s.registerSources(m)
+	s.registerSummaries(m)
 	mcp.AddTool(m, &mcp.Tool{Name: "search_graph", Description: "Find code for a question in natural language. " +
 		"Hybrid search (vectors + full text + domain concepts) over code chunks, then graph expansion: each result has the " +
 		"symbol, its domain concepts, business rules, callers, callees, related tests and a code excerpt. Start here."},
@@ -160,9 +161,10 @@ func (s *Server) register(m *mcp.Server) {
 				}
 				WITH n, max(score) AS score WHERE ($repo = '' OR n.repo = $repo) AND ($repos IS NULL OR n.repo IN $repos) AND ($kind = '' OR n.kind = $kind)
 				RETURN n.id AS id, n.qualname AS qualname, n.kind AS kind, n.role AS role, n.route AS route,
-				       n.path AS path, n.start_line AS start_line, n.signature AS signature, n.repo AS repo
+				       n.path AS path, n.start_line AS start_line, n.signature AS signature, n.repo AS repo,
+				       n.stale AS stale, n.stale_reason AS stale_reason
 				ORDER BY score DESC, n.path LIMIT $limit`, p)
-			return nil, Rows{Results: rows}, err
+			return nil, Rows{Results: dropEmptyStale(rows)}, err
 		})
 
 	mcp.AddTool(m, &mcp.Tool{Name: "get_symbol_code", Description: "Full source code of one symbol (all of its chunks), " +
@@ -176,11 +178,13 @@ func (s *Server) register(m *mcp.Server) {
 				OPTIONAL MATCH (c:Chunk)-[:PART_OF]->(n) WITH n, c ORDER BY c.start_line
 				RETURN n.id AS id, n.qualname AS qualname, n.kind AS kind, n.path AS path, n.start_line AS start_line,
 				       n.end_line AS end_line, n.signature AS signature, n.annotations AS annotations, n.role AS role,
+				       n.stale AS stale, n.stale_reason AS stale_reason,
 				       left(reduce(code = '', t IN collect(c.text) | code + t + '\n'), 30000) AS code`,
 				map[string]any{"id": id})))
 			if row == nil {
 				return nil, Doc{}, fmt.Errorf("symbol %s not found", id)
 			}
+			dropEmptyStale([]map[string]any{row})
 			return nil, Doc{Data: row}, nil
 		})
 
@@ -274,7 +278,7 @@ func (s *Server) register(m *mcp.Server) {
 				WHERE $repos IS NULL OR m.repo IS NULL OR m.repo IN $repos
 				WITH m, min(length(p)) AS distance, head(collect([x IN relationships(p) | type(x)])) AS via
 				RETURN m.id AS id, labels(m) AS labels, coalesce(m.qualname, m.name, m.statement, m.title, m.path) AS name,
-				       m.path AS path, distance, via, m.acl AS acl
+				       m.path AS path, distance, via, m.acl AS acl, m.stale AS stale, m.stale_reason AS stale_reason
 				ORDER BY distance, name LIMIT $limit`, map[string]any{"id": in.NodeID, "limit": clamp(in.Limit, 1, 100, 50)})
 			out := []map[string]any{}
 			for _, r := range rows {
@@ -283,7 +287,7 @@ func (s *Server) register(m *mcp.Server) {
 					out = append(out, r)
 				}
 			}
-			return nil, Rows{Results: out}, err
+			return nil, Rows{Results: dropEmptyStale(out)}, err
 		})
 
 	mcp.AddTool(m, &mcp.Tool{Name: "trace_requirement", Description: "Trace a document requirement to code: its " +

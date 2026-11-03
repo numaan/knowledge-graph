@@ -103,8 +103,8 @@ func TestToolsIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tools.Tools) != 12 {
-		t.Errorf("want 12 tools, got %d", len(tools.Tools))
+	if len(tools.Tools) != 13 {
+		t.Errorf("want 13 tools, got %d", len(tools.Tools))
 	}
 
 	call := func(name string, args map[string]any) map[string]any {
@@ -159,6 +159,17 @@ func TestToolsIntegration(t *testing.T) {
 	}
 	if k := call("search_knowledge", map[string]any{"query": "scenario builder fault types", "kind": "Section"}); len(k["results"].([]any)) == 0 {
 		t.Log("search_knowledge: no sections (run kg-docs and kg-embed --sources)")
+	}
+
+	// summaries (skipped when kg-summaries did not run for this repository)
+	res, err = cs.CallTool(ctx, &mcp.CallToolParams{Name: "get_summary", Arguments: map[string]any{"node_id": id}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Log("get_summary: no summaries (run kg-summaries --repo " + repo + ")")
+	} else if sum := call("get_summary", map[string]any{"node_id": id})["data"].(map[string]any)["summary"].(map[string]any); sum["text"] == "" {
+		t.Error("get_summary: empty text")
 	}
 }
 

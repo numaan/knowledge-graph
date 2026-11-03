@@ -34,7 +34,7 @@ func (s *Server) registerSources(m *mcp.Server) {
 			t := one(must(s.graph.Read(ctx, `MATCH (t:Ticket {id: $id})
 				RETURN t.key AS key, t.type AS type, t.status AS status, t.priority AS priority, t.title AS title,
 				       t.text AS text, t.labels AS labels, t.components AS components, t.url AS url,
-				       t.created AS created, t.updated AS updated, t.acl AS acl`, p)))
+				       t.created AS created, t.updated AS updated, t.acl AS acl, t.stale AS stale, t.stale_reason AS stale_reason`, p)))
 			if t == nil {
 				return nil, Doc{}, fmt.Errorf("ticket %s is not in the graph (run kg-jira for its project)", in.Key)
 			}
@@ -42,6 +42,7 @@ func (s *Server) registerSources(m *mcp.Server) {
 				return nil, Doc{}, fmt.Errorf("ticket %s is not visible to this server", in.Key)
 			}
 			delete(t, "acl")
+			dropEmptyStale([]map[string]any{t})
 			data := map[string]any{"ticket": t,
 				"parent": one(must(s.graph.Read(ctx, `MATCH (:Ticket {id: $id})-[:CHILD_OF]->(p:Ticket)
 					RETURN p.key AS key, p.type AS type, p.title AS title, p.status AS status`, p))),
@@ -109,7 +110,8 @@ func (s *Server) registerSources(m *mcp.Server) {
 				OPTIONAL MATCH (n)-[:PART_OF]->(d:Document)
 				RETURN n.id AS id, [l IN labels(n) WHERE l <> 'Source'][0] AS kind, n.key AS key, n.type AS type,
 				       n.status AS status, coalesce(d.title + ' > ', '') + n.title AS title, n.url AS url,
-				       left(n.text, 1200) AS text, coalesce(n.acl, d.acl) AS acl ORDER BY i`, map[string]any{"ids": idList})
+				       left(n.text, 1200) AS text, coalesce(n.acl, d.acl) AS acl,
+				       coalesce(n.stale, d.stale) AS stale, coalesce(n.stale_reason, d.stale_reason) AS stale_reason ORDER BY i`, map[string]any{"ids": idList})
 			if err != nil {
 				return nil, Rows{}, err
 			}
@@ -120,7 +122,7 @@ func (s *Server) registerSources(m *mcp.Server) {
 					out = append(out, r)
 				}
 			}
-			return nil, Rows{Results: out}, nil
+			return nil, Rows{Results: dropEmptyStale(out)}, nil
 		})
 
 	mcp.AddTool(m, &mcp.Tool{Name: "get_change_history", Description: "Recent commits that changed a symbol or " +
