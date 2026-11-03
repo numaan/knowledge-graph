@@ -26,9 +26,16 @@ spec:
   template:
     metadata:
       labels: {{- include "kg.selector" $sel | nindent 8 }}
-      {{- if $m.aclMapping }}
+      {{- if or $m.aclMapping $.Values.observability.prometheusAnnotations }}
       annotations:
+        {{- if $m.aclMapping }}
         checksum/acl-mapping: {{ toYaml $m.aclMapping | sha256sum }}
+        {{- end }}
+        {{- if $.Values.observability.prometheusAnnotations }}
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: {{ $m.port | quote }}
+        {{- end }}
       {{- end }}
     spec:
       containers:

@@ -4,6 +4,9 @@
 #               answer must contain. The case passes when one of them is in the top k results.
 # impact:       a symbol and symbols that must be among its affected code within `depth` hops.
 # requirements: expected verdicts of checked requirements (from the last kg-verify run).
+# answer:       a question for the MCP `ask` tool, the nodes its citations must include (expect) and
+#               the facts its answer must state (a list inside facts gives alternatives). Skipped when
+#               KG_MCP_URL is not set or the server has no `ask` tool.
 #
 # Write questions the way a developer asks them, not with the names in the code.
 repo: precept
@@ -92,3 +95,35 @@ requirements:
     verdict: supported
   - ref: FR-P10-03-10
     verdict: supported
+
+answer:
+  - question: Who may invite somebody as an owner of an organisation?
+    expect: [create_invitation]
+    facts: [owner, [403, forbidden]]
+  - question: What happens when I invite an email address that already has a pending invitation?
+    expect: [create_invitation, _bulk_invite_one]
+    facts: [[409, conflict, duplicate], pending]
+  - question: How long is an invitation link valid?
+    expect: [Invitation, models/tables.py]
+    facts: [[7 days, seven days, days=7]]
+  - question: Does resending an invitation make a new token or extend the expiry?
+    expect: [resend_invitation]
+    facts: [same token, [same expiry, not a reset, does not extend, unchanged], [429, too recently, throttle, interval]]
+  - question: How does a bulk invite count against the invite rate limit?
+    expect: [bulk_invite]
+    facts: [[one rate-limit hit, once, single hit, one hit], [each row, per row, independent]]
+  - question: What are the rate limits on login, and what does the client get above them?
+    expect: [login, ratelimit.py]
+    facts: ["10", ["60", one minute], [429, retry-after]]
+  - question: Can the last owner of an organisation be demoted or removed?
+    expect: [set_member_role, remove_member]
+    facts: [last owner, [409, conflict]]
+  - question: How are the API keys of LLM providers stored in the database?
+    expect: [EncryptedSecret, crypto.py]
+    facts: [fernet, [encrypted at rest, encrypt, enc:v1]]
+  - question: What happens to the topologies of a user when the user is hard-deleted?
+    expect: [hard_delete_user, user_lifecycle.py]
+    facts: [[owner_id, de-attribut, null], audit]
+  - question: Which fault types can a simulation inject?
+    expect: [faults.py, FaultInput]
+    facts: [az-partition, network-cut, leader-loss, db-failover, latency-spike, cpu-overload]

@@ -6,6 +6,7 @@
 // Environment: NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, EMBEDDINGS_URL, EMBEDDINGS_MODEL,
 // EMBEDDINGS_API_KEY, KG_DEFAULT_REPO, MCP_HTTP_ADDR (same as -http). Governance: KG_ACL_GROUPS,
 // KG_ACL_MAPPING, KG_OIDC_* (auth.go), KG_AUDIT, KG_AUDIT_FILE (audit.go), KG_WRITEBACK.
+// Tracing: OTEL_EXPORTER_OTLP_ENDPOINT (telemetry.go).
 package main
 
 import (
@@ -38,6 +39,7 @@ func newMCPServer(s *Server) *mcp.Server {
 	})
 	s.register(m)
 	m.AddReceivingMiddleware(s.accessMiddleware)
+	m.AddReceivingMiddleware(observe) // spans and metrics per tool call; wraps the access check
 	return m
 }
 
@@ -48,6 +50,7 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+	defer setupTracing(ctx)(context.Background())
 
 	graph, err := NewGraph(env("NEO4J_URI", "bolt://localhost:7687"), env("NEO4J_USER", "neo4j"), os.Getenv("NEO4J_PASSWORD"))
 	if err != nil {
@@ -102,6 +105,7 @@ func main() {
 		api.Identity = oidc.Caller // same bearer token check as /mcp
 	}
 	api.Mount(mux)
+	mux.Handle("/metrics", metricsHandler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if err := graph.Verify(r.Context()); err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)

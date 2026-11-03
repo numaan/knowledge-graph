@@ -7,6 +7,7 @@ import (
 
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/dbtype"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Graph runs read-only Cypher. Every query goes through a read transaction with a timeout,
@@ -32,7 +33,10 @@ func (g *Graph) Close(ctx context.Context) error { return g.driver.Close(ctx) }
 func (g *Graph) Verify(ctx context.Context) error { return g.driver.VerifyConnectivity(ctx) }
 
 // Read returns at most maxRows rows as JSON-ready maps.
-func (g *Graph) Read(ctx context.Context, cypher string, params map[string]any) ([]map[string]any, error) {
+func (g *Graph) Read(ctx context.Context, cypher string, params map[string]any) (_ []map[string]any, err error) {
+	ctx, span, start := childSpan(ctx, "neo4j.read", attribute.String("db.system.name", "neo4j"),
+		attribute.String("db.query.text", clip(cypher, 2000)))
+	defer func() { endSpan(span, start, querySeconds, err) }()
 	merged := make(map[string]any, len(params)+len(g.fixed))
 	for k, v := range params {
 		merged[k] = v

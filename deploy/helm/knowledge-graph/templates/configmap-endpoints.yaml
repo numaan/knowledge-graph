@@ -62,3 +62,6 @@ data:
   {{- with (.Values.sources.people).aliasesFile }}
   PEOPLE_ALIASES: {{ . | quote }}
   {{- end }}
+  {{- with .Values.observability.otlpEndpoint }}
+  OTEL_EXPORTER_OTLP_ENDPOINT: {{ . | quote }}
+  {{- end }}

@@ -1,0 +1,8 @@
+id: invite-ttl-setting
+title: Configurable invitation lifetime
+check: invite_ttl_setting.py
+prompt: |
+  In this repository (Locus 7), invitation links are valid for a fixed 7 days. Make the lifetime a
+  setting `invite_ttl_days` (default 7) in the backend settings, and use it when an invitation is
+  created, so that changing the setting at runtime changes the expiry of new invitations. Keep the
+  existing tests passing.

@@ -1,0 +1,8 @@
+id: fault-disk-full
+title: New simulation fault type disk-full
+check: fault_disk_full.py
+prompt: |
+  In this repository (Locus 7), add a new fault type `disk-full` that a simulation run can inject. Add it
+  to the vocabulary of fault types that the backend accepts and to the fault vocabulary of the frontend,
+  and make the database behaviour models react to it the same way they react to `db-failover`. Keep the
+  existing tests passing.

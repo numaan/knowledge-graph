@@ -224,6 +224,45 @@ web:
     limits: { memory: 512Mi }
 
 # ---------------------------------------------------------------------------
+# Tracing: OTLP/HTTP endpoint for the MCP server and the pipeline, e.g.
+# http://phoenix.observability.svc:6006 (Arize Phoenix) or
+# https://langfuse.example.com/api/public/otel (Langfuse; put
+# OTEL_EXPORTER_OTLP_HEADERS in sources.credentials). Empty = tracing off.
+# The MCP server always serves Prometheus metrics at /metrics.
+# ---------------------------------------------------------------------------
+observability:
+  otlpEndpoint: ""
+  prometheusAnnotations: true   # prometheus.io/scrape annotations on the MCP pods
+
+# ---------------------------------------------------------------------------
+# Neo4j backup (CronJob, off by default): kg-backup dump, an online logical
+# backup, to a folder on a PVC (default: the source archive PVC) or to
+# S3-compatible storage (SeaweedFS, MinIO, AWS S3). Restore procedure:
+# docs/streams/ops-eval.md.
+# ---------------------------------------------------------------------------
+backup:
+  enabled: false
+  image: ""          # the kg-pipeline image (pipeline/Dockerfile), e.g. registry/kg-pipeline:0.1.0
+  schedule: "30 2 * * *"
+  activeDeadlineSeconds: 7200
+  target: pvc        # pvc | s3
+  keep: 7            # pvc: number of backup files to keep (s3: use a bucket lifecycle rule)
+  pvc:
+    claimName: ""    # default: <namePrefix>-source-archive. Needs ReadWriteMany if pods land on other nodes.
+    path: backups/neo4j
+  s3:
+    endpoint: ""     # e.g. http://seaweedfs-s3.seaweedfs.svc:8333; empty = AWS S3
+    bucket: kg-backups
+    prefix: neo4j/
+    region: us-east-1
+    secretName: ""   # Secret with AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+    image: amazon/aws-cli:2.39.3
+    scratchSize: 20Gi  # emptyDir for the dump before the upload
+  resources:
+    requests: { cpu: 200m, memory: 512Mi }
+    limits: { memory: 2Gi }
+
+# ---------------------------------------------------------------------------
 # Dagster (official chart). Uses the PostgreSQL above, not its own.
 # ---------------------------------------------------------------------------
 global:
