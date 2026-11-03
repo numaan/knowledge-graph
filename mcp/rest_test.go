@@ -66,6 +66,10 @@ func restFixture(t *testing.T) (*httptest.Server, *REST, *memSink) {
 		}
 		return nil, nil
 	}
+	api.reqs = func(_ context.Context, repo string) ([]map[string]any, error) {
+		return []map[string]any{{"id": "r1", "verdict": "supported", "repo": repo}, {"id": "r2", "verdict": "contradicted"},
+			{"id": "r3", "verdict": nil}}, nil
+	}
 	api.Identity = func(r *http.Request) (*Caller, error) {
 		if r.Header.Get("Authorization") == "Bearer bad" {
 			return nil, errors.New("invalid token")
@@ -153,6 +157,18 @@ func TestRESTNode(t *testing.T) {
 	}
 	if code, _ = do(t, "GET", srv.URL+"/api/node/hidden", ""); code != 404 {
 		t.Errorf("hidden node: %d", code)
+	}
+}
+
+func TestRESTRequirements(t *testing.T) {
+	srv, _, _ := restFixture(t)
+	code, out := do(t, "GET", srv.URL+"/api/requirements?repo=precept", "")
+	counts := out["counts"].(map[string]any)
+	if code != 200 || out["total"].(float64) != 3 || counts["supported"].(float64) != 1 || counts["unresolved"].(float64) != 1 {
+		t.Errorf("requirements: %d %v", code, out)
+	}
+	if out["requirements"].([]any)[0].(map[string]any)["repo"] != "precept" {
+		t.Error("repo filter not passed")
 	}
 }
 

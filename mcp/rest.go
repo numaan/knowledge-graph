@@ -20,6 +20,7 @@ import (
 //	GET  /api/tools              names, descriptions and input schemas of all registered tools
 //	POST /api/tools/{name}       call one tool; body = tool arguments; response = structured result
 //	GET  /api/node/{id}          one node (labels, properties) and its neighbours (get_neighbors)
+//	GET  /api/requirements       checked requirements with verdict counts and evidence (?repo=)
 //	POST /api/feedback           {node_id, kind, comment} -> 202, through a FeedbackSink
 //
 // Tools run in-process through an in-memory MCP session on the same *mcp.Server, so every tool
@@ -84,6 +85,7 @@ type REST struct {
 	Timeout  time.Duration // per tool call
 	// node reads one node by id; nil means not found or not visible. Tests replace it.
 	node    func(ctx context.Context, id string) (map[string]any, error)
+	reqs    func(ctx context.Context, repo string) ([]map[string]any, error)
 	session *mcp.ClientSession
 	server  *mcp.ServerSession
 }
@@ -94,7 +96,7 @@ const callerMeta = "kg/caller"
 func newREST(ctx context.Context, s *Server, m *mcp.Server) (*REST, error) {
 	api := &REST{Identity: localIdentity, Feedback: logSink{}, Timeout: 120 * time.Second}
 	if s != nil && s.graph != nil {
-		api.node = s.nodeByID
+		api.node, api.reqs = s.nodeByID, s.requirements
 	}
 	// The caller travels as _meta on the call; only this session may set it, so MCP clients cannot spoof it.
 	m.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
@@ -131,6 +133,7 @@ func (api *REST) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/tools", api.with(api.listTools))
 	mux.HandleFunc("POST /api/tools/{name}", api.with(api.callTool))
 	mux.HandleFunc("GET /api/node/{id...}", api.with(api.getNode))
+	mux.HandleFunc("GET /api/requirements", api.with(api.getRequirements))
 	mux.HandleFunc("POST /api/feedback", api.with(api.postFeedback))
 }
 
@@ -259,6 +262,25 @@ func (api *REST) getNode(_ http.ResponseWriter, r *http.Request) (int, any, erro
 	return http.StatusOK, map[string]any{"node": node, "neighbors": nb}, nil
 }
 
+func (api *REST) getRequirements(_ http.ResponseWriter, r *http.Request) (int, any, error) {
+	if api.reqs == nil {
+		return 0, nil, fail(http.StatusNotFound, "requirements are not available")
+	}
+	rows, err := api.reqs(r.Context(), r.URL.Query().Get("repo"))
+	if err != nil {
+		return 0, nil, err
+	}
+	counts := map[string]int{"supported": 0, "contradicted": 0, "unresolved": 0}
+	for _, row := range rows {
+		v, _ := row["verdict"].(string)
+		if v == "" {
+			v = "unresolved"
+		}
+		counts[v]++
+	}
+	return http.StatusOK, map[string]any{"counts": counts, "total": len(rows), "requirements": rows}, nil
+}
+
 func (api *REST) postFeedback(_ http.ResponseWriter, r *http.Request) (int, any, error) {
 	var f Feedback
 	if err := json.NewDecoder(r.Body).Decode(&f); err != nil {
@@ -303,4 +325,18 @@ func (s *Server) nodeByID(ctx context.Context, id string) (map[string]any, error
 	}
 	delete(props, "acl")
 	return node, nil
+}
+
+// requirements lists checked requirements in the $repos scope, with their evidence and test count.
+func (s *Server) requirements(ctx context.Context, repo string) ([]map[string]any, error) {
+	return s.graph.Read(ctx, `
+		MATCH (r:Requirement) WHERE ($repo = '' OR r.repo = $repo) AND ($repos IS NULL OR r.repo IN $repos)
+		CALL (r) { OPTIONAL MATCH (r)-[e:IMPLEMENTED_BY|CONTRADICTED_BY]->(x:Symbol)
+		           RETURN collect(CASE WHEN x IS NULL THEN NULL ELSE {link: type(e), id: x.id, symbol: x.qualname,
+		                  path: x.path, confidence: e.confidence} END)[..10] AS evidence }
+		CALL (r) { OPTIONAL MATCH (r)-[:VALIDATED_BY]->(t:Symbol) RETURN count(t) AS tests }
+		RETURN r.id AS id, r.ref AS ref, r.statement AS statement, r.type AS type, r.source AS source,
+		       r.section AS section, r.repo AS repo, r.verdict AS verdict, r.confidence AS confidence,
+		       r.gaps AS gaps, r.checked_at AS checked_at, evidence, tests
+		ORDER BY source, ref`, map[string]any{"repo": repo})
 }
