@@ -171,6 +171,12 @@ func TestToolsIntegration(t *testing.T) {
 	} else if sum := call("get_summary", map[string]any{"node_id": id})["data"].(map[string]any)["summary"].(map[string]any); sum["text"] == "" {
 		t.Error("get_summary: empty text")
 	}
+	if res, _ := cs.CallTool(ctx, &mcp.CallToolParams{Name: "get_summary", Arguments: map[string]any{"path": "no/such/folder"}}); !res.IsError {
+		if d := call("get_summary", map[string]any{"path": "no/such/folder"})["data"].(map[string]any); d["note"] == nil ||
+			d["summary"].(map[string]any)["target_id"] != repo+":folder:/" {
+			t.Errorf("get_summary: unknown path must fall back to the root folder summary: %v", d)
+		}
+	}
 }
 
 func TestACLScope(t *testing.T) {

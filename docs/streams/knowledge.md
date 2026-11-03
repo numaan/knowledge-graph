@@ -150,5 +150,7 @@ against Neo4j and skips without `NEO4J_PASSWORD`.
   their own get no summary.
 - A suppressed edge is deleted again after each ingestion; between the ingestion and the overlay
   (one asset run) it is visible. CLI runs need `kg-corrections apply` afterwards.
-- Not run in this stream: the Neo4j integration tests (Docker was stopped) and `helm template`
-  (Helm is not installed). One real Ollama call checked the file prompt and schema.
+- Verified against Neo4j 2026.10.1 (port 7703): all pipeline tests (38) and the MCP integration tests
+  pass. On `precept` (592 files) the first `kg-summaries --no-llm` writes 659 summaries in about 15 s;
+  the second run writes nothing in about 7 s. `helm template` was not run (Helm is not installed).
+  One real Ollama call checked the file prompt and schema; a full LLM summary run was not done.
