@@ -121,7 +121,8 @@ class Neo4jWriter:
         old_nodes = {r["id"]: r["h"] for r in self._run(
             "MATCH (n:Code {repo: $repo}) RETURN n.id AS id, n.content_hash AS h", repo=g.repo).records}
         old_edges = {(r["a"], r["t"], r["b"]): r["h"] for r in self._run(
-            "MATCH (a:Code {repo: $repo})-[r]->(b:Code) RETURN a.id AS a, type(r) AS t, b.id AS b, r.content_hash AS h",
+            # layer 'links' edges belong to links.py (they join repositories), not to this snapshot.
+            "MATCH (a:Code {repo: $repo})-[r]->(b:Code) WHERE r.layer IS NULL OR r.layer <> 'links' RETURN a.id AS a, type(r) AS t, b.id AS b, r.content_hash AS h",
             repo=g.repo).records}
 
         changed = defaultdict(list)

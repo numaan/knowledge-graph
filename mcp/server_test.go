@@ -103,8 +103,8 @@ func TestToolsIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tools.Tools) != 15 {
-		t.Errorf("want 15 tools, got %d", len(tools.Tools))
+	if len(tools.Tools) != 16 {
+		t.Errorf("want 16 tools, got %d", len(tools.Tools))
 	}
 
 	call := func(name string, args map[string]any) map[string]any {
