@@ -11,21 +11,24 @@ import (
 // Tools over non-code sources: Jira tickets, git history and documents (all :Source nodes).
 
 type TicketIn struct {
+	Page
 	Key string `json:"key" jsonschema:"Jira issue key, e.g. PREC-123"`
 }
 type KnowledgeIn struct {
+	Page
 	Query string `json:"query" jsonschema:"question in natural language"`
 	Kind  string `json:"kind,omitempty" jsonschema:"Ticket, Section (documents and wiki pages) or empty for both"`
 	K     int    `json:"k,omitempty" jsonschema:"number of results, 1-20 (default 8)"`
 }
 type HistoryIn struct {
+	Page
 	Symbol string `json:"symbol" jsonschema:"symbol id, qualified name or file path"`
 	Repo   string `json:"repo,omitempty" jsonschema:"repository name"`
 	Limit  int    `json:"limit,omitempty" jsonschema:"maximum commits, 1-50 (default 15)"`
 }
 
 func (s *Server) registerSources(m *mcp.Server) {
-	mcp.AddTool(m, &mcp.Tool{Name: "get_context_for_ticket", Description: "Everything needed to work on a Jira " +
+	addTool(m, &mcp.Tool{Name: "get_context_for_ticket", Description: "Everything needed to work on a Jira " +
 		"ticket: its text and acceptance criteria, epic, sub-tasks, linked issues, release, the commits that " +
 		"reference it and the code they changed, code named in the ticket, checked requirements and the code that " +
 		"best matches the ticket text. Use it first when a task names a ticket."},
@@ -76,54 +79,18 @@ func (s *Server) registerSources(m *mcp.Server) {
 			return nil, Doc{Data: data}, nil
 		})
 
-	mcp.AddTool(m, &mcp.Tool{Name: "search_knowledge", Description: "Search Jira tickets and document or wiki " +
+	addTool(m, &mcp.Tool{Name: "search_knowledge", Description: "Search Jira tickets and document or wiki " +
 		"sections (specifications, ADRs, runbooks) by meaning and keywords. Use it for why and what questions; " +
 		"use search_graph for where-in-the-code questions."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in KnowledgeIn) (*mcp.CallToolResult, Rows, error) {
 			if in.Kind != "" && in.Kind != "Ticket" && in.Kind != "Section" {
 				return nil, Rows{}, fmt.Errorf("kind must be Ticket, Section or empty")
 			}
-			vec, err := s.emb.Query(ctx, in.Query)
-			if err != nil {
-				return nil, Rows{}, err
-			}
-			p := map[string]any{"v": vec, "q": lucene(in.Query), "kind": in.Kind}
-			filter := `($kind = '' OR $kind IN labels(node)) AND (node:Ticket OR node:Section)`
-			byVector, err := s.graph.Read(ctx, `CALL db.index.vector.queryNodes('source_embedding', 60, $v) YIELD node, score
-				WHERE `+filter+` RETURN node.id AS id ORDER BY score DESC LIMIT 30`, p)
-			if err != nil {
-				return nil, Rows{}, err
-			}
-			byText, err := s.graph.Read(ctx, `CALL db.index.fulltext.queryNodes('source_text', $q, {limit: 60}) YIELD node, score
-				WHERE `+filter+` RETURN node.id AS id ORDER BY score DESC LIMIT 30`, p)
-			if err != nil {
-				return nil, Rows{}, err
-			}
-			fused := rrf(ids(byVector), ids(byText))
-			fused = fused[:min(len(fused), clamp(in.K, 1, 20, 8))]
-			idList := make([]string, len(fused))
-			for i, f := range fused {
-				idList[i] = f.ID
-			}
-			rows, err := s.graph.Read(ctx, `UNWIND range(0, size($ids) - 1) AS i MATCH (n:Source {id: $ids[i]})
-				OPTIONAL MATCH (n)-[:PART_OF]->(d:Document)
-				RETURN n.id AS id, [l IN labels(n) WHERE l <> 'Source'][0] AS kind, n.key AS key, n.type AS type,
-				       n.status AS status, coalesce(d.title + ' > ', '') + n.title AS title, n.url AS url,
-				       left(n.text, 1200) AS text, coalesce(n.acl, d.acl) AS acl ORDER BY i`, map[string]any{"ids": idList})
-			if err != nil {
-				return nil, Rows{}, err
-			}
-			out := []map[string]any{}
-			for _, r := range rows {
-				if s.allowed(r["acl"]) {
-					delete(r, "acl")
-					out = append(out, r)
-				}
-			}
-			return nil, Rows{Results: out}, nil
+			rows, err := s.Knowledge(ctx, in.Query, in.Kind, clamp(in.K, 1, 20, 8))
+			return nil, Rows{Results: rows}, err
 		})
 
-	mcp.AddTool(m, &mcp.Tool{Name: "get_change_history", Description: "Recent commits that changed a symbol or " +
+	addTool(m, &mcp.Tool{Name: "get_change_history", Description: "Recent commits that changed a symbol or " +
 		"file: who, when, why (message) and the tickets they reference. Use it to understand why code is the way it is."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in HistoryIn) (*mcp.CallToolResult, Rows, error) {
 			repo := s.repo(in.Repo)

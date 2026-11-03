@@ -4,7 +4,8 @@
 //	kg-mcp -http :8000          Streamable HTTP at /mcp (Kubernetes)
 //
 // Environment: NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, EMBEDDINGS_URL, EMBEDDINGS_MODEL,
-// EMBEDDINGS_API_KEY, KG_DEFAULT_REPO, MCP_HTTP_ADDR (same as -http).
+// EMBEDDINGS_API_KEY, KG_DEFAULT_REPO, MCP_HTTP_ADDR (same as -http), RERANK_URL, RERANK_MODEL,
+// LLM_BASE_URL, LLM_MODEL, LLM_API_KEY (the ask tool).
 package main
 
 import (
@@ -63,6 +64,8 @@ func main() {
 		emb:         NewEmbedder(env("EMBEDDINGS_URL", "http://localhost:8080"), env("EMBEDDINGS_MODEL", "Qwen/Qwen3-Embedding-0.6B"), os.Getenv("EMBEDDINGS_API_KEY")),
 		defaultRepo: os.Getenv("KG_DEFAULT_REPO"),
 		groups:      aclGroups(),
+		rerank:      rerankerFromEnv(),
+		llm:         llmFromEnv(),
 	}
 	graph.fixed["repos"] = repoScope(s.groups)
 	server := newMCPServer(s)

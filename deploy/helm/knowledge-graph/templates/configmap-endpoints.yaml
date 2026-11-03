@@ -24,13 +24,17 @@ data:
   EMBEDDINGS_PROVIDER: tei
   EMBEDDINGS_URL: http://{{ $name }}-embeddings:8080
   {{- if .Values.models.reranker.enabled }}
-  RERANKER_URL: http://{{ $name }}-reranker:8080
-  RERANKER_MODEL: {{ .Values.models.reranker.model | quote }}
+  RERANK_URL: http://{{ $name }}-reranker:8080
+  RERANK_MODEL: {{ .Values.models.reranker.model | quote }}
   {{- end }}
   {{- else }}
   EMBEDDINGS_PROVIDER: {{ .Values.models.provider | quote }}
   {{- with .Values.models.externalUrl }}
   EMBEDDINGS_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.models.reranker.externalUrl }}
+  RERANK_URL: {{ . | quote }}
+  RERANK_MODEL: {{ $.Values.models.reranker.model | quote }}
   {{- end }}
   {{- end }}
   EMBEDDINGS_MODEL: {{ .Values.models.embeddings.model | quote }}

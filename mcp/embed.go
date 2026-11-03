@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -19,6 +20,8 @@ type Embedder struct {
 	Model  string
 	APIKey string
 	client *http.Client
+	mu     sync.Mutex
+	cache  map[string][]float64 // recent query vectors: ask embeds the same question for several indexes
 }
 
 func NewEmbedder(url, model, key string) *Embedder {
@@ -27,6 +30,25 @@ func NewEmbedder(url, model, key string) *Embedder {
 }
 
 func (e *Embedder) Query(ctx context.Context, text string) ([]float64, error) {
+	e.mu.Lock()
+	vec, ok := e.cache[text]
+	e.mu.Unlock()
+	if ok {
+		return vec, nil
+	}
+	vec, err := e.query(ctx, text)
+	if err == nil {
+		e.mu.Lock()
+		if e.cache == nil || len(e.cache) >= 256 {
+			e.cache = map[string][]float64{}
+		}
+		e.cache[text] = vec
+		e.mu.Unlock()
+	}
+	return vec, err
+}
+
+func (e *Embedder) query(ctx context.Context, text string) ([]float64, error) {
 	body, _ := json.Marshal(map[string]any{"model": e.Model, "input": []string{queryInstruction + text}})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.URL+"/v1/embeddings", bytes.NewReader(body))
 	if err != nil {
