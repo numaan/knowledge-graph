@@ -45,6 +45,7 @@ CONTEXT_CHARS = 12_000
 MAX_SYMBOLS = 120
 LEVELS = ("file", "module", "repo", "domain")
 TARGET_LABEL = {"file": "File", "module": "Folder", "repo": "Repository", "domain": "Capability"}
+TARGET_ANCHOR = {"file": "Code", "module": "Folder", "repo": "Code", "domain": "Domain"}   # labels with an id index
 
 SCHEMA = {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}
 
@@ -388,7 +389,7 @@ def write(w: Neo4jWriter, repo: str, rows: list[dict], folder_rows: list[dict]) 
         w._run("UNWIND $rows AS row MERGE (d:Folder {id: row.id}) SET d.repo = $repo, d.path = row.path, "
                "d.name = row.name, d.content_hash = row.content_hash, d.ingested_at = $stamp "
                "WITH d, row OPTIONAL MATCH (d)-[old:CONTAINS]->(:File) DELETE old "
-               "WITH DISTINCT d, row UNWIND row.files AS fid MATCH (f:File {id: fid}) "
+               "WITH DISTINCT d, row UNWIND row.files AS fid MATCH (f:Code {id: fid}) "
                "MERGE (d)-[r:CONTAINS]->(f) SET r.method = 'parser', r.confidence = 1.0",
                rows=changed_folders, repo=repo, stamp=stamp)
     keep_folders = [f["id"] for f in folder_rows]
@@ -399,7 +400,7 @@ def write(w: Neo4jWriter, repo: str, rows: list[dict], folder_rows: list[dict]) 
     for r in todo:
         by_level[r["level"]].append({k: r[k] for k in ("id", "level", "text", "model", "content_hash", "target_id", "path")})
     for level, batch in by_level.items():
-        label = TARGET_LABEL[level]
+        label = TARGET_ANCHOR[level]
         w._run(f"UNWIND $rows AS row MERGE (s:Summary {{id: row.id}}) "
                f"SET s.level = row.level, s.text = row.text, s.model = row.model, s.content_hash = row.content_hash, "
                f"s.target_id = row.target_id, s.path = row.path, s.repo = $repo, s.generated_at = $stamp "

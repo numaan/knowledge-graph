@@ -198,7 +198,7 @@ def write_flags(w: Neo4jWriter, stale: dict[str, dict], current: dict[str, dict]
 def _pairs(w: Neo4jWriter, stale: dict[str, dict]) -> list[dict]:
     wanted = [{"src": sid, "dst": cid} for sid, s in sorted(stale.items()) for cid in s["changed"]]
     rows = w._run("""
-        UNWIND $rows AS row MATCH (s:Section {id: row.src}) MATCH (x:Code {id: row.dst})
+        UNWIND $rows AS row MATCH (s:Source {id: row.src}) MATCH (x:Code {id: row.dst})
         OPTIONAL MATCH (c:Chunk)-[:PART_OF]->(x)
         WITH row, s, x, c ORDER BY c.start_line
         RETURN row.src AS src, row.dst AS dst, s.title AS title, s.text AS text,
@@ -210,11 +210,11 @@ def _pairs(w: Neo4jWriter, stale: dict[str, dict]) -> list[dict]:
 def write_conflicts(w: Neo4jWriter, results: list[dict], candidates: list[dict]) -> dict:
     stamp = datetime.now(timezone.utc).isoformat()
     hits = [r for r in results if r["conflict"]]
-    w._run("UNWIND $rows AS row MATCH (s:Section {id: row.src}) MATCH (x:Code {id: row.dst}) "
+    w._run("UNWIND $rows AS row MATCH (s:Source {id: row.src}) MATCH (x:Code {id: row.dst}) "
            "MERGE (s)-[r:CONFLICTS_WITH]->(x) SET r.reason = row.reason, r.confidence = row.confidence, "
            "r.method = 'llm', r.content_hash = row.content_hash, r.checked_at = $stamp", rows=hits, stamp=stamp)
     cleared = [r for r in results if not r["conflict"]]
-    w._run("UNWIND $rows AS row MATCH (:Section {id: row.src})-[r:CONFLICTS_WITH {method: 'llm'}]->(:Code {id: row.dst}) "
+    w._run("UNWIND $rows AS row MATCH (:Source {id: row.src})-[r:CONFLICTS_WITH {method: 'llm'}]->(:Code {id: row.dst}) "
            "DELETE r", rows=cleared)
     keys = [f"{c['src']}|{c['dst']}" for c in candidates]
     gone = w._run("MATCH (s:Section)-[r:CONFLICTS_WITH {method: 'llm'}]->(x:Code) WHERE NOT s.id + '|' + x.id IN $keys "

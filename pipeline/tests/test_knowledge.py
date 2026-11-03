@@ -146,7 +146,7 @@ def test_folders_and_summary_writes():
     out = summaries.write(w, "kgt", rows, fs)
     assert out == {"folders_written": 1, "summaries_written": 7, "summaries_removed": 1}
     writes = w.find("MERGE (s:Summary")
-    assert {q.split("MATCH (t:")[1].split(" ")[0] for q, _ in writes} == {"File", "Folder", "Repository", "Capability"}
+    assert {q.split("MATCH (t:")[1].split(" ")[0] for q, _ in writes} == {"Code", "Folder", "Domain"}
     assert sum(len(p["rows"]) for _, p in writes) == 7
 
 
