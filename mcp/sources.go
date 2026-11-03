@@ -33,8 +33,9 @@ func (s *Server) registerSources(m *mcp.Server) {
 			p := map[string]any{"id": "jira:" + strings.ToUpper(strings.TrimSpace(in.Key))}
 			t := one(must(s.graph.Read(ctx, `MATCH (t:Ticket {id: $id})
 				RETURN t.key AS key, t.type AS type, t.status AS status, t.priority AS priority, t.title AS title,
-				       t.text AS text, t.labels AS labels, t.components AS components, t.url AS url,
-				       t.created AS created, t.updated AS updated, t.acl AS acl`, p)))
+				       coalesce(t.text_masked, t.text) AS text, t.labels AS labels, t.components AS components, t.url AS url,
+				       t.created AS created, t.updated AS updated, t.source_updated_at AS source_updated_at,
+				       t.ingested_at AS ingested_at, t.author AS author, t.acl AS acl`, p)))
 			if t == nil {
 				return nil, Doc{}, fmt.Errorf("ticket %s is not in the graph (run kg-jira for its project)", in.Key)
 			}
@@ -51,12 +52,13 @@ func (s *Server) registerSources(m *mcp.Server) {
 					RETURN CASE WHEN startNode(l) = t THEN l.type ELSE 'inward: ' + l.type END AS link,
 					       o.key AS key, o.title AS title, o.status AS status`, p)),
 				"releases": must(s.graph.Read(ctx, `MATCH (:Ticket {id: $id})-[:IN_RELEASE]->(r:Release)
-					RETURN r.name AS name, r.released AS released, r.release_date AS date`, p)),
+					RETURN r.name AS name, r.released AS released, r.release_date AS date, r.url AS url`, p)),
 				"commits": must(s.graph.Read(ctx, `MATCH (c:Commit)-[:REFERENCES]->(:Ticket {id: $id})
 					WHERE $repos IS NULL OR c.repo IN $repos
 					OPTIONAL MATCH (c)-[:MODIFIES]->(x:Code)
 					WITH c, collect(DISTINCT coalesce(x.qualname, x.path))[..20] AS changed
-					RETURN c.sha AS sha, c.title AS title, c.author AS author, c.date AS date, c.repo AS repo, changed
+					RETURN c.sha AS sha, c.title AS title, c.author AS author, c.date AS date, c.repo AS repo, c.url AS url,
+					       c.ingested_at AS ingested_at, changed
 					ORDER BY c.date DESC LIMIT 20`, p)),
 				"mentioned_code": must(s.graph.Read(ctx, `MATCH (:Ticket {id: $id})-[m:MENTIONS]->(x:Code)
 					WHERE $repos IS NULL OR x.repo IN $repos
@@ -99,17 +101,22 @@ func (s *Server) registerSources(m *mcp.Server) {
 			if err != nil {
 				return nil, Rows{}, err
 			}
+			k := clamp(in.K, 1, 20, 8)
 			fused := rrf(ids(byVector), ids(byText))
-			fused = fused[:min(len(fused), clamp(in.K, 1, 20, 8))]
+			fused = fused[:min(len(fused), 3*k)] // spare rows for the ACL filter and collapsed duplicates
 			idList := make([]string, len(fused))
 			for i, f := range fused {
 				idList[i] = f.ID
 			}
 			rows, err := s.graph.Read(ctx, `UNWIND range(0, size($ids) - 1) AS i MATCH (n:Source {id: $ids[i]})
 				OPTIONAL MATCH (n)-[:PART_OF]->(d:Document)
+				OPTIONAL MATCH (n)-[:DUPLICATE_OF]->(c:Source)
 				RETURN n.id AS id, [l IN labels(n) WHERE l <> 'Source'][0] AS kind, n.key AS key, n.type AS type,
-				       n.status AS status, coalesce(d.title + ' > ', '') + n.title AS title, n.url AS url,
-				       left(n.text, 1200) AS text, coalesce(n.acl, d.acl) AS acl ORDER BY i`, map[string]any{"ids": idList})
+				       n.status AS status, coalesce(d.title + ' > ', '') + n.title AS title, coalesce(n.url, d.url) AS url,
+				       coalesce(n.source_updated_at, d.source_updated_at) AS source_updated_at,
+				       coalesce(n.ingested_at, d.ingested_at) AS ingested_at, coalesce(n.author, d.author) AS author,
+				       left(coalesce(n.text_masked, n.text), 1200) AS text, coalesce(n.acl, d.acl) AS acl,
+				       coalesce(c.id, n.id) AS canonical ORDER BY i`, map[string]any{"ids": idList})
 			if err != nil {
 				return nil, Rows{}, err
 			}
@@ -120,7 +127,7 @@ func (s *Server) registerSources(m *mcp.Server) {
 					out = append(out, r)
 				}
 			}
-			return nil, Rows{Results: out}, nil
+			return nil, Rows{Results: collapseDuplicates(out, k)}, nil
 		})
 
 	mcp.AddTool(m, &mcp.Tool{Name: "get_change_history", Description: "Recent commits that changed a symbol or " +
@@ -144,7 +151,7 @@ func (s *Server) registerSources(m *mcp.Server) {
 				MATCH (c:Commit)-[m:MODIFIES]->(t) WHERE t = x OR t = file
 				WITH c, max(CASE WHEN t = x THEN 1 ELSE 0 END) AS exact, collect(m.change)[0] AS change
 				OPTIONAL MATCH (c)-[:REFERENCES]->(k:Ticket)
-				RETURN c.sha AS sha, c.date AS date, c.author AS author, c.title AS title, left(c.text, 600) AS message,
+				RETURN c.sha AS sha, c.date AS date, c.author AS author, c.title AS title, left(c.text, 600) AS message, c.url AS url,
 				       change, exact = 1 AS touched_symbol, collect(k.key + ': ' + k.title) AS tickets
 				ORDER BY date DESC LIMIT $limit`, map[string]any{"id": id, "limit": clamp(in.Limit, 1, 50, 15)})
 			note := ""

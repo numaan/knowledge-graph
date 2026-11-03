@@ -9,6 +9,7 @@ import hashlib
 
 from .graph.neo4j_writer import Neo4jWriter
 from .models import Embedder
+from .privacy import mask
 
 MAX_CHARS = 6_000
 WRITE_BATCH = 200
@@ -75,6 +76,7 @@ def embed_sources(w: Neo4jWriter, emb: Embedder) -> dict:
 def _embed_label(w: Neo4jWriter, emb: Embedder, items: list[dict], label: str) -> dict:
     todo = []
     for it in items:
+        it = {**it, "text": mask(it["text"])}  # secrets and PII never reach the embedding server (KG_PII_MODE)
         h = hashlib.sha256(f"{emb.model}|{it['text']}".encode()).hexdigest()[:32]
         if h != it["hash"]:
             todo.append({**it, "new_hash": h})

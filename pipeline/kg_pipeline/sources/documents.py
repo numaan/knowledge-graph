@@ -2,6 +2,7 @@
 
     kg-docs --path /c/workspace/precept/docs --name precept-docs       # .md .txt .pdf .docx .pptx .html
     kg-docs --confluence ENG                                            # one Confluence Cloud space
+    kg-docs --confluence ENG --reconcile                                # remove deleted, archived, moved pages
 
 Markdown and text are read directly; PDF, DOCX, PPTX and HTML go through Docling Serve (DOCLING_URL).
 Confluence env: CONFLUENCE_BASE_URL (https://your-site.atlassian.net), CONFLUENCE_EMAIL and
@@ -27,6 +28,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from ..graph.neo4j_writer import Neo4jWriter
+from ..provenance import file_meta, file_url
 from .atlassian import Atlassian
 from .jira import link_mentions
 
@@ -126,7 +128,8 @@ def storage_to_markdown(html: str) -> str:
 def _write_document(w: Neo4jWriter, doc: dict, markdown: str) -> int:
     sections = split_sections(markdown)
     rows = [{"id": f"{doc['id']}#s{i}", "title": h or doc["title"], "text": t, "order": i, "acl": doc["acl"],
-             "source": doc["source"]} for i, (h, t) in enumerate(sections)]
+             "source": doc["source"], "url": doc.get("url"), "source_updated_at": doc.get("source_updated_at"),
+             "author": doc.get("author")} for i, (h, t) in enumerate(sections)]
     w.upsert(("Document",), [doc])
     w.upsert(("Section",), rows)
     w._run("MATCH (s:Section)-[:PART_OF]->(:Document {id: $doc}) WHERE NOT s.id IN $ids DETACH DELETE s",
@@ -141,10 +144,13 @@ def _unchanged(w: Neo4jWriter, doc_id: str, version: str) -> bool:
     return bool(r) and r[0]["v"] == version
 
 
-def sync_folder(w: Neo4jWriter, root: Path, name: str, read=None) -> dict:
+def sync_folder(w: Neo4jWriter, root: Path, name: str, read=None, url_base: str | None = None) -> dict:
+    """url_base: browsable URL of root (e.g. https://github.com/org/repo/blob/main/docs); default file:// links."""
     from ..requirements import read_document  # Docling for binary formats
+    from ..reconcile import folder_moves  # moved files keep their nodes and embeddings
     read = read or read_document
-    seen, stats = [], {"documents": 0, "unchanged": 0, "sections": 0, "failed": 0}
+    seen, stats = [], {"documents": 0, "unchanged": 0, "sections": 0, "failed": 0,
+                       "moved": len(folder_moves(w, root, name, url_base)["moved"])}
     for path in sorted(p for p in root.rglob("*") if p.suffix.lower() in SUFFIXES and p.is_file()):
         rel = path.relative_to(root).as_posix()
         doc_id = f"doc:{name}:{rel}"
@@ -161,7 +167,8 @@ def sync_folder(w: Neo4jWriter, root: Path, name: str, read=None) -> dict:
             continue
         title = next((l.lstrip("# ").strip() for l in markdown.splitlines() if l.startswith("# ")), path.stem)
         doc = {"id": doc_id, "name": path.name, "title": title, "path": rel, "collection": name, "version": version,
-               "format": path.suffix.lower().lstrip("."), "source": "files", "acl": [f"docs:{name}"]}
+               "format": path.suffix.lower().lstrip("."), "source": "files", "acl": [f"docs:{name}"],
+               "url": file_url(path, rel, url_base), **file_meta(path)}
         stats["sections"] += _write_document(w, doc, markdown)
         stats["documents"] += 1
     removed = w._run("MATCH (d:Document {collection: $name, source: 'files'}) WHERE NOT d.id IN $ids "
@@ -175,7 +182,8 @@ def fetch_pages(api: Atlassian, space_key: str):
     spaces = api.get("/wiki/api/v2/spaces", keys=space_key).get("results", [])
     if not spaces:
         raise ValueError(f"Confluence space {space_key} not found or not visible")
-    path, params = f"/wiki/api/v2/spaces/{spaces[0]['id']}/pages", {"body-format": "storage", "limit": 100}
+    # status=current: the API also returns archived pages by default, and they must not be in the graph
+    path, params = f"/wiki/api/v2/spaces/{spaces[0]['id']}/pages", {"body-format": "storage", "limit": 100, "status": "current"}
     while path:
         page = api.get(path, **params)
         yield from page.get("results", [])
@@ -201,7 +209,9 @@ def sync_confluence(w: Neo4jWriter, api: Atlassian, space_key: str) -> dict:
         doc = {"id": doc_id, "name": p["title"], "title": p["title"], "collection": f"confluence:{space_key}",
                "version": version, "url": api.base + "/wiki" + ((p.get("_links") or {}).get("webui") or ""),
                "updated": (p.get("version") or {}).get("createdAt"), "source": "confluence",
-               "acl": [f"confluence:{space_key}"]}
+               "acl": [f"confluence:{space_key}"], "page_id": p["id"],
+               "source_updated_at": (p.get("version") or {}).get("createdAt") or p.get("createdAt"),
+               "author": (p.get("version") or {}).get("authorId") or p.get("authorId")}
         stats["sections"] += _write_document(w, doc, markdown)
         stats["documents"] += 1
     w.link("CHILD_OF", parents, replace_from=seen)
@@ -218,11 +228,20 @@ def main(argv: list[str] | None = None) -> None:
     src.add_argument("--path", type=Path, help="folder of documents")
     src.add_argument("--confluence", metavar="SPACE", help="Confluence space key")
     ap.add_argument("--name", help="collection name for --path (default: folder name)")
+    ap.add_argument("--url-base", help="browsable URL of --path for deep links (default: file:// links)")
+    ap.add_argument("--reconcile", action="store_true",
+                    help="only remove deleted, archived and moved pages or files (no download of bodies)")
+    ap.add_argument("--force", action="store_true", help="with --reconcile: allow removing more than half")
     args = ap.parse_args(argv)
     with Neo4jWriter(os.environ.get("NEO4J_URI", "bolt://localhost:7687"), os.environ.get("NEO4J_USER", "neo4j"),
                      os.environ["NEO4J_PASSWORD"]) as w:
-        if args.path:
-            res = sync_folder(w, args.path, args.name or args.path.resolve().name)
+        from .. import reconcile
+        if args.path and args.reconcile:
+            res = reconcile.folder(w, args.path, args.name or args.path.resolve().name, args.url_base, args.force)
+        elif args.path:
+            res = sync_folder(w, args.path, args.name or args.path.resolve().name, url_base=args.url_base)
+        elif args.reconcile:
+            res = reconcile.confluence(w, Atlassian(prefix="CONFLUENCE"), args.confluence, args.force)
         else:
             res = sync_confluence(w, Atlassian(prefix="CONFLUENCE"), args.confluence)
         print(json.dumps(res, indent=2))

@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from neo4j import GraphDatabase
 
 from ..code.model import CodeGraph
+from ..privacy import protect_row
 
 BATCH = 2000
 _NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
@@ -66,8 +67,12 @@ class Neo4jWriter:
             self._run(statement)
 
     def upsert(self, labels: tuple[str, ...], rows: list[dict], keep: tuple[str, ...] = ("embedding", "embedding_hash")) -> int:
-        """MERGE :Source nodes by id and replace their properties, keeping computed ones (embeddings)."""
+        """MERGE :Source nodes by id and replace their properties, keeping computed ones (embeddings).
+
+        Secrets are removed from title and text before the write; text_masked holds the text without PII.
+        """
         self.ensure_schema()
+        rows = [protect_row(r) for r in rows]
         extra = "".join(f":{_safe(l)}" for l in labels)
         kept = ", ".join(f"n.{_safe(k)} AS {k}" for k in keep)
         restore = ", ".join(f"n.{k} = {k}" for k in keep)
