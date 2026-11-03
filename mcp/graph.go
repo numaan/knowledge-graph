@@ -10,7 +10,8 @@ import (
 )
 
 // Graph runs read-only Cypher. Every query goes through a read transaction with a timeout,
-// so the server cannot change the graph even if a query slips past the Cypher guard.
+// so the server cannot change the graph even if a query slips past the Cypher guard. The one
+// exception is writeProposal (writeback.go), which can only create :Proposal nodes.
 type Graph struct {
 	driver  neo4j.DriverWithContext
 	timeout time.Duration
@@ -38,6 +39,9 @@ func (g *Graph) Read(ctx context.Context, cypher string, params map[string]any) 
 	}
 	for k, v := range g.fixed {
 		merged[k] = v
+	}
+	if a := accessFrom(ctx); a != nil {
+		merged["repos"] = repoScope(a.Groups) // the caller's scope replaces the server default
 	}
 	params = merged
 	session := g.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeRead})

@@ -103,8 +103,8 @@ func TestToolsIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tools.Tools) != 16 {
-		t.Errorf("want 16 tools, got %d", len(tools.Tools))
+	if len(tools.Tools) != 19 { // 16 read tools + 3 write-back tools
+		t.Errorf("want 19 tools, got %d", len(tools.Tools))
 	}
 
 	call := func(name string, args map[string]any) map[string]any {
@@ -193,11 +193,12 @@ func TestACLScope(t *testing.T) {
 		want bool
 	}{{nil, true}, {[]any{}, true}, {[]any{"jira:PREC"}, true}, {[]any{"jira:HR", "confluence:HR"}, false}}
 	for _, c := range cases {
-		if team.allowed(c.acl) != c.want {
+		if team.allowed(context.Background(), c.acl) != c.want {
 			t.Errorf("allowed(%v) = %v", c.acl, !c.want)
 		}
 	}
-	if !all.allowed([]any{"jira:HR"}) || team.allowedRepo("other") || !team.allowedRepo("precept") {
+	ctx := context.Background()
+	if !all.allowed(ctx, []any{"jira:HR"}) || team.allowedRepo(ctx, "other") || !team.allowedRepo(ctx, "precept") {
 		t.Error("allowedRepo or * wrong")
 	}
 }

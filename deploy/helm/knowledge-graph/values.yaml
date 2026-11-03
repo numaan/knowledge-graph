@@ -173,6 +173,36 @@ mcp:
   resources:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { memory: 256Mi }
+  # Governance (docs/streams/governance.md). With oidc.enabled each caller sends a bearer token and
+  # sees its own groups (mapped by aclMapping); aclGroups above is the upper bound.
+  oidc:
+    enabled: false
+    issuer: ""            # https://sso.example.com/realms/kg; empty uses the dev Keycloak (keycloak.enabled)
+    audience: kg-mcp      # the aud claim the token must carry
+    groupsClaim: groups   # dotted paths such as realm_access.roles work
+    jwksUrl: ""           # default: from the issuer's discovery document
+    resource: ""          # public URL of /mcp, e.g. https://kg.example.com/mcp; default: from the request
+    scopes: ""            # scopes every call needs, comma-separated
+    writeScope: ""        # scope for report_wrong_fact, record_decision, suggest_link (e.g. kg:write)
+  aclMapping: {}          # acl-mapping.yaml: {default: [], passthrough: true, groups: {team-x: [repo:x, jira:X]}}
+  audit:
+    mode: stdout          # stdout or off: one JSON line per tool call
+    file: ""              # also append to this file in the pod
+  writeback: true         # the three proposal tools; false removes them
+
+# ---------------------------------------------------------------------------
+# Dev Keycloak for the OIDC test on kind (start-dev, in-memory database, realm "kg" imported from
+# files/keycloak/kg-realm.json). For production set mcp.oidc.issuer to your identity provider.
+# ---------------------------------------------------------------------------
+keycloak:
+  enabled: false
+  image: quay.io/keycloak/keycloak:26.4.2
+  port: 8080
+  realm: kg
+  adminUser: admin        # the password is generated into the Secret <prefix>-keycloak
+  resources:
+    requests: { cpu: 100m, memory: 512Mi }
+    limits: { memory: 1Gi }
 
 # Web UI for humans (web/Dockerfile). It calls the REST layer of the MCP server (/api), so it
 # sees what mcp.aclGroups allows. Off by default.

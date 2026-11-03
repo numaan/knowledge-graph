@@ -1,0 +1,6 @@
+{"self": "https://example.atlassian.net/rest/api/3/project/10000/role/10002", "name": "Developers", "id": 10002,
+ "actors": [
+  {"id": 1, "displayName": "KGT-Devs", "type": "atlassian-group-role-actor", "name": "KGT-Devs",
+   "actorGroup": {"name": "KGT-Devs", "displayName": "KGT-Devs", "groupId": "6e87dc72-4f1f-421f-9382-2fee8b652487"}},
+  {"id": 2, "displayName": "Sam Dev", "type": "atlassian-user-role-actor",
+   "actorUser": {"accountId": "5b10a2844c20165700ede21g"}}]}

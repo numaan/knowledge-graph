@@ -25,7 +25,7 @@ func TestRankExperts(t *testing.T) {
 		{"person": "p:bot", "name": "dependabot", "bot": true, "kind": "commit", "item": "c8", "date": "2026-10-31T00:00:00Z"},
 		{"person": "p:own", "name": "Owner", "kind": "code_owner", "item": "shop:a.py"},
 	}
-	got := rankExperts(rows, now, team.allowed, 10)
+	got := rankExperts(rows, now, func(acl any) bool { return team.allowed(context.Background(), acl) }, 10)
 	names := []string{}
 	for _, r := range got {
 		names = append(names, r["name"].(string))
@@ -40,7 +40,7 @@ func TestRankExperts(t *testing.T) {
 	if got[1]["last_activity"] != "2026-10-30" || len(got[2]["evidence"].([]map[string]any)) != 2 {
 		t.Errorf("evidence: %+v", got)
 	}
-	if len(rankExperts(rows, now, team.allowed, 1)) != 1 {
+	if len(rankExperts(rows, now, func(acl any) bool { return team.allowed(context.Background(), acl) }, 1)) != 1 {
 		t.Error("limit not applied")
 	}
 	if _, ok := parseDate("2026-10-01T10:00:00.000+0000"); !ok {

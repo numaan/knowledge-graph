@@ -84,8 +84,11 @@ type REST struct {
 	Feedback FeedbackSink
 	Timeout  time.Duration // per tool call
 	// node reads one node by id; nil means not found or not visible. Tests replace it.
-	node    func(ctx context.Context, id string) (map[string]any, error)
-	reqs    func(ctx context.Context, repo string) ([]map[string]any, error)
+	node func(ctx context.Context, id string) (map[string]any, error)
+	reqs func(ctx context.Context, repo string) ([]map[string]any, error)
+	// access puts the caller's ACL groups into the context for node and reqs, which read the
+	// graph directly (tool calls get them from the access middleware). nil in tests.
+	access  func(ctx context.Context, c *Caller) context.Context
 	session *mcp.ClientSession
 	server  *mcp.ServerSession
 }
@@ -95,8 +98,11 @@ const callerMeta = "kg/caller"
 // newREST connects an in-memory client to m. Call it after all tools are registered.
 func newREST(ctx context.Context, s *Server, m *mcp.Server) (*REST, error) {
 	api := &REST{Identity: localIdentity, Feedback: logSink{}, Timeout: 120 * time.Second}
-	if s != nil && s.graph != nil {
-		api.node, api.reqs = s.nodeByID, s.requirements
+	if s != nil {
+		api.access = func(ctx context.Context, c *Caller) context.Context { return withAccess(ctx, s.restAccess(c)) }
+		if s.graph != nil {
+			api.node, api.reqs = s.nodeByID, s.requirements
+		}
 	}
 	// The caller travels as _meta on the call; only this session may set it, so MCP clients cannot spoof it.
 	m.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
@@ -156,7 +162,11 @@ func (api *REST) with(h func(w http.ResponseWriter, r *http.Request) (int, any, 
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
-		r = r.WithContext(WithCaller(r.Context(), caller))
+		ctx := WithCaller(r.Context(), caller)
+		if api.access != nil {
+			ctx = api.access(ctx, caller)
+		}
+		r = r.WithContext(ctx)
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		status, v, err := h(w, r)
 		if err != nil {
@@ -320,7 +330,7 @@ func (s *Server) nodeByID(ctx context.Context, id string) (map[string]any, error
 	if acl == nil {
 		acl = row["doc_acl"]
 	}
-	if !s.allowed(acl) {
+	if !s.allowed(ctx, acl) {
 		return nil, nil
 	}
 	delete(props, "acl")

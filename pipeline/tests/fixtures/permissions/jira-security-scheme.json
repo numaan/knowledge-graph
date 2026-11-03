@@ -1,0 +1,4 @@
+{"self": "https://example.atlassian.net/rest/api/3/issuesecurityschemes/10200", "id": 10200, "name": "KGT security",
+ "description": "", "defaultSecurityLevelId": 10300,
+ "levels": [{"self": "https://example.atlassian.net/rest/api/3/securitylevel/10300", "id": "10300", "name": "Security team", "description": ""},
+            {"self": "https://example.atlassian.net/rest/api/3/securitylevel/10301", "id": "10301", "name": "Reporter only", "description": ""}]}

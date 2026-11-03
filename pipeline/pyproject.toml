@@ -34,6 +34,8 @@ kg-github = "kg_pipeline.sources.github:main"
 kg-catalog = "kg_pipeline.sources.catalog:main"
 kg-people = "kg_pipeline.people:main"
 kg-links = "kg_pipeline.code.links:main"
+kg-permissions = "kg_pipeline.sources.permissions:main"
+kg-review = "kg_pipeline.review:main"
 
 [build-system]
 requires = ["setuptools>=69"]

@@ -1,0 +1,64 @@
+{{/* OIDC, ACL mapping, audit and write-back settings of the MCP server (stream governance). */}}
+{{- define "kg.oidcIssuer" -}}
+{{- $o := .Values.mcp.oidc -}}
+{{- if $o.issuer -}}
+{{- $o.issuer -}}
+{{- else if .Values.keycloak.enabled -}}
+{{- printf "http://%s-keycloak:%v/realms/%s" (include "kg.name" .) .Values.keycloak.port .Values.keycloak.realm -}}
+{{- else -}}
+{{- fail "mcp.oidc.enabled needs mcp.oidc.issuer or keycloak.enabled" -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "kg.mcpGovernanceEnv" -}}
+{{- $m := .Values.mcp -}}
+{{- with $m.oidc }}{{- if .enabled }}
+- name: KG_OIDC_ISSUER
+  value: {{ include "kg.oidcIssuer" $ | quote }}
+- name: KG_OIDC_AUDIENCE
+  value: {{ .audience | quote }}
+- name: KG_OIDC_GROUPS_CLAIM
+  value: {{ .groupsClaim | quote }}
+{{- with .jwksUrl }}
+- name: KG_OIDC_JWKS_URL
+  value: {{ . | quote }}
+{{- end }}
+{{- with .resource }}
+- name: KG_OIDC_RESOURCE
+  value: {{ . | quote }}
+{{- end }}
+{{- with .scopes }}
+- name: KG_OIDC_SCOPES
+  value: {{ . | quote }}
+{{- end }}
+{{- with .writeScope }}
+- name: KG_OIDC_WRITE_SCOPE
+  value: {{ . | quote }}
+{{- end }}
+{{- end }}{{- end }}
+{{- if $m.aclMapping }}
+- name: KG_ACL_MAPPING
+  value: /etc/kg/acl-mapping.yaml
+{{- end }}
+{{- with $m.audit }}
+- name: KG_AUDIT
+  value: {{ .mode | default "stdout" | quote }}
+{{- with .file }}
+- name: KG_AUDIT_FILE
+  value: {{ . | quote }}
+{{- end }}
+{{- end }}
+- name: KG_WRITEBACK
+  value: {{ ternary "on" "off" (ne $m.writeback false) | quote }}
+{{- end -}}
+
+{{- if and .Values.mcp.enabled .Values.mcp.aclMapping }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "kg.name" . }}-acl-mapping
+  labels: {{- include "kg.labels" . | nindent 4 }}
+data:
+  acl-mapping.yaml: |
+    {{- toYaml .Values.mcp.aclMapping | nindent 4 }}
+{{- end }}

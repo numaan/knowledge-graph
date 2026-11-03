@@ -1,0 +1,92 @@
+{{- if .Values.keycloak.enabled }}
+{{- $name := include "kg.name" . -}}
+{{- $k := .Values.keycloak -}}
+{{- $sel := dict "ctx" $ "component" "keycloak" -}}
+{{- $secret := printf "%s-keycloak" $name -}}
+{{- $pw := include "kg.existingSecretValue" (dict "ctx" $ "secret" $secret "key" "KC_BOOTSTRAP_ADMIN_PASSWORD") | default (randAlphaNum 24) -}}
+# Dev Keycloak (start-dev, in-memory database): every restart imports the realm again.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secret }}
+  labels: {{- include "kg.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  KC_BOOTSTRAP_ADMIN_USERNAME: {{ $k.adminUser | quote }}
+  KC_BOOTSTRAP_ADMIN_PASSWORD: {{ $pw | quote }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-keycloak-realm
+  labels: {{- include "kg.labels" . | nindent 4 }}
+data:
+  kg-realm.json: |
+    {{- .Files.Get "files/keycloak/kg-realm.json" | nindent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-keycloak
+  labels: {{- include "kg.labels" . | nindent 4 }}
+spec:
+  selector: {{- include "kg.selector" $sel | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $k.port }}
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}-keycloak
+  labels: {{- include "kg.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{- include "kg.selector" $sel | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "kg.selector" $sel | nindent 8 }}
+      annotations:
+        checksum/realm: {{ .Files.Get "files/keycloak/kg-realm.json" | sha256sum }}
+    spec:
+      containers:
+        - name: keycloak
+          image: {{ $k.image }}
+          args: ["start-dev", "--import-realm"]
+          envFrom:
+            - secretRef:
+                name: {{ $secret }}
+          env:
+            # Tokens carry this issuer whether they are fetched in the cluster or through a
+            # port-forward, so the MCP server can check iss against the in-cluster URL.
+            - name: KC_HOSTNAME
+              value: {{ printf "http://%s-keycloak:%v" $name $k.port | quote }}
+            - name: KC_HTTP_ENABLED
+              value: "true"
+            - name: KC_HTTP_PORT
+              value: {{ $k.port | quote }}
+            - name: KC_HEALTH_ENABLED
+              value: "true"
+          ports:
+            - name: http
+              containerPort: {{ $k.port }}
+            - name: management
+              containerPort: 9000
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: management
+            periodSeconds: 10
+            failureThreshold: 30
+          volumeMounts:
+            - name: realm
+              mountPath: /opt/keycloak/data/import
+              readOnly: true
+          resources: {{- toYaml $k.resources | nindent 12 }}
+      volumes:
+        - name: realm
+          configMap:
+            name: {{ $name }}-keycloak-realm
+{{- end }}

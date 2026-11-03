@@ -190,7 +190,7 @@ func (s *Server) registerPeople(m *mcp.Server) {
 			if len(sourceIDs) > 0 {
 				rows = append(rows, must(s.graph.Read(ctx, sourceEvidence, map[string]any{"ids": sourceIDs}))...)
 			}
-			out := rankExperts(rows, time.Now(), s.allowed, clamp(in.Limit, 1, 20, 5))
+			out := rankExperts(rows, time.Now(), func(acl any) bool { return s.allowed(ctx, acl) }, clamp(in.Limit, 1, 20, 5))
 			note := ""
 			if len(out) == 0 {
 				note = "no people found; run kg-git-history, kg-github, kg-jira and then kg-people"
@@ -207,7 +207,7 @@ func (s *Server) registerPeople(m *mcp.Server) {
 				AND (n.id = $ref OR toLower(n.name) = toLower($ref)) AND ($repo = '' OR n.repo = $repo)
 				RETURN n.id AS id, [l IN labels(n) WHERE l <> 'Source'][0] AS kind, n.acl AS acl LIMIT 1`,
 				map[string]any{"ref": in.Node, "repo": repo})))
-			if entity != nil && s.allowed(entity["acl"]) {
+			if entity != nil && s.allowed(ctx, entity["acl"]) {
 				return nil, Doc{Data: s.entityOwners(ctx, entity["id"].(string))}, nil
 			}
 			id, err := s.codeNode(ctx, in.Node, repo)
@@ -217,12 +217,12 @@ func (s *Server) registerPeople(m *mcp.Server) {
 			p := map[string]any{"id": id}
 			file := `MATCH (x:Code {id: $id}) OPTIONAL MATCH (x)<-[:DEFINES]-(f:File) WITH coalesce(f, x) AS file `
 			data := map[string]any{"node": id,
-				"code_owners": s.visible(must(s.graph.Read(ctx, file+`
+				"code_owners": s.visible(ctx, must(s.graph.Read(ctx, file+`
 					MATCH (o:Source)-[r:OWNS]->(file) WHERE o:Team OR o:Person
 					RETURN [l IN labels(o) WHERE l <> 'Source'][0] AS kind, o.id AS id, o.title AS name,
 					       r.via AS via, r.pattern AS pattern, o.acl AS acl ORDER BY kind DESC, name`, p))),
 			}
-			services := s.visible(must(s.graph.Read(ctx, file+`
+			services := s.visible(ctx, must(s.graph.Read(ctx, file+`
 				MATCH (svc:Service)-[:IMPLEMENTED_IN]->(t) WHERE t = file OR (t:Repository AND t.name = file.repo)
 				RETURN svc.id AS id, svc.name AS name, svc.acl AS acl ORDER BY t = file DESC, name`, p)))
 			list := []map[string]any{}
@@ -244,10 +244,10 @@ func (s *Server) codeNode(ctx context.Context, ref, repo string) (string, error)
 }
 
 // visible drops rows the server may not see and removes their acl.
-func (s *Server) visible(rows []map[string]any) []map[string]any {
+func (s *Server) visible(ctx context.Context, rows []map[string]any) []map[string]any {
 	out := []map[string]any{}
 	for _, r := range rows {
-		if s.allowed(r["acl"]) {
+		if s.allowed(ctx, r["acl"]) {
 			delete(r, "acl")
 			out = append(out, r)
 		}
@@ -264,15 +264,15 @@ func (s *Server) entityOwners(ctx context.Context, id string) map[string]any {
 	if e == nil {
 		return map[string]any{"id": id}
 	}
-	e["owners"] = s.visible(must(s.graph.Read(ctx, `MATCH (o:Source)-[r:OWNS]->(:Source {id: $id}) WHERE o:Team OR o:Person
+	e["owners"] = s.visible(ctx, must(s.graph.Read(ctx, `MATCH (o:Source)-[r:OWNS]->(:Source {id: $id}) WHERE o:Team OR o:Person
 		RETURN [l IN labels(o) WHERE l <> 'Source'][0] AS kind, o.id AS id, o.title AS name, r.via AS via, o.acl AS acl`, p)))
-	e["members"] = s.visible(must(s.graph.Read(ctx, `MATCH (n:Source {id: $id}) OPTIONAL MATCH (t:Team)-[:OWNS]->(n)
+	e["members"] = s.visible(ctx, must(s.graph.Read(ctx, `MATCH (n:Source {id: $id}) OPTIONAL MATCH (t:Team)-[:OWNS]->(n)
 		WITH n, collect(t) AS owners WITH [x IN owners + [n] WHERE x:Team] AS teams UNWIND teams AS t
 		MATCH (p:Person)-[:MEMBER_OF]->(t) RETURN DISTINCT p.id AS id, p.name AS name, t.title AS team, p.acl AS acl
 		ORDER BY team, name LIMIT 50`, p)))
-	e["part_of"] = s.visible(must(s.graph.Read(ctx, `MATCH (:Source {id: $id})-[:PART_OF]->(x:Source)
+	e["part_of"] = s.visible(ctx, must(s.graph.Read(ctx, `MATCH (:Source {id: $id})-[:PART_OF]->(x:Source)
 		RETURN [l IN labels(x) WHERE l <> 'Source'][0] AS kind, x.id AS id, x.title AS name, x.acl AS acl`, p)))
-	e["apis"] = s.visible(must(s.graph.Read(ctx, `MATCH (:Source {id: $id})-[r:PROVIDES_API|CONSUMES_API]->(a:API)
+	e["apis"] = s.visible(ctx, must(s.graph.Read(ctx, `MATCH (:Source {id: $id})-[r:PROVIDES_API|CONSUMES_API]->(a:API)
 		RETURN toLower(type(r)) AS relation, a.id AS id, a.name AS name, a.acl AS acl ORDER BY relation, name`, p)))
 	code := one(must(s.graph.Read(ctx, `MATCH (:Source {id: $id})-[:IMPLEMENTED_IN]->(c:Code)
 		WHERE $repos IS NULL OR c.repo IN $repos

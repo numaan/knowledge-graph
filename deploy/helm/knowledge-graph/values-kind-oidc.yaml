@@ -1,0 +1,23 @@
+# OIDC test on kind: add this file after values-kind.yaml.
+#
+#   helm install kg deploy/helm/knowledge-graph -n kg --create-namespace \
+#     -f deploy/helm/knowledge-graph/values-kind.yaml -f deploy/helm/knowledge-graph/values-kind-oidc.yaml
+#
+# Keycloak realm "kg" has the groups kg-admins, team-precept and team-hr, and one confidential client
+# per group for tests (kg-agent-admin, kg-agent-precept, kg-agent-hr; client-credentials grant).
+# docs/streams/governance.md has the token and tool-call steps.
+
+keycloak:
+  enabled: true
+
+mcp:
+  aclGroups: "*"
+  oidc:
+    enabled: true
+    writeScope: kg:write
+  aclMapping:
+    default: []
+    groups:
+      kg-admins: ["*"]
+      team-precept: [repo:itsdangerous, jira:KGT, confluence:KGT]
+      team-hr: [jira:HR, confluence:HR]

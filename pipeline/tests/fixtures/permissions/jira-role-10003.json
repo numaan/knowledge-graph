@@ -1,0 +1,3 @@
+{"self": "https://example.atlassian.net/rest/api/3/project/10000/role/10003", "name": "Administrators", "id": 10003,
+ "actors": [{"id": 3, "displayName": "jira-admins", "type": "atlassian-group-role-actor", "name": "jira-admins",
+             "actorGroup": {"name": "jira-admins", "displayName": "jira-admins", "groupId": "a1"}}]}

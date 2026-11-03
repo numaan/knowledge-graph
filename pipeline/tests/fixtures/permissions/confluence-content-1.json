@@ -1,0 +1,9 @@
+{"results": [
+  {"id": "1", "type": "page", "status": "current", "title": "Scenario builder ADR", "ancestors": [],
+   "restrictions": {"read": {"operation": "read", "restrictions": {"user": {"results": [], "start": 0, "limit": 200, "size": 0},
+                                                                  "group": {"results": [], "start": 0, "limit": 200, "size": 0}}}}},
+  {"id": "2", "type": "page", "status": "current", "title": "Scenario API", "ancestors": [{"id": "1", "type": "page"}],
+   "restrictions": {"read": {"operation": "read", "restrictions": {"user": {"results": [], "size": 0},
+     "group": {"results": [{"type": "group", "name": "HR", "id": "h1"}, {"type": "group", "name": "eng", "id": "e1"}], "size": 2}}}}}],
+ "start": 0, "limit": 2, "size": 2,
+ "_links": {"base": "https://example.atlassian.net/wiki", "context": "/wiki", "next": "/rest/api/content?spaceKey=KGT&type=page&limit=2&start=2&expand=restrictions.read.restrictions.group,ancestors"}}

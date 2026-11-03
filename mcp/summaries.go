@@ -141,7 +141,7 @@ func (s *Server) registerSummaries(m *mcp.Server) {
 			if err != nil {
 				return nil, Doc{}, err
 			}
-			if !s.allowedRepo(repo) {
+			if !s.allowedRepo(ctx, repo) {
 				return nil, Doc{}, fmt.Errorf("repository %s is not visible to this server", repo)
 			}
 			sum := one(must(s.graph.Read(ctx, `UNWIND range(0, size($targets) - 1) AS i
