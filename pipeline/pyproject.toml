@@ -14,7 +14,9 @@ dependencies = [
 [project.optional-dependencies]
 # dagster-postgres and dagster-k8s: run pods read the instance from PostgreSQL and use the K8s launcher
 dagster = ["dagster==1.13.28", "dagster-postgres==0.29.28", "dagster-k8s==0.29.28", "sqlalchemy>=2.0,<2.1"]  # 2.1 switches postgresql:// to psycopg 3
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "ruff>=0.14"]
+# OpenTelemetry tracing (kg_pipeline/telemetry.py); off unless OTEL_EXPORTER_OTLP_ENDPOINT is set
+otel = ["opentelemetry-sdk>=1.38,<2", "opentelemetry-exporter-otlp-proto-http>=1.38,<2"]
 
 [project.scripts]
 kg-ingest-code = "kg_pipeline.code.ingest:main"
@@ -26,6 +28,8 @@ kg-eval = "kg_pipeline.evaluate:main"
 kg-jira = "kg_pipeline.sources.jira:main"
 kg-git-history = "kg_pipeline.sources.history:main"
 kg-docs = "kg_pipeline.sources.documents:main"
+kg-fake-embedder = "kg_pipeline.fake_embed:main"
+kg-backup = "kg_pipeline.backup:main"
 
 [build-system]
 requires = ["setuptools>=69"]
@@ -33,3 +37,13 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["kg_pipeline*"]
+
+# Lint in CI: pyflakes and syntax errors only; the code style allows short names and named lambdas.
+[tool.ruff]
+line-length = 130
+target-version = "py311"
+extend-exclude = ["kg_pipeline/code/scip_pb2.py", "tests/fixtures/bookshop"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+ignore = ["E731", "E741"]

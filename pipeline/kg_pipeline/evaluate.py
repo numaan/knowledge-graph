@@ -3,9 +3,11 @@
     kg-eval eval/precept.yaml                 # print a report
     kg-eval eval/precept.yaml --json out.json # also write the numbers (compare runs in CI)
     kg-eval eval/precept.yaml --min-hit 0.8   # exit 1 below this search hit rate
+    kg-eval eval/fixture.yaml --min-hit 0.8 --min-mrr 0.5 --min-impact 1   # CI gates
 
 Metrics: search hit@k and MRR (rank of the first expected symbol), impact recall, requirement
-verdict accuracy. Run it after every change to parsing, search or prompts.
+verdict accuracy, and for answer cases citation recall, citation validity and fact coverage of the
+MCP `ask` tool (KG_MCP_URL; see eval_answer.py). Run it after every change to parsing, search or prompts.
 """
 from __future__ import annotations
 
@@ -18,6 +20,7 @@ from pathlib import Path
 
 import yaml
 
+from .eval_answer import eval_answers
 from .graph.neo4j_writer import Neo4jWriter
 from .models import Embedder
 from .search import candidates, expand
@@ -93,29 +96,68 @@ def report(name: str, res: dict) -> str:
     out += ["", "## Wrong verdicts", ""] + ([f"- {r['ref']}: expected {r['expected']}, got {r['got']}" for r in wrong] or ["- none"])
     bad = [r for r in i["rows"] if not r["ok"]]
     out += ["", "## Impact misses", ""] + ([f"- {r['symbol']} ({r['affected']} affected)" for r in bad] or ["- none"])
+    a = res.get("answer") or {}
+    if a.get("skipped"):
+        out += ["", "## Answers", "", f"- skipped ({a['cases']} cases): {a['skipped']}"]
+    elif a.get("cases"):
+        out += ["", "## Answers", "", "| Metric | Value |", "|---|---|",
+                f"| Citation recall | {a['citation_recall']:.0%} ({a['cases']} questions) |",
+                f"| Citation validity | {a['citation_validity']:.0%} |",
+                f"| Fact coverage | {a['fact_coverage']:.0%} ({a['judge']} judge) |",
+                f"| Seconds per question | {a['seconds_per_question']} |", ""]
+        out += [f"- {r['question']}: missing citations {r['missing_citations']}, missing facts {r['missing_facts']}"
+                for r in a["rows"] if r["missing_citations"] or r["missing_facts"] or r["invalid_citations"]] or ["- no misses"]
     return "\n".join(out) + "\n"
 
 
-def run(w: Neo4jWriter, emb: Embedder, spec: dict) -> dict:
+def run(w: Neo4jWriter, emb: Embedder, spec: dict, judge: str = "string", mcp_url: str | None = None) -> dict:
     repo, k = spec["repo"], int(spec.get("k", 8))
+    llm = None
+    if judge == "llm":
+        from .models import LLM
+
+        llm = LLM()
+    cache = Path(os.environ["LLM_CACHE_DIR"]) if os.environ.get("LLM_CACHE_DIR") else None
     return {"repo": repo, "k": k,
             "search": eval_search(w, emb, repo, spec.get("search", []), k),
             "impact": eval_impact(w, repo, spec.get("impact", [])),
-            "requirements": eval_requirements(w, repo, spec.get("requirements", []))}
+            "requirements": eval_requirements(w, repo, spec.get("requirements", [])),
+            "answer": eval_answers(w, repo, spec.get("answer", []), mcp_url, judge, llm, cache)}
+
+
+def gate_failures(res: dict, gates: dict[str, float]) -> list[str]:
+    """Metrics below their threshold. Answer gates apply only when the answer cases ran."""
+    a = res.get("answer") or {}
+    values = {"min_hit": res["search"]["hit_at_k"], "min_mrr": res["search"]["mrr"],
+              "min_impact": res["impact"]["recall"] if res["impact"]["cases"] else None}
+    if a.get("cases") and not a.get("skipped"):
+        values |= {"min_citation_recall": a["citation_recall"], "min_citation_validity": a["citation_validity"],
+                   "min_fact_coverage": a["fact_coverage"]}
+    return [f"{name[4:]} {values[name]} < {limit}" for name, limit in gates.items()
+            if limit and values.get(name) is not None and values[name] < limit]
 
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("spec", type=Path)
     ap.add_argument("--json", type=Path)
-    ap.add_argument("--min-hit", type=float, default=0.0)
+    ap.add_argument("--min-hit", type=float, default=0.0, help="exit 1 below this search hit@k")
+    ap.add_argument("--min-mrr", type=float, default=0.0, help="exit 1 below this search MRR")
+    ap.add_argument("--min-impact", type=float, default=0.0, help="exit 1 below this impact recall")
+    ap.add_argument("--min-citation-recall", type=float, default=0.0)
+    ap.add_argument("--min-citation-validity", type=float, default=0.0)
+    ap.add_argument("--min-fact-coverage", type=float, default=0.0)
+    ap.add_argument("--judge", choices=["string", "llm"], default="string", help="fact check for answer cases")
+    ap.add_argument("--mcp-url", help="MCP endpoint for answer cases (default: KG_MCP_URL)")
     args = ap.parse_args(argv)
     spec = yaml.safe_load(args.spec.read_text(encoding="utf-8"))
     with Neo4jWriter(os.environ.get("NEO4J_URI", "bolt://localhost:7687"), os.environ.get("NEO4J_USER", "neo4j"),
                      os.environ["NEO4J_PASSWORD"]) as w:
-        res = run(w, Embedder(), spec)
+        res = run(w, Embedder(), spec, args.judge, args.mcp_url)
     print(report(args.spec.name, res))
     if args.json:
         args.json.write_text(json.dumps(res, indent=2), encoding="utf-8")
-    if res["search"]["hit_at_k"] < args.min_hit:
+    failed = gate_failures(res, {k: v for k, v in vars(args).items() if k.startswith("min_")})
+    if failed:
+        print("Gate failed: " + "; ".join(failed), file=sys.stderr)
         sys.exit(1)

@@ -1,0 +1,85 @@
+{{- if and .Values.backup.enabled (eq .Values.graph.backend "neo4j") }}
+{{- $name := include "kg.name" . -}}
+{{- $b := .Values.backup -}}
+{{- $s3 := eq $b.target "s3" -}}
+{{- if not (has $b.target (list "pvc" "s3")) }}{{ fail "backup.target must be pvc or s3" }}{{ end }}
+# Neo4j backup: kg-backup dump (online, logical) to a PVC folder or to S3-compatible storage.
+# Restore procedure: docs/streams/ops-eval.md.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $name }}-neo4j-backup
+  labels: {{- include "kg.labels" . | nindent 4 }}
+spec:
+  schedule: {{ $b.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: {{ $b.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels: {{- include "kg.selector" (dict "ctx" $ "component" "neo4j-backup") | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsUser: 10001
+            runAsNonRoot: true
+            fsGroup: 10001
+          {{- if $s3 }}
+          initContainers:
+          {{- else }}
+          containers:
+          {{- end }}
+            - name: dump
+              image: {{ required "backup.image is required: the kg-pipeline image (it has kg-backup)" $b.image }}
+              command: ["kg-backup", "dump", "--out", {{ ternary "/work" (printf "/backup/%s" $b.pvc.path) $s3 | quote }},
+                        "--keep", {{ ternary "1" ($b.keep | toString) $s3 | quote }}]
+              envFrom:
+                - configMapRef:
+                    name: {{ $name }}-endpoints
+              env:
+                - name: NEO4J_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ $name }}-credentials
+                      key: NEO4J_PASSWORD
+              resources: {{- toYaml $b.resources | nindent 16 }}
+              volumeMounts:
+                - name: {{ ternary "work" "backup" $s3 }}
+                  mountPath: {{ ternary "/work" "/backup" $s3 }}
+          {{- if $s3 }}
+          containers:
+            - name: upload
+              image: {{ $b.s3.image }}
+              command: ["aws", "s3", "cp", "/work/", {{ printf "s3://%s/%s" $b.s3.bucket $b.s3.prefix | quote }},
+                        "--recursive", "--exclude", "*", "--include", "neo4j-*.jsonl.gz"
+                        {{- with $b.s3.endpoint }}, "--endpoint-url", {{ . | quote }}{{ end }}]
+              env:
+                - name: AWS_DEFAULT_REGION
+                  value: {{ $b.s3.region | quote }}
+                - name: HOME
+                  value: /tmp
+              envFrom:
+                - secretRef:
+                    name: {{ required "backup.s3.secretName is required (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)" $b.s3.secretName }}
+              resources:
+                requests: { cpu: 50m, memory: 128Mi }
+                limits: { memory: 512Mi }
+              volumeMounts:
+                - name: work
+                  mountPath: /work
+          {{- end }}
+          volumes:
+            {{- if $s3 }}
+            - name: work
+              emptyDir:
+                sizeLimit: {{ $b.s3.scratchSize }}
+            {{- else }}
+            - name: backup
+              persistentVolumeClaim:
+                claimName: {{ $b.pvc.claimName | default (printf "%s-source-archive" $name) }}
+            {{- end }}
+{{- end }}

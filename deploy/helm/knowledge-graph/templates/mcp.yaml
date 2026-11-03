@@ -26,6 +26,12 @@ spec:
   template:
     metadata:
       labels: {{- include "kg.selector" $sel | nindent 8 }}
+      {{- if $.Values.observability.prometheusAnnotations }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: {{ $m.port | quote }}
+      {{- end }}
     spec:
       containers:
         - name: mcp

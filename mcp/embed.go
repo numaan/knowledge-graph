@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Qwen3-Embedding expects an instruction on the query side only (documents were embedded without one).
@@ -26,7 +28,10 @@ func NewEmbedder(url, model, key string) *Embedder {
 		client: &http.Client{Timeout: 60 * time.Second}}
 }
 
-func (e *Embedder) Query(ctx context.Context, text string) ([]float64, error) {
+func (e *Embedder) Query(ctx context.Context, text string) (_ []float64, err error) {
+	ctx, span, start := childSpan(ctx, "embeddings "+e.Model, attribute.String("gen_ai.operation.name", "embeddings"),
+		attribute.String("gen_ai.request.model", e.Model), attribute.String("openinference.span.kind", "EMBEDDING"))
+	defer func() { endSpan(span, start, embedSeconds, err) }()
 	body, _ := json.Marshal(map[string]any{"model": e.Model, "input": []string{queryInstruction + text}})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.URL+"/v1/embeddings", bytes.NewReader(body))
 	if err != nil {

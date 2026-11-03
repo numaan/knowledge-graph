@@ -4,7 +4,7 @@
 //	kg-mcp -http :8000          Streamable HTTP at /mcp (Kubernetes)
 //
 // Environment: NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, EMBEDDINGS_URL, EMBEDDINGS_MODEL,
-// EMBEDDINGS_API_KEY, KG_DEFAULT_REPO, MCP_HTTP_ADDR (same as -http).
+// EMBEDDINGS_API_KEY, KG_DEFAULT_REPO, MCP_HTTP_ADDR (same as -http), OTEL_EXPORTER_OTLP_ENDPOINT (tracing, see telemetry.go).
 package main
 
 import (
@@ -36,6 +36,7 @@ func newMCPServer(s *Server) *mcp.Server {
 			"method (parser, scip, treesitter, llm) and confidence: treat llm and low-confidence edges as hints.",
 	})
 	s.register(m)
+	m.AddReceivingMiddleware(observe) // spans and metrics per tool call
 	return m
 }
 
@@ -46,6 +47,7 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+	defer setupTracing(ctx)(context.Background())
 
 	graph, err := NewGraph(env("NEO4J_URI", "bolt://localhost:7687"), env("NEO4J_USER", "neo4j"), os.Getenv("NEO4J_PASSWORD"))
 	if err != nil {
@@ -75,6 +77,7 @@ func main() {
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil))
+	mux.Handle("/metrics", metricsHandler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if err := graph.Verify(r.Context()); err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)

@@ -21,6 +21,7 @@ from .graph.neo4j_writer import Neo4jWriter
 from .models import LLM, Embedder
 from .sources import documents, git, history, jira
 from .sources.atlassian import Atlassian
+from .telemetry import traced_asset
 from .vectors import embed_repo, embed_sources
 
 REPOS = {git.repo_name(u): u for u in os.environ.get("GIT_REPOSITORIES", "").split(",") if u}
@@ -37,6 +38,7 @@ def _writer() -> Neo4jWriter:
 
 
 @dg.asset(partitions_def=repo_partitions, kinds={"neo4j"}, group_name="code")
+@traced_asset
 def code_snapshot(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Code layer of one repository (files, symbols, imports, calls, chunks, ODM). Writes only changes."""
     name = context.partition_key
@@ -62,6 +64,7 @@ def code_snapshot(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
 
 
 @dg.asset(partitions_def=repo_partitions, deps=[code_snapshot], kinds={"neo4j"}, group_name="code")
+@traced_asset
 def git_history(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Commits since the last run, the files and symbols they changed, and the tickets they name."""
     name = context.partition_key
@@ -71,6 +74,7 @@ def git_history(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
 
 
 @dg.asset(partitions_def=repo_partitions, deps=[code_snapshot], kinds={"neo4j"}, group_name="domain")
+@traced_asset
 def domain_model(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Roles (entity, endpoint, ...) plus LLM-extracted concepts, business rules and capabilities."""
     llm = None if os.environ.get("DOMAIN_LLM") == "off" else LLM()
@@ -81,6 +85,7 @@ def domain_model(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
 
 
 @dg.asset(partitions_def=repo_partitions, deps=[domain_model], kinds={"neo4j"}, group_name="domain")
+@traced_asset
 def vector_index(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Embeddings for changed code chunks and domain concepts (Neo4j vector indexes)."""
     with _writer() as w:
@@ -90,6 +95,7 @@ def vector_index(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
 
 
 @dg.asset(kinds={"neo4j", "jira"}, group_name="sources")
+@traced_asset
 def jira_issues(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Stories, bugs, epics and releases updated since the last run, for each project in JIRA_PROJECTS."""
     if not JIRA_PROJECTS:
@@ -102,6 +108,7 @@ def jira_issues(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
 
 
 @dg.asset(kinds={"neo4j", "confluence"}, group_name="sources")
+@traced_asset
 def confluence_pages(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Pages of each space in CONFLUENCE_SPACES; unchanged versions are skipped."""
     if not CONFLUENCE_SPACES:
@@ -114,6 +121,7 @@ def confluence_pages(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
 
 
 @dg.asset(deps=[jira_issues, confluence_pages], kinds={"neo4j"}, group_name="sources")
+@traced_asset
 def source_vectors(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Embeddings for changed tickets and document sections."""
     with _writer() as w:
