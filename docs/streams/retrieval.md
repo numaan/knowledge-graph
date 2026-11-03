@@ -152,8 +152,10 @@ read the old names.
   | MRR | 0.392 | not measured |
   | Seconds per query | 2.71 | not measured |
 
-  The reranker run stopped because the Docker Desktop API failed (HTTP 500) while the TEI container
-  warmed up `bge-reranker-v2-m3` on the CPU. Run step 3 of section 3 before you turn the reranker on.
+  The reranker run stopped for two reasons. TEI stayed in "Warming up model" for more than 30 minutes
+  on the overloaded CPU (default `--max-batch-tokens` 16384). Then the Docker Desktop API failed with
+  HTTP 500 again and again, so a restart with a smaller `--max-batch-tokens 4096` was not possible.
+  Run step 3 of section 3 on a quiet host before you turn the reranker on.
 - The TEI CPU image found no ONNX files for `bge-reranker-v2-m3` and fell back to `model.safetensors`
   (2.2 GB). The download from Hugging Face broke twice. A resumable `curl` download into a folder and
   `--model-id /model` worked. In a cluster, give the reranker PVC the time and space for that download.
