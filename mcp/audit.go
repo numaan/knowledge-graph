@@ -104,6 +104,8 @@ func (s *Server) accessMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
 			user, _ := extra.TokenInfo.Extra["user"].(string)
 			groups, _ := extra.TokenInfo.Extra["groups"].([]string)
 			a = s.accessFor(user, groups, extra.TokenInfo.Scopes)
+		} else if c := CallerFrom(ctx); c != nil { // the REST layer (rest.go) set the caller
+			a = s.restAccess(c)
 		} else if s.requireCaller {
 			a = &Access{User: "anonymous", Groups: map[string]bool{}, Via: "none"}
 		}

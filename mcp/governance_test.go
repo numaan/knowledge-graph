@@ -501,7 +501,7 @@ func TestFeedbackSink(t *testing.T) {
 	s.proposals = f
 	ctx := withAccess(context.Background(), &Access{User: "carol", Groups: map[string]bool{"jira:PREC": true}, Via: "token"})
 	sink := s.feedbackSink()
-	if err := sink.Submit(ctx, Feedback{NodeID: "jira:PREC-1", Kind: "outdated", Comment: "superseded", User: "mallory"}); err != nil {
+	if err := sink.Submit(ctx, Feedback{NodeID: "jira:PREC-1", Kind: "outdated", Comment: "superseded", Caller: &Caller{Subject: "mallory"}}); err != nil {
 		t.Fatal(err)
 	}
 	p := f.proposals[0]
@@ -513,6 +513,43 @@ func TestFeedbackSink(t *testing.T) {
 		if sink.Submit(ctx, bad) == nil {
 			t.Errorf("feedback accepted: %+v", bad)
 		}
+	}
+	// a REST caller without an Access in the context: OIDC mode maps its token groups
+	s.requireCaller = true
+	s.mapping = &aclMapping{Groups: map[string][]string{"team-hr": {"jira:HR"}}}
+	rest := WithCaller(context.Background(), &Caller{Subject: "u-dana", Name: "dana", Groups: []string{"/team-hr"}})
+	if err := sink.Submit(rest, Feedback{NodeID: "jira:HR-7", Kind: "wrong"}); err != nil {
+		t.Fatal(err)
+	}
+	if p := f.proposals[1]; p["author"] != "dana" || p["author_via"] != "rest" {
+		t.Errorf("REST feedback: %v", p)
+	}
+	if sink.Submit(rest, Feedback{NodeID: "jira:PREC-1", Kind: "wrong"}) == nil {
+		t.Error("REST caller wrote feedback on a node outside its groups")
+	}
+}
+
+// The access middleware takes the REST caller (rest.go puts it into the context) like a token.
+func TestMiddlewareRESTCaller(t *testing.T) {
+	s := &Server{groups: map[string]bool{"jira:HR": true, "jira:PREC": true}}
+	s.requireCaller = true
+	s.mapping = &aclMapping{Groups: map[string][]string{"team-hr": {"jira:HR", "repo:other"}}}
+	var got *Access
+	h := s.accessMiddleware(func(ctx context.Context, _ string, _ mcp.Request) (mcp.Result, error) {
+		got = accessFrom(ctx)
+		return &mcp.CallToolResult{}, nil
+	})
+	req := &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{Name: "search_knowledge"}}
+	ctx := WithCaller(context.Background(), &Caller{Subject: "u-dana", Name: "dana", Groups: []string{"/team-hr"}})
+	if _, err := h(ctx, "tools/call", req); err != nil || got == nil {
+		t.Fatal(err)
+	}
+	if got.User != "dana" || got.Via != "rest" || strings.Join(sortedGroups(got.Groups), ",") != "jira:HR" {
+		t.Errorf("REST access: %+v", got)
+	}
+	got = nil
+	if _, err := h(context.Background(), "tools/call", req); err == nil || got != nil {
+		t.Error("OIDC mode ran a call without a caller")
 	}
 }
 

@@ -143,31 +143,44 @@ def test_permission_sync_writes_only_changed_acls(monkeypatch):
 # ---- review ---------------------------------------------------------------------------------------
 
 def test_corrections_from_proposals():
-    from kg_pipeline.review import correction_for
+    from kg_pipeline.review import corrections_for, decision_acl
+
+    def one(p, **kw):
+        decision, rows = corrections_for(p, "sam", **kw)
+        assert decision is None and len(rows) == 1
+        return rows[0]
     edge = {"id": "proposal:ab12", "kind": "wrong_fact", "target_id": "r:a.py#f", "edge_type": "REALISES",
             "other_id": "domain:r:invite", "text": "f does not invite", "author": "alice"}
-    c = correction_for(edge, "sam", now="2026-11-04T10:00:00+00:00")
-    assert c == {"id": "correction:ab12", "kind": "suppress_edge", "target_id": "r:a.py#f", "edge_type": "REALISES",
-                 "other_id": "domain:r:invite", "text": "f does not invite", "author": "alice",
-                 "created_at": "2026-11-04T10:00:00+00:00", "status": "active", "proposal_id": "proposal:ab12",
-                 "approved_by": "sam", "approved_at": "2026-11-04T10:00:00+00:00"}
-    node = correction_for({"id": "proposal:1", "kind": "wrong_fact", "target_id": "jira:PREC-1", "text": "old"}, "sam")
+    assert one(edge, now="2026-11-04T10:00:00+00:00") == {
+        "id": "correction:ab12", "kind": "suppress_edge", "target_id": "r:a.py#f", "edge_type": "REALISES",
+        "other_id": "domain:r:invite", "text": "f does not invite", "author": "alice",
+        "created_at": "2026-11-04T10:00:00+00:00", "status": "approved", "proposal_id": "proposal:ab12",
+        "approved_by": "sam", "approved_at": "2026-11-04T10:00:00+00:00"}
+    node = one({"id": "proposal:1", "kind": "wrong_fact", "target_id": "jira:PREC-1", "text": "old"})
     assert node["kind"] == "mark_outdated" and "edge_type" not in node
-    link = correction_for({"id": "proposal:2", "kind": "link", "target_id": "r:a.py#f", "edge_type": "REALISES",
-                           "other_id": "domain:r:x"}, "sam")
+    link = one({"id": "proposal:2", "kind": "link", "target_id": "r:a.py#f", "edge_type": "REALISES", "other_id": "domain:r:x"})
     assert link["kind"] == "add_fact" and link["other_id"] == "domain:r:x"
-    dec = correction_for({"id": "proposal:3", "kind": "decision", "text": "Use PUT", "links": ["a", "b"],
-                          "target_id": "a"}, "sam", text="Use PUT for updates")
-    assert dec["kind"] == "add_fact" and dec["text"] == "Use PUT for updates" and dec["links"] == ["a", "b"]
-    fb = correction_for({"id": "proposal:4", "kind": "feedback", "feedback_kind": "outdated", "target_id": "x"}, "sam")
-    assert fb["kind"] == "mark_outdated"
-    assert correction_for({"id": "proposal:5", "kind": "decision", "text": "t"}, "sam", target="r:a.py")["target_id"] == "r:a.py"
-    with pytest.raises(ValueError):
-        correction_for({"id": "proposal:5", "kind": "decision", "text": "t"}, "sam")          # no target
-    with pytest.raises(ValueError):
-        correction_for(node | {"id": "proposal:6"}, "sam", kind="suppress_edge")              # not an edge
-    with pytest.raises(ValueError):
-        correction_for(edge, "sam", kind="delete_everything")
+    assert one({"id": "proposal:4", "kind": "feedback", "feedback_kind": "outdated", "target_id": "x"})["kind"] == "mark_outdated"
+    assert one({"id": "proposal:4", "kind": "feedback", "feedback_kind": "missing", "target_id": "x"},
+               kind="mark_outdated", text="gone")["text"] == "gone"
+
+    decision, rows = corrections_for({"id": "proposal:3", "kind": "decision", "title": "PUT", "text": "Use PUT",
+                                      "links": ["a", "b"], "author": "alice"}, "sam", text="Use PUT for updates")
+    assert decision["id"] == "decision:3" and decision["text"] == "Use PUT for updates" and decision["title"] == "PUT"
+    assert [(r["id"], r["target_id"], r["edge_type"], r["other_id"]) for r in rows] == [
+        ("correction:3:0", "decision:3", "ABOUT", "a"), ("correction:3:1", "decision:3", "ABOUT", "b")]
+    assert corrections_for({"id": "proposal:5", "kind": "decision", "text": "t"}, "sam", target="r:a.py")[1][0]["other_id"] == "r:a.py"
+
+    for p, kw in [({"id": "proposal:5", "kind": "decision", "text": "t"}, {}),                  # no target
+                  (node | {"id": "proposal:6"}, {"kind": "suppress_edge"}),                     # not an edge
+                  (node | {"id": "proposal:6"}, {"kind": "add_fact"}),                          # add_fact needs an edge
+                  ({"id": "proposal:7", "kind": "feedback", "feedback_kind": "helpful", "target_id": "x"}, {}),
+                  (edge, {"kind": "delete_everything"})]:
+        with pytest.raises(ValueError):
+            corrections_for(p, "sam", **kw)
+
+    assert decision_acl([{"acl": ["jira:PREC"]}, {"repo": "precept"}]) == ["jira:PREC", "repo:precept"]
+    assert decision_acl([{"acl": ["jira:PREC"]}, {"acl": None, "repo": None}]) is None          # one public node
 
 
 def test_review_cli_approve_and_reject():
@@ -177,7 +190,7 @@ def test_review_cli_approve_and_reject():
     w = FakeWriter([{"p": open_p}])
     c = review.approve(w, "proposal:ab12", "sam")
     q, params = w.calls[-1]
-    assert "MERGE (c:Correction {id: $c.id})" in q and "p.status = 'approved'" in q and params["c"] == c
+    assert "MERGE (c:Correction {id: row.id})" in q and "p.status = 'approved'" in q and params["rows"] == [c]
     assert review.reject(FakeWriter([{"p": open_p}]), "proposal:ab12", "sam", "no")["status"] == "rejected"
     with pytest.raises(SystemExit):
         review.approve(FakeWriter([{"p": open_p | {"status": "approved"}}]), "proposal:ab12", "sam")
@@ -205,21 +218,28 @@ def test_permissions_and_review_in_neo4j(monkeypatch):
             sec = w._run("MATCH (s:Section {id: 'confluence:KGT:3#s0'}) RETURN s.acl AS a").records[0]["a"]
             assert sec == ["confluence-group:eng"]
 
-            # the MCP server writes proposals like this one
-            w._run("CREATE (p:Proposal) SET p = $p", p={"id": "proposal:kgt1", "kind": "wrong_fact", "status": "open",
-                   "target_id": "jira:KGT-1", "text": "outdated", "author": "alice", "created_at": "2026-11-04T10:00:00Z",
-                   "content_hash": "kgt1"})
-            w._run("CREATE (p:Proposal) SET p = $p", p={"id": "proposal:kgt2", "kind": "link", "status": "open",
-                   "target_id": "jira:KGT-1", "edge_type": "LINKS", "other_id": "jira:KGT-2", "author": "bob",
-                   "created_at": "2026-11-04T11:00:00Z", "content_hash": "kgt2"})
-            assert [p["id"] for p in list_proposals(w) if p["id"].startswith("proposal:kgt")] == ["proposal:kgt2", "proposal:kgt1"]
-            c = approve(w, "proposal:kgt1", "sam")
-            assert c["kind"] == "mark_outdated"
-            row = w._run("MATCH (p:Proposal {id: 'proposal:kgt1'}) MATCH (c:Correction {id: p.correction_id}) "
+            # the MCP server writes proposals like these
+            for p in ({"id": "proposal:kgt1", "kind": "wrong_fact", "target_id": "jira:KGT-1", "text": "outdated",
+                       "author": "alice", "created_at": "2026-11-04T10:00:00Z"},
+                      {"id": "proposal:kgt2", "kind": "link", "target_id": "jira:KGT-1", "edge_type": "LINKS",
+                       "other_id": "jira:KGT-2", "author": "bob", "created_at": "2026-11-04T11:00:00Z"},
+                      {"id": "proposal:kgt3", "kind": "decision", "text": "Keep KGT-1 open", "author": "alice",
+                       "links": ["jira:KGT-1", "confluence:KGT:3#s0"], "created_at": "2026-11-04T12:00:00Z"}):
+                w._run("CREATE (p:Proposal) SET p = $p", p=p | {"status": "open", "content_hash": p["id"]})
+            assert [p["id"] for p in list_proposals(w) if p["id"].startswith("proposal:kgt")] == [
+                "proposal:kgt3", "proposal:kgt2", "proposal:kgt1"]
+            assert approve(w, "proposal:kgt1", "sam")["kind"] == "mark_outdated"
+            row = w._run("MATCH (p:Proposal {id: 'proposal:kgt1'}) MATCH (c:Correction {id: p.correction_ids[0]}) "
                          "RETURN p.status AS s, c.target_id AS t, c.status AS cs").records[0]
-            assert (row["s"], row["t"], row["cs"]) == ("approved", "jira:KGT-1", "active")
+            assert (row["s"], row["t"], row["cs"]) == ("approved", "jira:KGT-1", "approved")
+            res = approve(w, "proposal:kgt3", "sam")
+            assert len(res["corrections"]) == 2
+            d = w._run("MATCH (d:Source:Decision {id: 'decision:kgt3'}) RETURN d.acl AS acl").records[0]["acl"]
+            kgt1 = w._run("MATCH (t:Ticket {id: 'jira:KGT-1'}) RETURN t.acl AS a").records[0]["a"]
+            assert d == sorted(set(kgt1) | {"confluence-group:eng"})                          # visible to readers of either
             reject(w, "proposal:kgt2", "sam", "not related")
             assert not [p for p in list_proposals(w) if p["id"].startswith("proposal:kgt")]
         finally:
-            w._run("MATCH (n:Source) WHERE n.id STARTS WITH 'jira:KGT' OR n.id STARTS WITH 'confluence:KGT:' DETACH DELETE n")
-            w._run("MATCH (n) WHERE (n:Proposal OR n:Correction) AND (n.id ENDS WITH 'kgt1' OR n.id ENDS WITH 'kgt2') DETACH DELETE n")
+            w._run("MATCH (n:Source) WHERE n.id STARTS WITH 'jira:KGT' OR n.id STARTS WITH 'confluence:KGT:' "
+                   "OR n.id = 'decision:kgt3' DETACH DELETE n")
+            w._run("MATCH (n) WHERE (n:Proposal OR n:Correction) AND n.id CONTAINS ':kgt' DETACH DELETE n")

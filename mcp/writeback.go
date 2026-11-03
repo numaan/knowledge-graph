@@ -183,6 +183,9 @@ func limit(name, v string, lo, hi int) error {
 
 func (s *Server) canWrite(ctx context.Context) error {
 	a := accessFrom(ctx)
+	if a != nil && a.Via == "rest" && s.requireCaller {
+		return nil // the REST layer checked the token; its Caller carries no scopes
+	}
 	if s.writeScope != "" && (a == nil || a.Via != "token" || !slices.Contains(a.Scopes, s.writeScope)) {
 		return deny(ctx, "write-back needs the OAuth scope %s", s.writeScope)
 	}
