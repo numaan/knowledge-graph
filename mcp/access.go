@@ -170,7 +170,9 @@ func loadACLMapping(path string) (*aclMapping, error) {
 	return m, nil
 }
 
-func normGroup(g string) string { return strings.ToLower(strings.TrimPrefix(strings.TrimSpace(g), "/")) }
+func normGroup(g string) string {
+	return strings.ToLower(strings.TrimPrefix(strings.TrimSpace(g), "/"))
+}
 
 func (m *aclMapping) resolve(tokenGroups []string) map[string]bool {
 	out := map[string]bool{}
