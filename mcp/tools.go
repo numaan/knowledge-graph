@@ -13,7 +13,8 @@ type Server struct {
 	graph       *Graph
 	emb         *Embedder
 	defaultRepo string
-	groups      map[string]bool // ACL groups this server may see; see acl.go
+	groups      map[string]bool // ACL groups this server may see (default and upper bound); see acl.go
+	gov                         // per-user access, audit and write-back; see access.go
 }
 
 func (s *Server) repo(r string) string {
@@ -122,6 +123,7 @@ type Doc struct {
 
 func (s *Server) register(m *mcp.Server) {
 	s.registerSources(m)
+	s.registerWriteback(m)
 	mcp.AddTool(m, &mcp.Tool{Name: "search_graph", Description: "Find code for a question in natural language. " +
 		"Hybrid search (vectors + full text + domain concepts) over code chunks, then graph expansion: each result has the " +
 		"symbol, its domain concepts, business rules, callers, callees, related tests and a code excerpt. Start here."},
@@ -278,7 +280,7 @@ func (s *Server) register(m *mcp.Server) {
 				ORDER BY distance, name LIMIT $limit`, map[string]any{"id": in.NodeID, "limit": clamp(in.Limit, 1, 100, 50)})
 			out := []map[string]any{}
 			for _, r := range rows {
-				if s.allowed(r["acl"]) {
+				if s.allowed(ctx, r["acl"]) {
 					delete(r, "acl")
 					out = append(out, r)
 				}
@@ -328,8 +330,8 @@ func (s *Server) register(m *mcp.Server) {
 		"module, main domain concepts, business rules, entities and HTTP endpoints. Without repo: list repositories."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in RepoIn) (*mcp.CallToolResult, Doc, error) {
 			repo := s.repo(in.Repo)
-			if repo != "" && !s.allowedRepo(repo) {
-				return nil, Doc{}, fmt.Errorf("repository %s is not visible to this server", repo)
+			if repo != "" && !s.allowedRepo(ctx, repo) {
+				return nil, Doc{}, deny(ctx, "repository %s is not visible to this server", repo)
 			}
 			if repo == "" {
 				rows, err := s.graph.Read(ctx, `MATCH (r:Repository) WHERE $repos IS NULL OR r.name IN $repos
@@ -361,8 +363,8 @@ func (s *Server) register(m *mcp.Server) {
 		"Requirement. Edges: CONTAINS, DEFINES, PART_OF, IMPORTS, CALLS, USES_TYPE, EXTENDS, IMPLEMENTS, OVERRIDES, " +
 		"REALISES, IMPLEMENTED_BY, CONTRADICTED_BY, VALIDATED_BY, COVERS, USES_CONCEPT."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in CypherIn) (*mcp.CallToolResult, Rows, error) {
-			if !s.groups["*"] {
-				return nil, Rows{}, fmt.Errorf("read_cypher is off for scoped servers (KG_ACL_GROUPS is not *)")
+			if !s.groupsFor(ctx)["*"] {
+				return nil, Rows{}, deny(ctx, "read_cypher is off for scoped callers (groups do not include *)")
 			}
 			if err := checkReadOnly(in.Query); err != nil {
 				return nil, Rows{}, err

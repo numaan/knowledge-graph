@@ -1,15 +1,17 @@
 package main
 
 import (
+	"context"
 	"strings"
 )
 
 // Access control. Every :Source node carries acl, a list of groups such as "jira:PREC",
-// "confluence:ENG" or "repo:precept". The server sees a node when one of its groups is in
-// KG_ACL_GROUPS ("*" sees everything). Nodes without acl are public.
+// "confluence:ENG", "jira-group:precept-devs" or "repo:precept". A caller sees a node when one of
+// its groups is in the acl ("*" sees everything). Nodes without acl are public.
 //
-// Deploy one server per audience (team, agent) with its own KG_ACL_GROUPS; the agent cannot
-// change its groups, because they come from the environment, not from a tool argument.
+// The caller's groups come from the request context (access.go): from the OIDC token in HTTP mode,
+// from KG_ACL_GROUPS otherwise. KG_ACL_GROUPS is also the upper bound for every token. The agent
+// cannot change its groups, because they never come from a tool argument.
 func aclGroups() map[string]bool {
 	out := map[string]bool{}
 	for _, g := range strings.Split(env("KG_ACL_GROUPS", "*"), ",") {
@@ -20,8 +22,9 @@ func aclGroups() map[string]bool {
 	return out
 }
 
-func (s *Server) allowed(acl any) bool {
-	if s.groups["*"] {
+func (s *Server) allowed(ctx context.Context, acl any) bool {
+	groups := s.groupsFor(ctx)
+	if groups["*"] {
 		return true
 	}
 	list, ok := acl.([]any)
@@ -29,9 +32,12 @@ func (s *Server) allowed(acl any) bool {
 		return true
 	}
 	for _, g := range list {
-		if name, _ := g.(string); s.groups[name] {
+		if name, _ := g.(string); groups[name] {
 			return true
 		}
+	}
+	if a := accessFrom(ctx); a != nil && a.stats != nil {
+		a.stats.hidden.Add(1)
 	}
 	return false
 }
@@ -51,6 +57,7 @@ func repoScope(groups map[string]bool) any {
 }
 
 // allowedRepo checks the repo:<name> group for code results.
-func (s *Server) allowedRepo(repo string) bool {
-	return s.groups["*"] || repo == "" || s.groups["repo:"+repo]
+func (s *Server) allowedRepo(ctx context.Context, repo string) bool {
+	groups := s.groupsFor(ctx)
+	return groups["*"] || repo == "" || groups["repo:"+repo]
 }

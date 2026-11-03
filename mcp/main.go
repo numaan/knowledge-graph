@@ -4,7 +4,8 @@
 //	kg-mcp -http :8000          Streamable HTTP at /mcp (Kubernetes)
 //
 // Environment: NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, EMBEDDINGS_URL, EMBEDDINGS_MODEL,
-// EMBEDDINGS_API_KEY, KG_DEFAULT_REPO, MCP_HTTP_ADDR (same as -http).
+// EMBEDDINGS_API_KEY, KG_DEFAULT_REPO, MCP_HTTP_ADDR (same as -http). Governance: KG_ACL_GROUPS,
+// KG_ACL_MAPPING, KG_OIDC_* (auth.go), KG_AUDIT, KG_AUDIT_FILE (audit.go), KG_WRITEBACK.
 package main
 
 import (
@@ -36,6 +37,7 @@ func newMCPServer(s *Server) *mcp.Server {
 			"method (parser, scip, treesitter, llm) and confidence: treat llm and low-confidence edges as hints.",
 	})
 	s.register(m)
+	m.AddReceivingMiddleware(s.accessMiddleware)
 	return m
 }
 
@@ -65,6 +67,13 @@ func main() {
 		groups:      aclGroups(),
 	}
 	graph.fixed["repos"] = repoScope(s.groups)
+	oidc := oidcFromEnv()
+	if err := s.setupGovernance(*httpAddr == "", oidc); err != nil {
+		log.Fatal(err)
+	}
+	if oidc != nil && *httpAddr != "" {
+		graph.fixed["repos"] = []string{} // a query without a caller sees no repository
+	}
 	server := newMCPServer(s)
 
 	if *httpAddr == "" {
@@ -74,7 +83,16 @@ func main() {
 		return
 	}
 	mux := http.NewServeMux()
-	mux.Handle("/mcp", mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil))
+	var handler http.Handler = mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil)
+	if oidc != nil {
+		handler = oidc.Middleware(handler)
+		mux.Handle(metadataPath, oidc.MetadataHandler())
+		mux.Handle(metadataPath+"/mcp", oidc.MetadataHandler())
+		log.Printf("OIDC: tokens from %s for audience %s", oidc.Issuer, oidc.Audience)
+	} else {
+		log.Printf("warning: KG_OIDC_ISSUER is not set; every HTTP caller gets KG_ACL_GROUPS")
+	}
+	mux.Handle("/mcp", handler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if err := graph.Verify(r.Context()); err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)

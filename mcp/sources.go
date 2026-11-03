@@ -38,8 +38,8 @@ func (s *Server) registerSources(m *mcp.Server) {
 			if t == nil {
 				return nil, Doc{}, fmt.Errorf("ticket %s is not in the graph (run kg-jira for its project)", in.Key)
 			}
-			if !s.allowed(t["acl"]) {
-				return nil, Doc{}, fmt.Errorf("ticket %s is not visible to this server", in.Key)
+			if !s.allowed(ctx, t["acl"]) {
+				return nil, Doc{}, deny(ctx, "ticket %s is not visible to this server", in.Key)
 			}
 			delete(t, "acl")
 			data := map[string]any{"ticket": t,
@@ -115,7 +115,7 @@ func (s *Server) registerSources(m *mcp.Server) {
 			}
 			out := []map[string]any{}
 			for _, r := range rows {
-				if s.allowed(r["acl"]) {
+				if s.allowed(ctx, r["acl"]) {
 					delete(r, "acl")
 					out = append(out, r)
 				}
