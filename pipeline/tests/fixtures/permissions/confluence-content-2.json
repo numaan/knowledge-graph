@@ -1,0 +1,10 @@
+{"results": [
+  {"id": "3", "type": "page", "status": "current", "title": "Payroll", "ancestors": [{"id": "1"}, {"id": "2"}],
+   "restrictions": {"read": {"operation": "read", "restrictions": {"user": {"results": []},
+     "group": {"results": [{"type": "group", "name": "eng", "id": "e1"}]}}}}},
+  {"id": "4", "type": "page", "status": "current", "title": "Private notes", "ancestors": [{"id": "1"}],
+   "restrictions": {"read": {"operation": "read", "restrictions": {"user": {"results": [{"type": "known", "accountId": "5b10a2844c20165700ede21g"}]},
+     "group": {"results": []}}}}},
+  {"id": "5", "type": "page", "status": "current", "title": "API changelog", "ancestors": [{"id": "1"}, {"id": "2"}],
+   "restrictions": {"read": {"operation": "read", "restrictions": {"user": {"results": []}, "group": {"results": []}}}}}],
+ "start": 2, "limit": 2, "size": 3, "_links": {"base": "https://example.atlassian.net/wiki", "context": "/wiki"}}

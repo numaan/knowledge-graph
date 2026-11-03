@@ -19,7 +19,7 @@ from .code.ingest import build_graph
 from .domain.extract import extract
 from .graph.neo4j_writer import Neo4jWriter
 from .models import LLM, Embedder
-from .sources import documents, git, history, jira
+from .sources import documents, git, history, jira, permissions
 from .sources.atlassian import Atlassian
 from .vectors import embed_repo, embed_sources
 
@@ -121,8 +121,22 @@ def source_vectors(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     return dg.MaterializeResult(metadata={"sources": dg.MetadataValue.json(stats["sources"])})
 
 
+@dg.asset(deps=[jira_issues, confluence_pages], kinds={"neo4j", "jira", "confluence"}, group_name="sources")
+def source_permissions(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
+    """Precise ACLs from Jira permissions and security levels and Confluence restrictions (KG_ACL_DEFAULT)."""
+    out = {}
+    with _writer() as w:
+        if JIRA_PROJECTS:
+            api = Atlassian()
+            out["jira"] = [permissions.sync_jira(w, api, p) for p in JIRA_PROJECTS]
+        if CONFLUENCE_SPACES:
+            api = Atlassian(prefix="CONFLUENCE")
+            out["confluence"] = [permissions.sync_confluence(w, api, s) for s in CONFLUENCE_SPACES]
+    return dg.MaterializeResult(metadata={"permissions": dg.MetadataValue.json(out)})
+
+
 CODE = [code_snapshot, git_history, domain_model, vector_index]
-SOURCES = [jira_issues, confluence_pages, source_vectors]
+SOURCES = [jira_issues, confluence_pages, source_permissions, source_vectors]
 
 
 # Incremental runs are cheap (only changes are written), so code runs every hour, sources every 15 minutes.

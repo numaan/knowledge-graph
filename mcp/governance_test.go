@@ -23,6 +23,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
 )
 
 // ---- test identity provider: discovery document, JWKS and signed tokens --------------------------
@@ -655,5 +656,54 @@ func TestStdioUsesEnvACL(t *testing.T) {
 	}
 	if f.proposals[0]["author"] != "dev" || f.proposals[0]["author_via"] != "env" || !strings.Contains(buf.String(), `"user":"dev"`) {
 		t.Errorf("stdio author: %v / %s", f.proposals[0], buf.String())
+	}
+}
+
+// Neo4j: proposals are written by the write transaction; the same proposal is stored once; the
+// node lookup sees the ACL of a section through its document.
+func TestProposalsNeo4j(t *testing.T) {
+	if os.Getenv("NEO4J_PASSWORD") == "" {
+		t.Skip("NEO4J_PASSWORD not set")
+	}
+	ctx := context.Background()
+	g, err := NewGraph(env("NEO4J_URI", "bolt://localhost:7687"), env("NEO4J_USER", "neo4j"), os.Getenv("NEO4J_PASSWORD"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Close(ctx)
+	if err := g.Verify(ctx); err != nil {
+		t.Skip("neo4j not reachable:", err)
+	}
+	setup := func(q string) {
+		if _, err := neo4j.ExecuteQuery(ctx, g.driver, q, nil, neo4j.EagerResultTransformer); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setup(`CREATE (:Source:Document {id: 'confluence:KGTGO:1', acl: ['confluence:KGTGO']})<-[:PART_OF]-(:Source:Section {id: 'confluence:KGTGO:1#s0'}),
+	       (:Source:Ticket {id: 'jira:KGTGO-1', acl: ['jira:KGTGO']})-[:LINKS]->(:Source:Ticket {id: 'jira:KGTGO-2'})`)
+	defer setup(`MATCH (n) WHERE n.id STARTS WITH 'confluence:KGTGO' OR n.id STARTS WITH 'jira:KGTGO' OR n.target_id STARTS WITH 'jira:KGTGO' DETACH DELETE n`)
+
+	found, _, acl, err := g.NodeAccess(ctx, "confluence:KGTGO:1#s0")
+	if err != nil || !found || acl.([]any)[0] != "confluence:KGTGO" {
+		t.Fatalf("section acl through its document: %v %v %v", found, acl, err)
+	}
+	if ok, err := g.EdgeExists(ctx, "jira:KGTGO-1", "LINKS", "jira:KGTGO-2"); err != nil || !ok {
+		t.Fatalf("edge: %v %v", ok, err)
+	}
+	props := proposalProps(map[string]any{"kind": "wrong_fact", "target_id": "jira:KGTGO-1", "text": "old"}, "alice", "token", "mcp")
+	id, status, created, err := g.CreateProposal(ctx, props)
+	if err != nil || !created || status != "open" || id != props["id"] {
+		t.Fatalf("create: %v %v %v %v", id, status, created, err)
+	}
+	again := proposalProps(map[string]any{"kind": "wrong_fact", "target_id": "jira:KGTGO-1", "text": "old"}, "alice", "token", "mcp")
+	if id2, _, created, _ := g.CreateProposal(ctx, again); created || id2 != id {
+		t.Errorf("duplicate proposal created: %v", id2)
+	}
+	if _, err := g.writeProposal(ctx, "MATCH (n:Ticket) SET n.acl = []", nil); err == nil {
+		t.Error("writeProposal ran a statement other than a proposal")
+	}
+	rows, _ := g.Read(ctx, "MATCH (p:Proposal {target_id: 'jira:KGTGO-1'}) RETURN count(p) AS n, collect(p.author)[0] AS a", nil)
+	if rows[0]["n"].(int64) != 1 || rows[0]["a"] != "alice" {
+		t.Errorf("proposals in the graph: %v", rows)
 	}
 }

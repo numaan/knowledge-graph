@@ -26,6 +26,10 @@ spec:
   template:
     metadata:
       labels: {{- include "kg.selector" $sel | nindent 8 }}
+      {{- if $m.aclMapping }}
+      annotations:
+        checksum/acl-mapping: {{ toYaml $m.aclMapping | sha256sum }}
+      {{- end }}
     spec:
       containers:
         - name: mcp
@@ -46,6 +50,7 @@ spec:
             - name: KG_DEFAULT_REPO
               value: {{ . | quote }}
             {{- end }}
+            {{- include "kg.mcpGovernanceEnv" . | nindent 12 }}
             {{- range $k, $v := $m.env }}
             - name: {{ $k }}
               value: {{ $v | quote }}
@@ -63,4 +68,16 @@ spec:
               port: http
             periodSeconds: 30
           resources: {{- toYaml $m.resources | nindent 12 }}
+          {{- if $m.aclMapping }}
+          volumeMounts:
+            - name: acl-mapping
+              mountPath: /etc/kg
+              readOnly: true
+          {{- end }}
+      {{- if $m.aclMapping }}
+      volumes:
+        - name: acl-mapping
+          configMap:
+            name: {{ $name }}-acl-mapping
+      {{- end }}
 {{- end }}

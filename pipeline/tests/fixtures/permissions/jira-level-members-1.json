@@ -1,0 +1,5 @@
+{"maxResults": 2, "startAt": 0, "total": 3, "isLast": false, "values": [
+  {"id": "10000", "issueSecurityLevelId": "10300", "issueSecuritySchemeId": "10200",
+   "holder": {"type": "group", "parameter": "Security", "value": "s1", "expand": "group", "group": {"name": "Security", "groupId": "s1"}}},
+  {"id": "10001", "issueSecurityLevelId": "10300", "issueSecuritySchemeId": "10200",
+   "holder": {"type": "projectRole", "parameter": "10003", "value": "10003"}}]}
