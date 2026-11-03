@@ -55,3 +55,10 @@ data:
   GIT_REPOSITORIES: {{ join "," .Values.sources.git.repositories | quote }}
   KG_PII_MODE: {{ .Values.sources.privacy.mode | quote }}
   KG_PII_ALLOW: {{ join "," .Values.sources.privacy.allow | quote }}
+  GITHUB_REPOSITORIES: {{ join "," (.Values.sources.github).repositories | quote }}
+  {{- with (.Values.sources.github).apiUrl }}
+  GITHUB_API_URL: {{ . | quote }}
+  {{- end }}
+  {{- with (.Values.sources.people).aliasesFile }}
+  PEOPLE_ALIASES: {{ . | quote }}
+  {{- end }}

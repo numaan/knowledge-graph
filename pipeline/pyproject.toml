@@ -30,6 +30,9 @@ kg-dedupe = "kg_pipeline.dedupe:main"
 kg-summaries = "kg_pipeline.summaries:main"
 kg-freshness = "kg_pipeline.freshness:main"
 kg-corrections = "kg_pipeline.corrections:main"
+kg-github = "kg_pipeline.sources.github:main"
+kg-catalog = "kg_pipeline.sources.catalog:main"
+kg-people = "kg_pipeline.people:main"
 
 [build-system]
 requires = ["setuptools>=69"]

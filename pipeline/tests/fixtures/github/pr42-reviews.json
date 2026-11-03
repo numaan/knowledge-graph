@@ -1,0 +1,6 @@
+[
+  {"id": 9001, "user": {"login": "bob"}, "state": "CHANGES_REQUESTED", "body": "The upsert must keep the created date.",
+   "submitted_at": "2026-09-22T10:00:00Z", "html_url": "https://github.com/acme/shop/pull/42#pullrequestreview-9001"},
+  {"id": 9002, "user": {"login": "bob"}, "state": "APPROVED", "body": "",
+   "submitted_at": "2026-10-01T10:00:00Z", "html_url": "https://github.com/acme/shop/pull/42#pullrequestreview-9002"}
+]

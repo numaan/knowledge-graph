@@ -29,6 +29,7 @@ from pathlib import Path
 
 from ..graph.neo4j_writer import Neo4jWriter
 from ..provenance import commit_url, git_remote, web_remote
+from ..people import git_identity
 
 log = logging.getLogger("kg_pipeline.history")
 
@@ -43,7 +44,7 @@ def git_log(repo: Path, since: str | None, max_commits: int) -> str:
     rng = [f"{since}..HEAD"] if since else []
     return subprocess.run(
         ["git", "-C", str(repo), "-c", "core.quotepath=off", "log", "--no-merges", "--no-color", "--no-ext-diff",
-         "-U0", "-p", f"--max-count={max_commits}", f"--format={END}%H{SEP}%an{SEP}%aI{SEP}%s{SEP}%b{SEP}", *rng, "--"],
+         "-U0", "-p", f"--max-count={max_commits}", f"--format={END}%H{SEP}%an{SEP}%ae{SEP}%aI{SEP}%s{SEP}%b{SEP}", *rng, "--"],
         capture_output=True, check=True, text=True, encoding="utf-8", errors="replace").stdout
 
 
@@ -51,7 +52,7 @@ def parse(log_text: str) -> list[dict]:
     """Commits, newest first, each with files: {path: {change, added, deleted, hunks: [(start, end, header)]}}."""
     commits = []
     for block in log_text.split(END)[1:]:
-        sha, author, date, title, body, diff = (block.split(SEP, 5) + [""] * 6)[:6]
+        sha, author, email, date, title, body, diff = (block.split(SEP, 6) + [""] * 7)[:7]
         files: dict[str, dict] = {}
         cur = None
         change = "M"
@@ -82,7 +83,7 @@ def parse(log_text: str) -> list[dict]:
             elif cur is not None and line.startswith("-"):
                 cur["deleted"] += 1
         text = (title + "\n\n" + body).strip()
-        commits.append({"sha": sha.strip(), "author": author, "date": date, "title": title, "text": text[:TEXT_CHARS],
+        commits.append({"sha": sha.strip(), "author": author, **git_identity(author, email), "date": date, "title": title, "text": text[:TEXT_CHARS],
                         "keys": sorted(set(KEY_RE.findall(text))), "files": files})
     return commits
 
@@ -137,6 +138,7 @@ def sync(w: Neo4jWriter, repo_dir: Path, name: str, full: bool = False, max_comm
     cid = lambda sha: f"git:{name}:{sha}"
     web = web_remote(remote) if remote else git_remote(repo_dir)
     w.upsert(("Commit",), [{"id": cid(c["sha"]), "sha": c["sha"], "repo": name, "author": c["author"], "date": c["date"],
+                            "author_email_hash": c["author_email_hash"], "author_github": c["author_github"],
                             "title": c["title"], "text": c["text"], "ticket_keys": c["keys"],
                             "files_changed": len(c["files"]), "acl": [f"repo:{name}"], "source": "git",
                             "url": commit_url(web, c["sha"]), "source_updated_at": c["date"]} for c in commits])

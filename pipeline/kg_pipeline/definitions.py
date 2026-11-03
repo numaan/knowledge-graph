@@ -10,6 +10,7 @@ EMBEDDINGS_MODEL, EMBEDDINGS_DIMENSIONS. Set DOMAIN_LLM=off to extract roles and
 Summaries: SUMMARY_LLM=off (extractive only), SUMMARY_BUDGET. Freshness: FRESHNESS_LLM=on, FRESHNESS_LLM_BUDGET.
 Jira: JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECTS (comma-separated keys).
 Confluence: CONFLUENCE_BASE_URL, CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN, CONFLUENCE_SPACES.
+GitHub, catalog and people: see people_assets.py (github_prs, service_catalog, people).
 """
 
 import os
@@ -23,6 +24,7 @@ from .code.ingest import build_graph
 from .domain.extract import extract
 from .graph.neo4j_writer import Neo4jWriter
 from .models import LLM, Embedder
+from .people_assets import github_prs, people_asset, service_catalog_asset
 from .sources import documents, git, history, jira
 from .sources.atlassian import Atlassian
 from .vectors import embed_repo, embed_sources
@@ -130,7 +132,7 @@ def confluence_pages(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     return dg.MaterializeResult(metadata={"spaces": dg.MetadataValue.json(out)})
 
 
-@dg.asset(deps=[jira_issues, confluence_pages], kinds={"neo4j"}, group_name="sources")
+@dg.asset(deps=[jira_issues, confluence_pages, github_prs], kinds={"neo4j"}, group_name="sources")
 def source_vectors(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Embeddings for changed tickets and document sections."""
     with _writer() as w:
@@ -147,8 +149,11 @@ def doc_freshness(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     return dg.MaterializeResult(metadata={k: v for k, v in stats.items() if isinstance(v, int)})
 
 
-CODE = [code_snapshot, git_history, domain_model, vector_index, summaries_asset]
-SOURCES = [jira_issues, confluence_pages, source_vectors, doc_freshness]
+service_catalog = service_catalog_asset(repo_partitions, code_snapshot, REPOS, BRANCH, ARCHIVE)
+people = people_asset([git_history, jira_issues, confluence_pages, github_prs, service_catalog])
+
+CODE = [code_snapshot, git_history, domain_model, vector_index, summaries_asset, service_catalog]
+SOURCES = [jira_issues, confluence_pages, github_prs, source_vectors, doc_freshness, people]
 
 
 # Incremental runs are cheap (only changes are written), so code runs every hour, sources every 15 minutes.

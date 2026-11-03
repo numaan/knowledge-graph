@@ -32,6 +32,8 @@ SCHEMA = [
     "CREATE INDEX source_key IF NOT EXISTS FOR (n:Ticket) ON (n.key)",
     "CREATE INDEX commit_sha IF NOT EXISTS FOR (n:Commit) ON (n.sha)",
     "CREATE FULLTEXT INDEX source_text IF NOT EXISTS FOR (n:Ticket|Commit|Section) ON EACH [n.key, n.title, n.text]",
+    "CREATE FULLTEXT INDEX review_text IF NOT EXISTS FOR (n:PullRequest|Review|ReviewComment) ON EACH [n.key, n.title, n.text]",
+    "CREATE INDEX person_github IF NOT EXISTS FOR (n:Person) ON (n.github)",
 ]
 ANCHORS = {"Code", "Source", "Domain", "Requirement"}  # labels with a unique id that edges can join on
 
