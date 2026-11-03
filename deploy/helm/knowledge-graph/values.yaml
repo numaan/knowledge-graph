@@ -109,6 +109,9 @@ llm:
   baseUrl: http://ollama.ollama.svc:11434
   model: qwen3.6:35b-a3b
   contextTokens: 16384
+  summaryBudget: 300       # maximum LLM calls per summaries run; the rest get extractive text
+  freshnessCheck: false    # true: the LLM checks stale document sections against the code
+  freshnessBudget: 20      # maximum LLM calls per freshness run
 
 # ---------------------------------------------------------------------------
 # Source archive: raw snapshots of every ingested item, for replay and audit.

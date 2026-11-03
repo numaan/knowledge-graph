@@ -99,7 +99,7 @@ func (s *Server) Candidates(ctx context.Context, repo, query string, k int) ([]s
 
 // Expand builds the evidence pack for chunk ids, in the same order.
 func (s *Server) Expand(ctx context.Context, chunkIDs []string, codeChars int) ([]map[string]any, error) {
-	return s.graph.Read(ctx, `
+	rows, err := s.graph.Read(ctx, `
 		UNWIND range(0, size($ids) - 1) AS i
 		MATCH (c:Chunk {id: $ids[i]})-[:PART_OF]->(o)
 		OPTIONAL MATCH (o)-[:REALISES]->(dc:DomainConcept)
@@ -113,6 +113,8 @@ func (s *Server) Expand(ctx context.Context, chunkIDs []string, codeChars int) (
 		WITH i, c, o, concepts, rules, callers, callees, collect(DISTINCT t.qualname)[..3] AS tests
 		RETURN c.path AS path, c.start_line AS start_line, c.end_line AS end_line,
 		       o.id AS symbol_id, coalesce(o.qualname, o.path) AS symbol, coalesce(o.kind, 'File') AS kind, o.role AS role, o.route AS route,
-		       concepts, rules, callers, callees, tests, left(c.text, $chars) AS code
+		       concepts, rules, callers, callees, tests, left(c.text, $chars) AS code,
+		       o.stale AS stale, o.stale_reason AS stale_reason
 		ORDER BY i`, map[string]any{"ids": chunkIDs, "testPath": testPathRegex, "chars": codeChars})
+	return dropEmptyStale(rows), err
 }

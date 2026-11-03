@@ -35,7 +35,7 @@ func (s *Server) registerSources(m *mcp.Server) {
 				RETURN t.key AS key, t.type AS type, t.status AS status, t.priority AS priority, t.title AS title,
 				       coalesce(t.text_masked, t.text) AS text, t.labels AS labels, t.components AS components, t.url AS url,
 				       t.created AS created, t.updated AS updated, t.source_updated_at AS source_updated_at,
-				       t.ingested_at AS ingested_at, t.author AS author, t.acl AS acl`, p)))
+				       t.ingested_at AS ingested_at, t.author AS author, t.acl AS acl, t.stale AS stale, t.stale_reason AS stale_reason`, p)))
 			if t == nil {
 				return nil, Doc{}, fmt.Errorf("ticket %s is not in the graph (run kg-jira for its project)", in.Key)
 			}
@@ -43,6 +43,7 @@ func (s *Server) registerSources(m *mcp.Server) {
 				return nil, Doc{}, fmt.Errorf("ticket %s is not visible to this server", in.Key)
 			}
 			delete(t, "acl")
+			dropEmptyStale([]map[string]any{t})
 			data := map[string]any{"ticket": t,
 				"parent": one(must(s.graph.Read(ctx, `MATCH (:Ticket {id: $id})-[:CHILD_OF]->(p:Ticket)
 					RETURN p.key AS key, p.type AS type, p.title AS title, p.status AS status`, p))),
@@ -116,6 +117,7 @@ func (s *Server) registerSources(m *mcp.Server) {
 				       coalesce(n.source_updated_at, d.source_updated_at) AS source_updated_at,
 				       coalesce(n.ingested_at, d.ingested_at) AS ingested_at, coalesce(n.author, d.author) AS author,
 				       left(coalesce(n.text_masked, n.text), 1200) AS text, coalesce(n.acl, d.acl) AS acl,
+				       coalesce(n.stale, d.stale) AS stale, coalesce(n.stale_reason, d.stale_reason) AS stale_reason,
 				       coalesce(c.id, n.id) AS canonical ORDER BY i`, map[string]any{"ids": idList})
 			if err != nil {
 				return nil, Rows{}, err
@@ -127,7 +129,7 @@ func (s *Server) registerSources(m *mcp.Server) {
 					out = append(out, r)
 				}
 			}
-			return nil, Rows{Results: collapseDuplicates(out, k)}, nil
+			return nil, Rows{Results: collapseDuplicates(dropEmptyStale(out), k)}, nil
 		})
 
 	mcp.AddTool(m, &mcp.Tool{Name: "get_change_history", Description: "Recent commits that changed a symbol or " +

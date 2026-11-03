@@ -1,20 +1,24 @@
 """Dagster code location for the knowledge graph pipeline.
 
-Assets per repository: code_snapshot -> git_history, domain_model -> vector_index.
-Source assets: jira_issues, confluence_pages -> source_vectors.
+Assets per repository: code_snapshot -> git_history, domain_model -> vector_index, summaries.
+Source assets: jira_issues, confluence_pages -> source_vectors, doc_freshness.
+Every asset applies the approved corrections (corrections.py) after its writes.
 
 Environment (set by the Helm chart): GIT_REPOSITORIES, GIT_BRANCH, GIT_TOKEN, SOURCE_ARCHIVE_PATH,
 NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, LLM_PROVIDER, LLM_BASE_URL, LLM_MODEL, EMBEDDINGS_URL,
 EMBEDDINGS_MODEL, EMBEDDINGS_DIMENSIONS. Set DOMAIN_LLM=off to extract roles and entities only.
+Summaries: SUMMARY_LLM=off (extractive only), SUMMARY_BUDGET. Freshness: FRESHNESS_LLM=on, FRESHNESS_LLM_BUDGET.
 Jira: JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECTS (comma-separated keys).
 Confluence: CONFLUENCE_BASE_URL, CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN, CONFLUENCE_SPACES.
 """
 
 import os
+from contextlib import contextmanager
 from pathlib import Path
 
 import dagster as dg
 
+from . import corrections, freshness, summaries
 from .code.ingest import build_graph
 from .domain.extract import extract
 from .graph.neo4j_writer import Neo4jWriter
@@ -32,8 +36,12 @@ CONFLUENCE_SPACES = [s.strip() for s in os.environ.get("CONFLUENCE_SPACES", "").
 repo_partitions = dg.StaticPartitionsDefinition(sorted(REPOS) or ["no-repositories-configured"])
 
 
-def _writer() -> Neo4jWriter:
-    return Neo4jWriter(os.environ["NEO4J_URI"], os.environ.get("NEO4J_USER", "neo4j"), os.environ["NEO4J_PASSWORD"])
+@contextmanager
+def _writer():
+    """Neo4j writer of one asset. Approved corrections are applied again after the asset's writes."""
+    with Neo4jWriter(os.environ["NEO4J_URI"], os.environ.get("NEO4J_USER", "neo4j"), os.environ["NEO4J_PASSWORD"]) as w:
+        yield w
+        corrections.apply(w)
 
 
 @dg.asset(partitions_def=repo_partitions, kinds={"neo4j"}, group_name="code")
@@ -89,6 +97,15 @@ def vector_index(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
                                           "concepts": dg.MetadataValue.json(stats["concepts"])})
 
 
+@dg.asset(name="summaries", partitions_def=repo_partitions, deps=[domain_model], kinds={"neo4j"}, group_name="knowledge")
+def summaries_asset(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
+    """File, module, repository and domain summaries; only changed inputs are summarised, within SUMMARY_BUDGET."""
+    llm = None if os.environ.get("SUMMARY_LLM") == "off" else LLM()
+    with _writer() as w:
+        stats = summaries.summarize(w, context.partition_key, llm, Embedder(), cache=ARCHIVE / "cache" / "llm")
+    return dg.MaterializeResult(metadata={k: v for k, v in stats.items() if isinstance(v, int)})
+
+
 @dg.asset(kinds={"neo4j", "jira"}, group_name="sources")
 def jira_issues(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Stories, bugs, epics and releases updated since the last run, for each project in JIRA_PROJECTS."""
@@ -121,8 +138,17 @@ def source_vectors(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     return dg.MaterializeResult(metadata={"sources": dg.MetadataValue.json(stats["sources"])})
 
 
-CODE = [code_snapshot, git_history, domain_model, vector_index]
-SOURCES = [jira_issues, confluence_pages, source_vectors]
+@dg.asset(deps=[confluence_pages], kinds={"neo4j"}, group_name="knowledge")
+def doc_freshness(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
+    """Stale flags on documents whose code changed later; FRESHNESS_LLM=on also checks for conflicts."""
+    llm = LLM() if os.environ.get("FRESHNESS_LLM") == "on" else None
+    with _writer() as w:
+        stats = freshness.run(w, llm, cache=ARCHIVE / "cache" / "llm")
+    return dg.MaterializeResult(metadata={k: v for k, v in stats.items() if isinstance(v, int)})
+
+
+CODE = [code_snapshot, git_history, domain_model, vector_index, summaries_asset]
+SOURCES = [jira_issues, confluence_pages, source_vectors, doc_freshness]
 
 
 # Incremental runs are cheap (only changes are written), so code runs every hour, sources every 15 minutes.
