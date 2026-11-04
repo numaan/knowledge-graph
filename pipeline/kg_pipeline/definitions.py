@@ -1,26 +1,34 @@
 """Dagster code location for the knowledge graph pipeline.
 
-Assets per repository: code_snapshot -> git_history, domain_model -> vector_index.
-Source assets: jira_issues, confluence_pages -> source_vectors.
+Assets per repository: code_snapshot -> git_history, domain_model -> vector_index, summaries.
+Source assets: jira_issues, confluence_pages -> source_vectors, doc_freshness.
+Every asset applies the approved corrections (corrections.py) after its writes.
 
 Environment (set by the Helm chart): GIT_REPOSITORIES, GIT_BRANCH, GIT_TOKEN, SOURCE_ARCHIVE_PATH,
 NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, LLM_PROVIDER, LLM_BASE_URL, LLM_MODEL, EMBEDDINGS_URL,
 EMBEDDINGS_MODEL, EMBEDDINGS_DIMENSIONS. Set DOMAIN_LLM=off to extract roles and entities only.
+Summaries: SUMMARY_LLM=off (extractive only), SUMMARY_BUDGET. Freshness: FRESHNESS_LLM=on, FRESHNESS_LLM_BUDGET.
 Jira: JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECTS (comma-separated keys).
 Confluence: CONFLUENCE_BASE_URL, CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN, CONFLUENCE_SPACES.
+GitHub, catalog and people: see people_assets.py (github_prs, service_catalog, people).
 """
 
 import os
+from contextlib import contextmanager
 from pathlib import Path
 
 import dagster as dg
 
+from . import corrections, freshness, summaries
+from .code import links
 from .code.ingest import build_graph
 from .domain.extract import extract
 from .graph.neo4j_writer import Neo4jWriter
 from .models import LLM, Embedder
-from .sources import documents, git, history, jira
+from .people_assets import github_prs, people_asset, service_catalog_asset
+from .sources import documents, git, history, jira, permissions
 from .sources.atlassian import Atlassian
+from .telemetry import traced_asset
 from .vectors import embed_repo, embed_sources
 
 REPOS = {git.repo_name(u): u for u in os.environ.get("GIT_REPOSITORIES", "").split(",") if u}
@@ -32,11 +40,16 @@ CONFLUENCE_SPACES = [s.strip() for s in os.environ.get("CONFLUENCE_SPACES", "").
 repo_partitions = dg.StaticPartitionsDefinition(sorted(REPOS) or ["no-repositories-configured"])
 
 
-def _writer() -> Neo4jWriter:
-    return Neo4jWriter(os.environ["NEO4J_URI"], os.environ.get("NEO4J_USER", "neo4j"), os.environ["NEO4J_PASSWORD"])
+@contextmanager
+def _writer():
+    """Neo4j writer of one asset. Approved corrections are applied again after the asset's writes."""
+    with Neo4jWriter(os.environ["NEO4J_URI"], os.environ.get("NEO4J_USER", "neo4j"), os.environ["NEO4J_PASSWORD"]) as w:
+        yield w
+        corrections.apply(w)
 
 
 @dg.asset(partitions_def=repo_partitions, kinds={"neo4j"}, group_name="code")
+@traced_asset
 def code_snapshot(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Code layer of one repository (files, symbols, imports, calls, chunks, ODM). Writes only changes."""
     name = context.partition_key
@@ -48,6 +61,7 @@ def code_snapshot(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
         graph = build_graph(work, name, scip_mode="auto", scip_cache=ARCHIVE / "cache" / "scip")
     with _writer() as writer:
         result = writer.write_delta(graph)
+        context.log.info("links: %s", links.sync(writer, links.load_config(None)))  # HTTP calls and topics across repos
     stats = graph.stats()
     context.log.info("graph stats: %s", stats)
     return dg.MaterializeResult(metadata={
@@ -62,6 +76,7 @@ def code_snapshot(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
 
 
 @dg.asset(partitions_def=repo_partitions, deps=[code_snapshot], kinds={"neo4j"}, group_name="code")
+@traced_asset
 def git_history(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Commits since the last run, the files and symbols they changed, and the tickets they name."""
     name = context.partition_key
@@ -71,6 +86,7 @@ def git_history(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
 
 
 @dg.asset(partitions_def=repo_partitions, deps=[code_snapshot], kinds={"neo4j"}, group_name="domain")
+@traced_asset
 def domain_model(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Roles (entity, endpoint, ...) plus LLM-extracted concepts, business rules and capabilities."""
     llm = None if os.environ.get("DOMAIN_LLM") == "off" else LLM()
@@ -81,6 +97,7 @@ def domain_model(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
 
 
 @dg.asset(partitions_def=repo_partitions, deps=[domain_model], kinds={"neo4j"}, group_name="domain")
+@traced_asset
 def vector_index(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Embeddings for changed code chunks and domain concepts (Neo4j vector indexes)."""
     with _writer() as w:
@@ -89,7 +106,17 @@ def vector_index(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
                                           "concepts": dg.MetadataValue.json(stats["concepts"])})
 
 
+@dg.asset(name="summaries", partitions_def=repo_partitions, deps=[domain_model], kinds={"neo4j"}, group_name="knowledge")
+def summaries_asset(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
+    """File, module, repository and domain summaries; only changed inputs are summarised, within SUMMARY_BUDGET."""
+    llm = None if os.environ.get("SUMMARY_LLM") == "off" else LLM()
+    with _writer() as w:
+        stats = summaries.summarize(w, context.partition_key, llm, Embedder(), cache=ARCHIVE / "cache" / "llm")
+    return dg.MaterializeResult(metadata={k: v for k, v in stats.items() if isinstance(v, int)})
+
+
 @dg.asset(kinds={"neo4j", "jira"}, group_name="sources")
+@traced_asset
 def jira_issues(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Stories, bugs, epics and releases updated since the last run, for each project in JIRA_PROJECTS."""
     if not JIRA_PROJECTS:
@@ -102,6 +129,7 @@ def jira_issues(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
 
 
 @dg.asset(kinds={"neo4j", "confluence"}, group_name="sources")
+@traced_asset
 def confluence_pages(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Pages of each space in CONFLUENCE_SPACES; unchanged versions are skipped."""
     if not CONFLUENCE_SPACES:
@@ -113,7 +141,8 @@ def confluence_pages(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     return dg.MaterializeResult(metadata={"spaces": dg.MetadataValue.json(out)})
 
 
-@dg.asset(deps=[jira_issues, confluence_pages], kinds={"neo4j"}, group_name="sources")
+@dg.asset(deps=[jira_issues, confluence_pages, github_prs], kinds={"neo4j"}, group_name="sources")
+@traced_asset
 def source_vectors(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Embeddings for changed tickets and document sections."""
     with _writer() as w:
@@ -121,8 +150,35 @@ def source_vectors(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     return dg.MaterializeResult(metadata={"sources": dg.MetadataValue.json(stats["sources"])})
 
 
-CODE = [code_snapshot, git_history, domain_model, vector_index]
-SOURCES = [jira_issues, confluence_pages, source_vectors]
+@dg.asset(deps=[confluence_pages], kinds={"neo4j"}, group_name="knowledge")
+def doc_freshness(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
+    """Stale flags on documents whose code changed later; FRESHNESS_LLM=on also checks for conflicts."""
+    llm = LLM() if os.environ.get("FRESHNESS_LLM") == "on" else None
+    with _writer() as w:
+        stats = freshness.run(w, llm, cache=ARCHIVE / "cache" / "llm")
+    return dg.MaterializeResult(metadata={k: v for k, v in stats.items() if isinstance(v, int)})
+
+
+service_catalog = service_catalog_asset(repo_partitions, code_snapshot, REPOS, BRANCH, ARCHIVE)
+people = people_asset([git_history, jira_issues, confluence_pages, github_prs, service_catalog])
+
+
+@dg.asset(deps=[jira_issues, confluence_pages], kinds={"neo4j", "jira", "confluence"}, group_name="sources")
+def source_permissions(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
+    """Precise ACLs from Jira permissions and security levels and Confluence restrictions (KG_ACL_DEFAULT)."""
+    out = {}
+    with _writer() as w:
+        if JIRA_PROJECTS:
+            api = Atlassian()
+            out["jira"] = [permissions.sync_jira(w, api, p) for p in JIRA_PROJECTS]
+        if CONFLUENCE_SPACES:
+            api = Atlassian(prefix="CONFLUENCE")
+            out["confluence"] = [permissions.sync_confluence(w, api, s) for s in CONFLUENCE_SPACES]
+    return dg.MaterializeResult(metadata={"permissions": dg.MetadataValue.json(out)})
+
+
+CODE = [code_snapshot, git_history, domain_model, vector_index, summaries_asset, service_catalog]
+SOURCES = [jira_issues, confluence_pages, source_permissions, github_prs, source_vectors, doc_freshness, people]
 
 
 # Incremental runs are cheap (only changes are written), so code runs every hour, sources every 15 minutes.
@@ -135,4 +191,6 @@ def hourly_code(context: dg.ScheduleEvaluationContext):
 sources_every_15_min = dg.ScheduleDefinition(name="sources_every_15_min", target=SOURCES, cron_schedule="*/15 * * * *",
                                              default_status=dg.DefaultScheduleStatus.STOPPED)
 
-defs = dg.Definitions(assets=CODE + SOURCES, schedules=[hourly_code, sources_every_15_min])
+from .trust_assets import TRUST, daily_reconcile  # noqa: E402  data trust: deletes, moves, duplicates
+
+defs = dg.Definitions(assets=CODE + SOURCES + TRUST, schedules=[hourly_code, sources_every_15_min, daily_reconcile])

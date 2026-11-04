@@ -1,0 +1,8 @@
+[
+  {"id": 7001, "pull_request_review_id": 9001, "user": {"login": "bob"}, "body": "Keep `created` when the id exists.",
+   "path": "services/cart/src/store.py", "line": 14, "original_line": 14, "commit_id": "c1a0000000000000000000000000000000000001",
+   "created_at": "2026-09-22T10:00:00Z", "html_url": "https://github.com/acme/shop/pull/42#discussion_r7001"},
+  {"id": 7002, "pull_request_review_id": 9001, "user": {"login": "bob"}, "body": "Outdated remark.",
+   "path": "services/cart/src/store.py", "line": null, "original_line": 3,
+   "created_at": "2026-09-22T10:01:00Z", "html_url": "https://github.com/acme/shop/pull/42#discussion_r7002"}
+]

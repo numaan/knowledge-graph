@@ -1,0 +1,89 @@
+{
+  "realm": "kg",
+  "enabled": true,
+  "displayName": "Knowledge graph (dev)",
+  "sslRequired": "external",
+  "accessTokenLifespan": 900,
+  "registrationAllowed": false,
+  "groups": [
+    { "name": "kg-admins" },
+    { "name": "team-precept" },
+    { "name": "team-hr" }
+  ],
+  "clientScopes": [
+    {
+      "name": "kg-mcp",
+      "description": "Access to the knowledge-graph MCP server: aud kg-mcp and the groups claim",
+      "protocol": "openid-connect",
+      "attributes": { "include.in.token.scope": "false", "display.on.consent.screen": "false" },
+      "protocolMappers": [
+        {
+          "name": "audience kg-mcp",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": { "included.custom.audience": "kg-mcp", "access.token.claim": "true", "id.token.claim": "false" }
+        },
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "config": { "claim.name": "groups", "full.path": "false", "access.token.claim": "true",
+                      "id.token.claim": "true", "userinfo.token.claim": "true" }
+        }
+      ]
+    },
+    {
+      "name": "kg:write",
+      "description": "Write-back proposals (report_wrong_fact, record_decision, suggest_link)",
+      "protocol": "openid-connect",
+      "attributes": { "include.in.token.scope": "true", "display.on.consent.screen": "true" }
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "kg-mcp-client",
+      "name": "MCP clients (authorization code with PKCE)",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["http://localhost/*", "http://127.0.0.1/*"],
+      "attributes": { "pkce.code.challenge.method": "S256" },
+      "defaultClientScopes": ["kg-mcp", "basic", "profile"],
+      "optionalClientScopes": ["kg:write"]
+    },
+    {
+      "clientId": "kg-agent-admin",
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "defaultClientScopes": ["kg-mcp", "basic", "profile"],
+      "optionalClientScopes": ["kg:write"]
+    },
+    {
+      "clientId": "kg-agent-precept",
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "defaultClientScopes": ["kg-mcp", "basic", "profile"],
+      "optionalClientScopes": ["kg:write"]
+    },
+    {
+      "clientId": "kg-agent-hr",
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "defaultClientScopes": ["kg-mcp", "basic", "profile"],
+      "optionalClientScopes": ["kg:write"]
+    }
+  ],
+  "users": [
+    { "username": "service-account-kg-agent-admin", "enabled": true, "serviceAccountClientId": "kg-agent-admin", "groups": ["/kg-admins"] },
+    { "username": "service-account-kg-agent-precept", "enabled": true, "serviceAccountClientId": "kg-agent-precept", "groups": ["/team-precept"] },
+    { "username": "service-account-kg-agent-hr", "enabled": true, "serviceAccountClientId": "kg-agent-hr", "groups": ["/team-hr"] },
+    { "username": "alice", "enabled": true, "email": "alice@example.com", "emailVerified": true, "firstName": "Alice", "lastName": "Test", "groups": ["/team-precept"] },
+    { "username": "bob", "enabled": true, "email": "bob@example.com", "emailVerified": true, "firstName": "Bob", "lastName": "Test", "groups": ["/team-hr"] }
+  ]
+}

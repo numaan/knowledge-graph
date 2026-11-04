@@ -12,6 +12,7 @@ import re
 
 from .graph.neo4j_writer import Neo4jWriter
 from .models import Embedder
+from .rerank import PASSAGE_CHARS, Reranker
 
 RRF_K = 60
 TEST_PATH = r"(?i).*(^|/)(tests?|__tests__|spec)/.*|.*(_test|_spec|\.test|\.spec|Test|Tests)\.[a-z]+$|.*(^|/)test_[^/]*$"
@@ -32,8 +33,8 @@ def _rrf(*ranked: list[str]) -> list[tuple[str, float]]:
 
 
 def candidates(w: Neo4jWriter, emb: Embedder, repo: str, query: str, k: int = 8,
-               vector: list[float] | None = None) -> list[tuple[str, float]]:
-    """Top chunk ids for a query, fused from three rankings."""
+               vector: list[float] | None = None, reranker: Reranker | None = None) -> list[tuple[str, float]]:
+    """Top chunk ids for a query, fused from three rankings, then reranked when RERANK_URL is set."""
     vec = vector or emb.query(query)
     by_vector = [r["id"] for r in w._run(
         "CALL db.index.vector.queryNodes('chunk_embedding', 80, $v) YIELD node, score "
@@ -47,7 +48,16 @@ def candidates(w: Neo4jWriter, emb: Embedder, repo: str, query: str, k: int = 8,
         "CALL db.index.vector.queryNodes('concept_embedding', 10, $v) YIELD node, score WHERE node.repo = $repo "
         "MATCH (node)<-[:REALISES]-(s:Symbol)<-[:PART_OF]-(c:Chunk) "
         "RETURN c.id AS id, max(score) AS s ORDER BY s DESC LIMIT 40", v=vec, repo=repo).records]
-    return _rrf(by_vector, by_text, by_concept)[:k]
+    fused = _rrf(by_vector, by_text, by_concept)
+    return (reranker or Reranker()).rerank(query, fused, k, lambda ids: chunk_texts(w, ids))
+
+
+def chunk_texts(w: Neo4jWriter, chunk_ids: list[str]) -> dict[str, str]:
+    """Reranker passage per chunk: owner symbol, path and code."""
+    return {r["id"]: r["text"] for r in w._run(
+        "UNWIND $ids AS id MATCH (c:Chunk {id: id})-[:PART_OF]->(o) "
+        "RETURN c.id AS id, coalesce(o.qualname, o.path, '') + ' (' + coalesce(c.path, '') + ')\\n' + left(c.text, $chars) AS text",
+        ids=chunk_ids, chars=PASSAGE_CHARS).records}
 
 
 def expand(w: Neo4jWriter, chunk_ids: list[str], tests_per_symbol: int = 3) -> list[dict]:

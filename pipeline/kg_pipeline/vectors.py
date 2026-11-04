@@ -9,6 +9,7 @@ import hashlib
 
 from .graph.neo4j_writer import Neo4jWriter
 from .models import Embedder
+from .privacy import mask
 
 MAX_CHARS = 6_000
 WRITE_BATCH = 200
@@ -54,9 +55,9 @@ def _concept_texts(w: Neo4jWriter, repo: str) -> list[dict]:
 
 
 def _source_texts(w: Neo4jWriter) -> list[dict]:
-    """Tickets and document sections (commits are short and found through tickets and code)."""
+    """Tickets, document sections, pull requests and reviews (commits are short and found through tickets and code)."""
     rows = w._run("""
-        MATCH (n:Source) WHERE n:Ticket OR n:Section
+        MATCH (n:Source) WHERE n:Ticket OR n:Section OR n:PullRequest OR n:Review OR n:ReviewComment
         OPTIONAL MATCH (n)-[:PART_OF]->(d:Document)
         RETURN n.id AS id, n.embedding_hash AS hash, n.key AS key, n.type AS type, n.title AS title,
                n.text AS text, d.title AS doc""").records
@@ -75,6 +76,7 @@ def embed_sources(w: Neo4jWriter, emb: Embedder) -> dict:
 def _embed_label(w: Neo4jWriter, emb: Embedder, items: list[dict], label: str) -> dict:
     todo = []
     for it in items:
+        it = {**it, "text": mask(it["text"])}  # secrets and PII never reach the embedding server (KG_PII_MODE)
         h = hashlib.sha256(f"{emb.model}|{it['text']}".encode()).hexdigest()[:32]
         if h != it["hash"]:
             todo.append({**it, "new_hash": h})

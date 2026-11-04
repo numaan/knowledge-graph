@@ -25,17 +25,31 @@ see the [guide](GUIDE.md).
 | `kg-docling` | Deployment | 5001 | `/health` | none |
 | `kg-embeddings` (TEI) | Deployment | 8080 | `/health` | model cache |
 | `kg-mcp` | Deployment | 8000 | `/healthz` (checks Neo4j) | none |
+| `kg-reranker` (TEI, optional) | Deployment | 8080 | `/health` | model cache |
+| `kg-web` (optional) | Deployment | 3000 | `/healthz` | none |
+| `kg-keycloak` (optional, dev only) | Deployment | 8080 | `/health/ready` | realm `kg` from `files/keycloak/kg-realm.json` |
+| `kg-neo4j-backup` (optional) | CronJob | none | job status | backup files on a PVC or in S3 |
+
+`kg-mcp` also serves the REST layer for the web UI (`/api/*`), Prometheus metrics (`/metrics`) and,
+with OAuth, the protected-resource metadata (`/.well-known/oauth-protected-resource`).
 
 ```mermaid
 flowchart LR
-  S[Schedules: code hourly, sources every 15 min] --> D[Dagster daemon] --> J[Run pod: kg-pipeline image]
+  S[Schedules: code hourly, sources every 15 min, reconcile daily] --> D[Dagster daemon] --> J[Run pod: kg-pipeline image]
   J --> N[(Neo4j)]
   J --> E[Embeddings: TEI or Ollama]
   J --> L[LLM: Ollama, vLLM or API]
   J --> DL[Docling]
+  J --> GH[GitHub, Jira, Confluence APIs]
   M[kg-mcp] --> N
   M --> E
-  A[Agents] --> M
+  M -.optional.-> RR[Reranker]
+  M -.ask.-> L
+  A[Agents] -->|MCP + Bearer token| M
+  W[kg-web] -->|REST /api + token| M
+  P[People] --> W
+  A & P -.OAuth.-> K[Keycloak or your IdP]
+  B[backup CronJob] --> N
 ```
 
 ## 2. Deploy
@@ -45,8 +59,10 @@ flowchart LR
 ```bash
 docker build -t <registry>/kg-pipeline:0.2.4 pipeline/       # add --build-arg WITH_JAVA=0 WITH_DOTNET=0 for a smaller image
 docker build -t <registry>/kg-mcp:0.2.0 mcp/
+docker build -t <registry>/kg-web:0.1.0 web/
 docker push <registry>/kg-pipeline:0.2.4
 docker push <registry>/kg-mcp:0.2.0
+docker push <registry>/kg-web:0.1.0
 ```
 
 ### 2.2 Install
@@ -126,9 +142,22 @@ export KUBECONFIG=$HOME/.kube/kg-test.kubeconfig
 kind create cluster --name kg-test
 docker build -t kg-pipeline:0.2.4 --build-arg WITH_JAVA=0 --build-arg WITH_DOTNET=0 pipeline/
 docker build -t kg-mcp:0.2.0 mcp/
-kind load docker-image kg-pipeline:0.2.4 kg-mcp:0.2.0 --name kg-test
+docker build -t kg-web:0.1.0 web/
+kind load docker-image kg-pipeline:0.2.4 kg-mcp:0.2.0 kg-web:0.1.0 --name kg-test
 helm install kg deploy/helm/knowledge-graph -n kg --create-namespace -f deploy/helm/knowledge-graph/values-kind.yaml
 ```
+
+- Add `-f deploy/helm/knowledge-graph/values-kind-oidc.yaml` to test OAuth with a dev Keycloak
+  (see [governance.md](streams/governance.md#test-on-kind)).
+- Open the web UI with `kubectl -n kg port-forward svc/kg-web 3000`.
+- Materialize the code assets for the test repository in the Dagster UI, or from the code-server pod:
+
+  ```bash
+  kubectl -n kg exec deploy/kg-dagster-user-deployments-kg-pipeline -- sh -c \
+    'DAGSTER_HOME=/tmp/dh dagster asset materialize -m kg_pipeline.definitions --select "code_snapshot,git_history,domain_model,vector_index,summaries,service_catalog" --partition itsdangerous'
+  ```
+
+The result of the last end-to-end check is in [kg-test-e2e.md](streams/kg-test-e2e.md).
 
 Remove it with `kind delete cluster --name kg-test`.
 
@@ -141,6 +170,18 @@ Remove it with `kind delete cluster --name kg-test`.
 | Confluence | `sources.confluence.baseUrl` (site root), `spaces` | same as Jira | `confluence_pages` |
 | LLM | `llm.*` | `LLM_API_KEY` if needed | `domain_model` |
 | Embeddings | `models.*` (TEI) or `models.selfHosted=false` + `externalUrl` | `EMBEDDINGS_API_KEY` if needed | `vector_index`, `source_vectors` |
+| Reranker (optional) | `models.reranker.enabled`, or `models.reranker.externalUrl` | `RERANK_API_KEY` if needed | used by `kg-mcp` and search |
+| GitHub | `sources.github.repositories`, `apiUrl` | `GITHUB_TOKEN` (required for repositories taken from `sources.git`) | `github_prs` |
+| Catalog and people | `sources.people.aliasesFile` | none | `service_catalog`, `people` |
+| Permissions | `sources.jira`, `sources.confluence` | the Atlassian account needs to read permission schemes and restrictions | `source_permissions` |
+| Masking | `sources.privacy.mode`, `allow` | none | every write |
+| Summaries and freshness | `llm.enabled`, `llm.summaryBudget`, `llm.freshnessCheck`, `llm.freshnessBudget` | none | `summaries`, `doc_freshness` |
+| MCP access | `mcp.aclGroups`, `mcp.oidc.*`, `mcp.aclMapping`, `mcp.audit`, `mcp.writeback` | none (public keys come from the issuer) | `kg-mcp` |
+| Web UI | `web.enabled`, `web.image`, `web.oidc.*` | `web.oidc.existingSecret` with `OIDC_CLIENT_SECRET` and `AUTH_SECRET` | `kg-web` |
+| Tracing and metrics | `observability.otlpEndpoint`, `observability.prometheusAnnotations` | `OTEL_EXPORTER_OTLP_HEADERS` in `sources.credentials` | all |
+| Backup | `backup.*` | `backup.s3.secretName` for S3 | CronJob |
+
+With `llm.enabled=false`, `kg-mcp` has no `ask` tool and the summaries are extractive.
 
 **Caution:** The embedding model must be the same for the pipeline and `kg-mcp`. If you change it,
 delete the embeddings and the vector indexes, then embed again (see [7.3](#73-change-the-embedding-model)).
@@ -149,12 +190,18 @@ delete the embeddings and the vector indexes, then embed again (see [7.3](#73-ch
 
 ### 4.1 Schedules
 
-Both schedules are off after install. Turn them on in the Dagster UI (Overview > Schedules):
+All schedules are off after install. Turn them on in the Dagster UI (Overview > Schedules):
 
 | Schedule | Cron | Assets |
 |---|---|---|
-| `hourly_code` | `0 * * * *` | `code_snapshot`, `git_history`, `domain_model`, `vector_index` (one run per repository) |
-| `sources_every_15_min` | `*/15 * * * *` | `jira_issues`, `confluence_pages`, `source_vectors` |
+| `hourly_code` | `0 * * * *` | `code_snapshot` (with links), `git_history`, `domain_model`, `vector_index`, `summaries`, `service_catalog` (one run per repository) |
+| `sources_every_15_min` | `*/15 * * * *` | `jira_issues`, `confluence_pages`, `source_permissions`, `github_prs`, `source_vectors`, `doc_freshness`, `people` |
+| `daily_reconcile` | `0 3 * * *` | `source_reconcile` (deletes and moves), `document_duplicates` |
+
+Every asset applies the approved corrections after its writes.
+
+**Caution:** `source_reconcile` stops with `TooManyRemovals` when it would remove more than half of a
+source. Check the source before you set `RECONCILE_FORCE=1` for one run (see [6.9](#69-reconcile-stops-with-toomanyremovals)).
 
 Code runs are cheap when nothing changed: only changed nodes and edges are written, and SCIP indexes
 of unchanged project folders are reused.
@@ -193,6 +240,11 @@ kubectl -n kg exec deploy/kg-dagster-user-deployments-kg-pipeline -- \
 | Freshness | Cypher: `MATCH (s:SyncState) RETURN s.key, s.value, s.updated_at ORDER BY s.updated_at` | each cursor updated within its schedule |
 | Search quality | `kg-eval eval/<repo>.yaml --min-hit 0.85` (weekly, or after each release) | exit code 0 |
 | Disk | `kubectl -n kg exec kg-neo4j-0 -- df -h /data` | less than 80 % used |
+| Tool errors and latency | Prometheus: `sum by (tool) (rate(kg_mcp_tool_errors_total[5m]))` and p95 of `kg_mcp_tool_duration_seconds` | no tool with a rising error rate |
+| Open proposals | `kubectl -n kg exec deploy/kg-dagster-user-deployments-kg-pipeline -- kg-review list` | reviewed within a working day |
+| Denied calls | audit lines with `"denied":true` in the `kg-mcp` log (or `KG_AUDIT_FILE`) | only expected callers |
+| Backup | last `kg-neo4j-backup` job `Complete`; `kg-backup check <file>` on the newest file | one complete file per day |
+| Stale documents | Cypher: `MATCH (n:Source {stale: true}) RETURN labels(n)[1], count(*)` | the owners know about them |
 
 ## 6. Incidents
 
@@ -248,6 +300,46 @@ The pipeline image does not have the Dagster storage libraries. Build it from th
 TEI on CPU and large image loads can stall the Docker VM. Use `values-kind.yaml` (models in Ollama
 on the host), load one image at a time and restart Docker Desktop if `docker info` does not answer.
 
+### 6.8 Run fails in `github_prs` with `GitHub rate limit: reset in N s`
+
+| Cause | Fix |
+|---|---|
+| No `GITHUB_TOKEN`: GitHub allows 60 calls per hour | Add `GITHUB_TOKEN` to the source credentials. Without a token, set only `sources.github.repositories` for small repositories. |
+| First run of a large repository: about 4 calls per pull request | Nothing: the next run continues from the cursor. Or run `kg-github --repo <owner/repo> --name <name> --max 200` once from the pipeline pod. |
+
+`people` depends on `github_prs`. When `github_prs` fails, materialize `people` alone.
+
+### 6.9 Reconcile stops with `TooManyRemovals`
+
+The run would remove more than half of a project, space, folder or repository with more than 20 items.
+A broken listing or a lost permission looks the same as a mass delete.
+
+1. Read the summary in Neo4j: `MATCH (s:SyncState) WHERE s.key STARTS WITH 'reconcile:' RETURN s.key, s.value`.
+2. Check in the source that the items are really gone.
+3. If they are gone, run the asset once with `RECONCILE_FORCE=1`, or the CLI with `--force`.
+4. If they are not gone, repair the service account permissions. Do not force.
+
+### 6.10 Agents or the web UI get 401 or 403 from `kg-mcp`
+
+| Answer | Cause | Fix |
+|---|---|---|
+| 401 with `WWW-Authenticate` | no token, expired token, wrong issuer or audience | The client must sign in again. Check that the token `iss` equals `mcp.oidc.issuer` and `aud` contains `mcp.oidc.audience`. |
+| 403 | a scope in `KG_OIDC_SCOPES` is missing, or a write-back tool without `KG_OIDC_WRITE_SCOPE` | Add the scope to the client in the identity provider |
+| Tool result empty or "not found or not visible" | the caller's groups do not include the ACL of the data | Check `mcp.aclMapping` and the token `groups` claim; the audit line shows the effective groups |
+| `read_cypher is off for scoped callers` | the caller's groups do not include `*` | Expected. Give `*` only to administrators. |
+
+### 6.11 `ask` times out or is missing
+
+- Missing: `llm.enabled` is `false`, or `KG_ASK=off`. This is the expected result without an LLM.
+- Timeout: the LLM is too slow (for example a 35B model on CPU). Use a GPU server (vLLM), or set
+  `mcp.env.LLM_REASONING_EFFORT: none` for Ollama models with a thinking phase.
+
+### 6.12 `kubectl` fails with `x509: certificate signed by unknown authority` on a laptop
+
+An antivirus that inspects TLS on `127.0.0.1` (for example Avast Web/Mail Shield) replaces the
+certificate of the kind API server. Do not turn off the antivirus. Run `kubectl` and `helm` in a
+container on the `kind` network with the internal kubeconfig instead (see [kg-test-e2e.md](streams/kg-test-e2e.md)).
+
 ## 7. Maintenance
 
 ### 7.1 Upgrade
@@ -258,6 +350,31 @@ on the host), load one image at a time and restart Docker Desktop if `docker inf
 4. Run `kg-eval` and compare with the last report.
 
 ### 7.2 Back up and restore Neo4j (Community)
+
+Use the online logical backup for daily backups. Use the offline dump below for a physical copy in a
+maintenance window.
+
+**Online backup (`kg-backup`).** Set `backup.enabled=true` and `backup.target` (`pvc` or `s3`). The
+CronJob runs `kg-backup dump` at 02:30 and keeps `backup.keep` files on the PVC. For S3 (SeaweedFS,
+MinIO, AWS), set a lifecycle rule on the bucket.
+
+```bash
+kg-backup dump --out /archive/backups/neo4j --keep 7
+kg-backup check /archive/backups/neo4j/neo4j-<time>.jsonl.gz
+```
+
+To restore:
+
+1. Stop the writers: `kubectl -n kg scale deploy -l app.kubernetes.io/name=dagster-user-deployments --replicas=0`, and stop the schedules.
+2. Get an empty database: scale `kg-neo4j` to 0, delete the PVC `data-kg-neo4j-0`, scale it to 1.
+3. In a pod with the kg-pipeline image, run `kg-backup check <file>`, then `kg-backup restore <file>`.
+4. Compare `MATCH (n) RETURN count(n)` and `MATCH ()-[r]->() RETURN count(r)` with the counts of `kg-backup check`.
+5. Start the Dagster user deployment and the schedules again.
+
+**Caution:** the archive PVC is `ReadWriteOnce`. If the backup pod can run on another node than the
+run pods, use a `ReadWriteMany` claim or the S3 target. See [ops-eval.md](streams/ops-eval.md#6-backup-and-restore).
+
+**Offline dump.**
 
 1. Scale the writers down: turn off the schedules and wait for the runs to finish.
 2. Dump the database:
@@ -301,14 +418,20 @@ All data can also be rebuilt from the sources: run every asset with `--full` opt
 | A repository | `MATCH (n:Code {repo: 'app'}) DETACH DELETE n` and `MATCH (n:Commit {repo: 'app'}) DETACH DELETE n` |
 | A Jira project | `MATCH (n:Source) WHERE n.id STARTS WITH 'jira:APP-' OR n.id STARTS WITH 'jira:release:APP:' DETACH DELETE n` |
 | A Confluence space | `MATCH (n:Source) WHERE n.id STARTS WITH 'confluence:ENG:' DETACH DELETE n` |
-
+| The pull requests of a GitHub repository | `MATCH (n:Source) WHERE n.id STARTS WITH 'github:acme/app#' DETACH DELETE n` |
 Also delete its `SyncState` cursor: `MATCH (s:SyncState) WHERE s.key STARTS WITH 'jira:APP' DELETE s`.
 
 ## 8. Known limits
 
 | Limit | Effect | Workaround |
 |---|---|---|
-| Tests that call endpoints over HTTP are not linked to the endpoint | `find_related_tests` misses API tests | search the test folder for the route |
+| HTTP calls and routes are found with regular expressions | URLs built at run time and some route prefixes (Express `app.use`, Django `urls.py`) are not linked | use `kg-links.yaml`; search the test folder for the route |
+| Tests that call methods on pytest fixtures | no `CALLS` edge, so `find_related_tests` finds no test | search the test folder for the method name |
+| The reranker effect is not measured | the reranker is off by default | measure with `kg-eval` before you turn it on |
+| `ask`, LLM summaries and the freshness LLM check are not tested with the production LLM | answer quality is unknown | run the answer cases of `kg-eval` against the LLM server |
+| Not tested against real Jira, Confluence, GitHub or Keycloak | API or permission differences can show up | start with one project and one space; compare the ACLs with `kg-permissions --dry-run` |
+| Tokens are not introspected | a revoked token works until it expires | keep token lifetimes short |
+| One MCP replica with a small Neo4j is saturated near 50 concurrent clients | latency grows | add `kg-mcp` replicas |
 | Older commits map to symbols through hunk headers (confidence 0.6) | less exact history for old changes | use file-level `MODIFIES` edges |
 | The LLM judge can disagree with a human reviewer | verdicts are evidence, not proof | review `unresolved` and `contradicted` items; tune the evaluation set |
 | Jira and Confluence: Cloud REST APIs only | Data Center is not tested | use the Cloud API or add a client |

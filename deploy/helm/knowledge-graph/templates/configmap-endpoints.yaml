@@ -24,13 +24,17 @@ data:
   EMBEDDINGS_PROVIDER: tei
   EMBEDDINGS_URL: http://{{ $name }}-embeddings:8080
   {{- if .Values.models.reranker.enabled }}
-  RERANKER_URL: http://{{ $name }}-reranker:8080
-  RERANKER_MODEL: {{ .Values.models.reranker.model | quote }}
+  RERANK_URL: http://{{ $name }}-reranker:8080
+  RERANK_MODEL: {{ .Values.models.reranker.model | quote }}
   {{- end }}
   {{- else }}
   EMBEDDINGS_PROVIDER: {{ .Values.models.provider | quote }}
   {{- with .Values.models.externalUrl }}
   EMBEDDINGS_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.models.reranker.externalUrl }}
+  RERANK_URL: {{ . | quote }}
+  RERANK_MODEL: {{ $.Values.models.reranker.model | quote }}
   {{- end }}
   {{- end }}
   EMBEDDINGS_MODEL: {{ .Values.models.embeddings.model | quote }}
@@ -40,6 +44,10 @@ data:
   LLM_BASE_URL: {{ .Values.llm.baseUrl | quote }}
   LLM_MODEL: {{ .Values.llm.model | quote }}
   LLM_CONTEXT_TOKENS: {{ .Values.llm.contextTokens | quote }}
+  SUMMARY_LLM: {{ ternary "on" "off" .Values.llm.enabled | quote }}
+  SUMMARY_BUDGET: {{ .Values.llm.summaryBudget | default 300 | quote }}
+  FRESHNESS_LLM: {{ ternary "on" "off" (and .Values.llm.enabled .Values.llm.freshnessCheck) | quote }}
+  FRESHNESS_LLM_BUDGET: {{ .Values.llm.freshnessBudget | default 20 | quote }}
   SOURCE_ARCHIVE_PATH: {{ .Values.archive.mountPath | quote }}
   JIRA_BASE_URL: {{ .Values.sources.jira.baseUrl | quote }}
   JIRA_PROJECTS: {{ join "," .Values.sources.jira.projects | quote }}
@@ -49,3 +57,15 @@ data:
   CONFLUENCE_BASE_URL: {{ .Values.sources.confluence.baseUrl | quote }}
   CONFLUENCE_SPACES: {{ join "," .Values.sources.confluence.spaces | quote }}
   GIT_REPOSITORIES: {{ join "," .Values.sources.git.repositories | quote }}
+  KG_PII_MODE: {{ .Values.sources.privacy.mode | quote }}
+  KG_PII_ALLOW: {{ join "," .Values.sources.privacy.allow | quote }}
+  GITHUB_REPOSITORIES: {{ join "," (.Values.sources.github).repositories | quote }}
+  {{- with (.Values.sources.github).apiUrl }}
+  GITHUB_API_URL: {{ . | quote }}
+  {{- end }}
+  {{- with (.Values.sources.people).aliasesFile }}
+  PEOPLE_ALIASES: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.observability.otlpEndpoint }}
+  OTEL_EXPORTER_OTLP_ENDPOINT: {{ . | quote }}
+  {{- end }}

@@ -13,7 +13,10 @@ type Server struct {
 	graph       *Graph
 	emb         *Embedder
 	defaultRepo string
-	groups      map[string]bool // ACL groups this server may see; see acl.go
+	groups      map[string]bool // ACL groups this server may see (default and upper bound); see acl.go
+	gov                         // per-user access, audit and write-back; see access.go
+	rerank      *Reranker       // optional cross-encoder after RRF; nil is off (rerank.go)
+	llm         *ChatLLM        // optional chat model for ask; nil turns ask off (ask.go)
 }
 
 func (s *Server) repo(r string) string {
@@ -72,26 +75,31 @@ func must(rows []map[string]any, err error) []map[string]any {
 // ---- inputs and outputs -------------------------------------------------------------------------
 
 type SearchIn struct {
+	Page
 	Query string `json:"query" jsonschema:"question or description in natural language, e.g. 'who can invite users in bulk'"`
 	Repo  string `json:"repo,omitempty" jsonschema:"repository name; empty uses the default or searches all"`
 	K     int    `json:"k,omitempty" jsonschema:"number of results, 1-20 (default 8)"`
 }
 type FindSymbolIn struct {
+	Page
 	Name  string `json:"name" jsonschema:"symbol name, qualified name (Class.method) or prefix; * wildcards allowed"`
 	Repo  string `json:"repo,omitempty" jsonschema:"repository name"`
 	Kind  string `json:"kind,omitempty" jsonschema:"Class, Interface, Enum, Function or Method"`
 	Limit int    `json:"limit,omitempty" jsonschema:"maximum results, 1-50 (default 20)"`
 }
 type SymbolIn struct {
+	Page
 	Symbol string `json:"symbol" jsonschema:"symbol id (from another tool) or qualified name"`
 	Repo   string `json:"repo,omitempty" jsonschema:"repository name, to disambiguate names"`
 }
 type ImpactIn struct {
+	Page
 	Symbol string `json:"symbol" jsonschema:"symbol id or qualified name of the code you plan to change"`
 	Repo   string `json:"repo,omitempty" jsonschema:"repository name"`
 	Depth  int    `json:"depth,omitempty" jsonschema:"how many hops of callers and subtypes to follow, 1-4 (default 3)"`
 }
 type NeighborsIn struct {
+	Page
 	NodeID    string   `json:"node_id" jsonschema:"id of any node (symbol, file, concept, rule, requirement)"`
 	EdgeTypes []string `json:"edge_types,omitempty" jsonschema:"filter, e.g. CALLS, IMPORTS, DEFINES, CONTAINS, REALISES, IMPLEMENTED_BY"`
 	Direction string   `json:"direction,omitempty" jsonschema:"out, in or both (default both)"`
@@ -99,30 +107,43 @@ type NeighborsIn struct {
 	Limit     int      `json:"limit,omitempty" jsonschema:"1-100 (default 50)"`
 }
 type RequirementIn struct {
+	Page
 	Requirement string `json:"requirement" jsonschema:"requirement id, document reference (e.g. FR-P10-03-02) or the requirement text"`
 	Repo        string `json:"repo,omitempty" jsonschema:"repository name"`
 }
 type RepoIn struct {
+	Page
 	Repo string `json:"repo,omitempty" jsonschema:"repository name; empty lists repositories"`
 }
 type CypherIn struct {
+	Page
 	Query  string         `json:"query" jsonschema:"read-only Cypher; nodes have :Code (File, Symbol, Chunk, Module), :Domain (DomainConcept, BusinessRule, Capability) or :Requirement labels"`
 	Params map[string]any `json:"params,omitempty" jsonschema:"query parameters"`
 }
 
 type Rows struct {
-	Results []map[string]any `json:"results"`
-	Note    string           `json:"note,omitempty"`
+	Results    []map[string]any `json:"results"`
+	Note       string           `json:"note,omitempty"`
+	NextCursor string           `json:"next_cursor,omitempty"` // see page.go
+	Truncated  bool             `json:"truncated,omitempty"`
+	Total      int              `json:"total,omitempty"`
 }
 type Doc struct {
-	Data map[string]any `json:"data"`
+	Data      map[string]any `json:"data"`
+	Truncated bool           `json:"truncated,omitempty"`
+	Omitted   map[string]int `json:"omitted,omitempty"` // list items left out per field path
 }
 
 // ---- tools --------------------------------------------------------------------------------------
 
 func (s *Server) register(m *mcp.Server) {
 	s.registerSources(m)
-	mcp.AddTool(m, &mcp.Tool{Name: "search_graph", Description: "Find code for a question in natural language. " +
+	s.registerSummaries(m)
+	s.registerPeople(m)
+	s.registerContracts(m)
+	s.registerWriteback(m)
+	s.registerAsk(m)
+	addTool(m, &mcp.Tool{Name: "search_graph", Description: "Find code for a question in natural language. " +
 		"Hybrid search (vectors + full text + domain concepts) over code chunks, then graph expansion: each result has the " +
 		"symbol, its domain concepts, business rules, callers, callees, related tests and a code excerpt. Start here."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in SearchIn) (*mcp.CallToolResult, Rows, error) {
@@ -144,7 +165,7 @@ func (s *Server) register(m *mcp.Server) {
 			return nil, Rows{Results: rows}, nil
 		})
 
-	mcp.AddTool(m, &mcp.Tool{Name: "find_symbol", Description: "Look up classes, interfaces, functions and methods by name. " +
+	addTool(m, &mcp.Tool{Name: "find_symbol", Description: "Look up classes, interfaces, functions and methods by name. " +
 		"Exact name and qualified-name matches come first, then full-text matches."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in FindSymbolIn) (*mcp.CallToolResult, Rows, error) {
 			q := lucene(in.Name)
@@ -160,12 +181,13 @@ func (s *Server) register(m *mcp.Server) {
 				}
 				WITH n, max(score) AS score WHERE ($repo = '' OR n.repo = $repo) AND ($repos IS NULL OR n.repo IN $repos) AND ($kind = '' OR n.kind = $kind)
 				RETURN n.id AS id, n.qualname AS qualname, n.kind AS kind, n.role AS role, n.route AS route,
-				       n.path AS path, n.start_line AS start_line, n.signature AS signature, n.repo AS repo
+				       n.path AS path, n.start_line AS start_line, n.signature AS signature, n.repo AS repo,
+				       n.stale AS stale, n.stale_reason AS stale_reason
 				ORDER BY score DESC, n.path LIMIT $limit`, p)
-			return nil, Rows{Results: rows}, err
+			return nil, Rows{Results: dropEmptyStale(rows)}, err
 		})
 
-	mcp.AddTool(m, &mcp.Tool{Name: "get_symbol_code", Description: "Full source code of one symbol (all of its chunks), " +
+	addTool(m, &mcp.Tool{Name: "get_symbol_code", Description: "Full source code of one symbol (all of its chunks), " +
 		"with file path, line range, signature and annotations."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in SymbolIn) (*mcp.CallToolResult, Doc, error) {
 			id, err := s.resolve(ctx, in.Symbol, s.repo(in.Repo))
@@ -176,16 +198,19 @@ func (s *Server) register(m *mcp.Server) {
 				OPTIONAL MATCH (c:Chunk)-[:PART_OF]->(n) WITH n, c ORDER BY c.start_line
 				RETURN n.id AS id, n.qualname AS qualname, n.kind AS kind, n.path AS path, n.start_line AS start_line,
 				       n.end_line AS end_line, n.signature AS signature, n.annotations AS annotations, n.role AS role,
+				       n.stale AS stale, n.stale_reason AS stale_reason,
 				       left(reduce(code = '', t IN collect(c.text) | code + t + '\n'), 30000) AS code`,
 				map[string]any{"id": id})))
 			if row == nil {
 				return nil, Doc{}, fmt.Errorf("symbol %s not found", id)
 			}
+			dropEmptyStale([]map[string]any{row})
 			return nil, Doc{Data: row}, nil
 		})
 
-	mcp.AddTool(m, &mcp.Tool{Name: "impact_analysis", Description: "What can break if a symbol changes: every caller, " +
-		"subtype and user up to N hops, split into production code and tests, plus affected HTTP endpoints, " +
+	addTool(m, &mcp.Tool{Name: "impact_analysis", Description: "What can break if a symbol changes: every caller, " +
+		"subtype and user up to N hops (also HTTP callers in other repositories, HTTP tests and consumers of topics it " +
+		"publishes to), split into production code and tests, plus affected HTTP endpoints, " +
 		"linked requirements and domain concepts. Use before you edit shared code."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in ImpactIn) (*mcp.CallToolResult, Doc, error) {
 			id, err := s.resolve(ctx, in.Symbol, s.repo(in.Repo))
@@ -195,14 +220,21 @@ func (s *Server) register(m *mcp.Server) {
 			depth := clamp(in.Depth, 1, 4, 3)
 			affected, err := s.graph.Read(ctx, fmt.Sprintf(`
 				MATCH (t:Code {id: $id})
-				MATCH p = (a:Symbol)-[:CALLS|USES_TYPE|IMPLEMENTS|EXTENDS|OVERRIDES*1..%d]->(t)
+				MATCH p = (a:Symbol|File)-[:%s*1..%d]->(t)
 				WHERE $repos IS NULL OR a.repo IN $repos
 				WITH a, min(length(p)) AS distance
-				RETURN a.id AS id, a.qualname AS qualname, a.kind AS kind, a.path AS path, a.role AS role,
-				       a.http_method AS http_method, a.route AS route, distance, a.path =~ $testPath AS is_test
-				ORDER BY distance, a.path LIMIT 300`, depth), map[string]any{"id": id, "testPath": testPathRegex})
+				RETURN a.id AS id, coalesce(a.qualname, a.path) AS qualname, a.kind AS kind, a.path AS path, a.repo AS repo,
+				       CASE WHEN a.endpoint_route IS NOT NULL THEN 'endpoint' ELSE a.role END AS role,
+				       coalesce(a.http_method, a.endpoint_method) AS http_method, coalesce(a.route, a.endpoint_route) AS route,
+				       distance, a.path =~ $testPath AS is_test
+				ORDER BY distance, a.path LIMIT 300`, impactEdges, depth), map[string]any{"id": id, "testPath": testPathRegex})
 			if err != nil {
 				return nil, Doc{}, err
+			}
+			// Consumers of topics that the symbol publishes to are affected across the broker.
+			for _, sub := range s.topicSubscribers(ctx, []string{id}) {
+				sub["distance"], sub["via"] = 1, "topic:"+fmt.Sprint(sub["topic"])
+				affected = append(affected, sub)
 			}
 			code, tests, endpoints := []map[string]any{}, []map[string]any{}, []map[string]any{}
 			ids := []string{id}
@@ -231,8 +263,9 @@ func (s *Server) register(m *mcp.Server) {
 			}}, nil
 		})
 
-	mcp.AddTool(m, &mcp.Tool{Name: "find_related_tests", Description: "Tests that exercise a symbol: test code that " +
-		"calls or uses it directly or through up to 2 intermediate calls. Run these after you change the symbol."},
+	addTool(m, &mcp.Tool{Name: "find_related_tests", Description: "Tests that exercise a symbol: test code that " +
+		"calls or uses it directly or through up to 2 intermediate calls, including HTTP tests of the endpoints that " +
+		"reach it (TestClient, supertest, MockMvc, httptest, ...). Run these after you change the symbol."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in SymbolIn) (*mcp.CallToolResult, Rows, error) {
 			id, err := s.resolve(ctx, in.Symbol, s.repo(in.Repo))
 			if err != nil {
@@ -240,9 +273,17 @@ func (s *Server) register(m *mcp.Server) {
 			}
 			rows, err := s.graph.Read(ctx, `
 				MATCH (t:Code {id: $id})
-				MATCH p = (x:Symbol)-[:CALLS|USES_TYPE*1..3]->(t) WHERE x.path =~ $testPath
-				WITH x, min(length(p)) AS distance
-				RETURN x.id AS id, x.qualname AS test, x.path AS path, x.start_line AS line, distance
+				CALL (t) {
+				  MATCH p = (x:Symbol|File)-[:`+testEdges+`*1..3]->(t) RETURN x, length(p) AS distance, 'code' AS via
+				  UNION
+				  // tests that drive a publisher of a topic this symbol consumes
+				  MATCH (t)-[:SUBSCRIBES]->(:Topic)<-[:PUBLISHES]-(pub)
+				  MATCH p = (x:Symbol|File)-[:`+testEdges+`*1..2]->(pub) RETURN x, length(p) + 1 AS distance, 'topic' AS via
+				}
+				WITH x, distance, via WHERE x.path =~ $testPath AND ($repos IS NULL OR x.repo IN $repos)
+				WITH x, min(distance) AS distance, collect(DISTINCT via) AS via
+				RETURN x.id AS id, coalesce(x.qualname, x.path) AS test, x.path AS path, x.repo AS repo, x.start_line AS line,
+				       distance, via
 				ORDER BY distance, x.path LIMIT 50`, map[string]any{"id": id, "testPath": testPathRegex})
 			note := ""
 			if err == nil && len(rows) == 0 {
@@ -251,8 +292,9 @@ func (s *Server) register(m *mcp.Server) {
 			return nil, Rows{Results: rows, Note: note}, err
 		})
 
-	mcp.AddTool(m, &mcp.Tool{Name: "get_neighbors", Description: "Walk the graph from any node: typed edges " +
-		"(CALLS, IMPORTS, DEFINES, CONTAINS, EXTENDS, IMPLEMENTS, USES_TYPE, REALISES, IMPLEMENTED_BY, VALIDATED_BY, COVERS, ...)."},
+	addTool(m, &mcp.Tool{Name: "get_neighbors", Description: "Walk the graph from any node: typed edges " +
+		"(CALLS, IMPORTS, DEFINES, CONTAINS, EXTENDS, IMPLEMENTS, USES_TYPE, REALISES, IMPLEMENTED_BY, VALIDATED_BY, COVERS, " +
+		contractDoc + ", ...)."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in NeighborsIn) (*mcp.CallToolResult, Rows, error) {
 			if err := checkEdgeTypes(in.EdgeTypes); err != nil {
 				return nil, Rows{}, err
@@ -274,19 +316,19 @@ func (s *Server) register(m *mcp.Server) {
 				WHERE $repos IS NULL OR m.repo IS NULL OR m.repo IN $repos
 				WITH m, min(length(p)) AS distance, head(collect([x IN relationships(p) | type(x)])) AS via
 				RETURN m.id AS id, labels(m) AS labels, coalesce(m.qualname, m.name, m.statement, m.title, m.path) AS name,
-				       m.path AS path, distance, via, m.acl AS acl
+				       m.path AS path, distance, via, m.acl AS acl, m.stale AS stale, m.stale_reason AS stale_reason
 				ORDER BY distance, name LIMIT $limit`, map[string]any{"id": in.NodeID, "limit": clamp(in.Limit, 1, 100, 50)})
 			out := []map[string]any{}
 			for _, r := range rows {
-				if s.allowed(r["acl"]) {
+				if s.allowed(ctx, r["acl"]) {
 					delete(r, "acl")
 					out = append(out, r)
 				}
 			}
-			return nil, Rows{Results: out}, err
+			return nil, Rows{Results: dropEmptyStale(out)}, err
 		})
 
-	mcp.AddTool(m, &mcp.Tool{Name: "trace_requirement", Description: "Trace a document requirement to code: its " +
+	addTool(m, &mcp.Tool{Name: "trace_requirement", Description: "Trace a document requirement to code: its " +
 		"verdict (supported, contradicted, unresolved), reasoning, gaps, the implementing or contradicting symbols and " +
 		"the tests that validate it. Accepts an id, a reference such as FR-P10-03-02, or the requirement text."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in RequirementIn) (*mcp.CallToolResult, Doc, error) {
@@ -324,12 +366,12 @@ func (s *Server) register(m *mcp.Server) {
 			return nil, Doc{Data: data}, nil
 		})
 
-	mcp.AddTool(m, &mcp.Tool{Name: "domain_overview", Description: "Business view of a repository: capabilities per " +
+	addTool(m, &mcp.Tool{Name: "domain_overview", Description: "Business view of a repository: capabilities per " +
 		"module, main domain concepts, business rules, entities and HTTP endpoints. Without repo: list repositories."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in RepoIn) (*mcp.CallToolResult, Doc, error) {
 			repo := s.repo(in.Repo)
-			if repo != "" && !s.allowedRepo(repo) {
-				return nil, Doc{}, fmt.Errorf("repository %s is not visible to this server", repo)
+			if repo != "" && !s.allowedRepo(ctx, repo) {
+				return nil, Doc{}, deny(ctx, "repository %s is not visible to this server", repo)
 			}
 			if repo == "" {
 				rows, err := s.graph.Read(ctx, `MATCH (r:Repository) WHERE $repos IS NULL OR r.name IN $repos
@@ -355,14 +397,15 @@ func (s *Server) register(m *mcp.Server) {
 			}}, nil
 		})
 
-	mcp.AddTool(m, &mcp.Tool{Name: "read_cypher", Description: "Run a read-only Cypher query when the other tools do " +
+	addTool(m, &mcp.Tool{Name: "read_cypher", Description: "Run a read-only Cypher query when the other tools do " +
 		"not fit. Writes and most procedures are rejected; at most 500 rows; 15 s timeout. Labels: File, Symbol " +
 		"(Class, Interface, Enum, Function, Method), Chunk, Module, Repository, DomainConcept, BusinessRule, Capability, " +
-		"Requirement. Edges: CONTAINS, DEFINES, PART_OF, IMPORTS, CALLS, USES_TYPE, EXTENDS, IMPLEMENTS, OVERRIDES, " +
-		"REALISES, IMPLEMENTED_BY, CONTRADICTED_BY, VALIDATED_BY, COVERS, USES_CONCEPT."},
+		"Requirement, ApiOperation, Schema, Table, Column, Topic. Edges: CONTAINS, DEFINES, PART_OF, IMPORTS, CALLS, " +
+		"USES_TYPE, EXTENDS, IMPLEMENTS, OVERRIDES, REALISES, IMPLEMENTED_BY, CONTRADICTED_BY, VALIDATED_BY, COVERS, " +
+		"USES_CONCEPT, " + contractDoc + "."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in CypherIn) (*mcp.CallToolResult, Rows, error) {
-			if !s.groups["*"] {
-				return nil, Rows{}, fmt.Errorf("read_cypher is off for scoped servers (KG_ACL_GROUPS is not *)")
+			if !s.groupsFor(ctx)["*"] {
+				return nil, Rows{}, deny(ctx, "read_cypher is off for scoped callers (groups do not include *)")
 			}
 			if err := checkReadOnly(in.Query); err != nil {
 				return nil, Rows{}, err

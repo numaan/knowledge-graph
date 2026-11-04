@@ -1,0 +1,10 @@
+# Explicit merges for kg-people. Each entry is one person; every key in it joins that person.
+people:
+  - id: alice
+    name: Alice Smith
+    emails: [alice@example.com]
+    github: [alice-gh]
+    atlassian: [acc-alice]
+  - name: Carol White
+    github: [carol]
+    names: [Carol W.]

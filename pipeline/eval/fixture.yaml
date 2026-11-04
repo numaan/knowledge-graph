@@ -1,0 +1,52 @@
+# Evaluation set for the bookshop fixture repository (tests/fixtures/bookshop). The CI integration job
+# ingests it with the LLM off and the fake embedder (kg-fake-embedder), then gates on these numbers.
+# Change the thresholds in .github/workflows/ci.yml when you change the fixture or this file.
+repo: bookshop
+k: 8
+
+search:
+  - q: sign in a customer with a password
+    expect: [login]
+  - q: end the session of the customer, sign out
+    expect: [logout]
+  - q: customer forgot the password, email a reset link
+    expect: [request_password_reset, send_password_reset]
+  - q: place an order and charge the customer
+    expect: [place_order]
+  - q: cancel an order that is not shipped
+    expect: [cancel_order]
+  - q: give the money back, refund
+    expect: [refund_order]
+  - q: percentage off with a discount code
+    expect: [apply_discount]
+  - q: sales tax on an amount
+    expect: [compute_tax]
+  - q: hold books in the warehouse stock for an order
+    expect: [reserve_stock]
+  - q: supplier delivery adds copies to stock
+    expect: [restock_book]
+  - q: which books need a new delivery, low stock
+    expect: [low_stock_report]
+  - q: loyalty points for a customer
+    expect: [award_loyalty_points]
+  - q: add a book to the shopping cart in the browser
+    expect: [Cart.addToCart, cart.ts]
+  - q: search books by title as the user types
+    expect: [searchBooks]
+
+impact:
+  - symbol: order_total
+    depth: 2
+    expect: [place_order, refund_order]
+  - symbol: reserve_stock
+    depth: 2
+    expect_any: [test_]
+
+# Answer cases call the MCP `ask` tool (KG_MCP_URL). They are skipped when the tool is not there.
+answer:
+  - question: What does a refund require before it can happen?
+    expect: [refund_order]
+    facts: [[cancel, cancelled]]
+  - question: How is the order total computed?
+    expect: [order_total]
+    facts: [discount, tax]

@@ -91,15 +91,29 @@ func (s *Server) Candidates(ctx context.Context, repo, query string, k int) ([]s
 		return nil, err
 	}
 	fused := rrf(ids(byVector), ids(byText), ids(byConcept))
-	if len(fused) > k {
-		fused = fused[:k]
+	return s.rerank.Rerank(ctx, query, fused, k, s.chunkTexts), nil
+}
+
+// chunkTexts gives the reranker the passage of each chunk: owner symbol, path and code.
+func (s *Server) chunkTexts(ctx context.Context, chunkIDs []string) (map[string]string, error) {
+	rows, err := s.graph.Read(ctx, `UNWIND $ids AS id MATCH (c:Chunk {id: id})-[:PART_OF]->(o)
+		RETURN c.id AS id, coalesce(o.qualname, o.path, '') + ' (' + coalesce(c.path, '') + ')\n' + left(c.text, $chars) AS text`,
+		map[string]any{"ids": chunkIDs, "chars": rerankChars})
+	return textByID(rows), err
+}
+
+func textByID(rows []map[string]any) map[string]string {
+	out := make(map[string]string, len(rows))
+	for _, r := range rows {
+		id, _ := r["id"].(string)
+		out[id], _ = r["text"].(string)
 	}
-	return fused, nil
+	return out
 }
 
 // Expand builds the evidence pack for chunk ids, in the same order.
 func (s *Server) Expand(ctx context.Context, chunkIDs []string, codeChars int) ([]map[string]any, error) {
-	return s.graph.Read(ctx, `
+	rows, err := s.graph.Read(ctx, `
 		UNWIND range(0, size($ids) - 1) AS i
 		MATCH (c:Chunk {id: $ids[i]})-[:PART_OF]->(o)
 		OPTIONAL MATCH (o)-[:REALISES]->(dc:DomainConcept)
@@ -113,6 +127,76 @@ func (s *Server) Expand(ctx context.Context, chunkIDs []string, codeChars int) (
 		WITH i, c, o, concepts, rules, callers, callees, collect(DISTINCT t.qualname)[..3] AS tests
 		RETURN c.path AS path, c.start_line AS start_line, c.end_line AS end_line,
 		       o.id AS symbol_id, coalesce(o.qualname, o.path) AS symbol, coalesce(o.kind, 'File') AS kind, o.role AS role, o.route AS route,
-		       concepts, rules, callers, callees, tests, left(c.text, $chars) AS code
+		       concepts, rules, callers, callees, tests, left(c.text, $chars) AS code,
+		       o.stale AS stale, o.stale_reason AS stale_reason
 		ORDER BY i`, map[string]any{"ids": chunkIDs, "testPath": testPathRegex, "chars": codeChars})
+	return dropEmptyStale(rows), err
+}
+
+// Knowledge is search_knowledge: tickets, document sections and pull requests with reviews, vector
+// + full text, fused with RRF, reranked when a reranker is configured, then filtered by the ACL.
+func (s *Server) Knowledge(ctx context.Context, query, kind string, k int) ([]map[string]any, error) {
+	vec, err := s.emb.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	p := map[string]any{"v": vec, "q": lucene(query), "kind": kind}
+	// Reviews and review comments are found with their pull request (kind PullRequest).
+	filter := `($kind = '' OR $kind IN labels(node) OR ($kind = 'PullRequest' AND (node:Review OR node:ReviewComment))) AND
+		(node:Ticket OR node:Section OR node:PullRequest OR node:Review OR node:ReviewComment)`
+	byVector, err := s.graph.Read(ctx, `CALL db.index.vector.queryNodes('source_embedding', 60, $v) YIELD node, score
+		WHERE `+filter+` RETURN node.id AS id ORDER BY score DESC LIMIT 30`, p)
+	if err != nil {
+		return nil, err
+	}
+	byText, err := s.graph.Read(ctx, `CALL db.index.fulltext.queryNodes('source_text', $q, {limit: 60}) YIELD node, score
+		WHERE `+filter+` RETURN node.id AS id ORDER BY score DESC LIMIT 30`, p)
+	if err != nil {
+		return nil, err
+	}
+	byReview := must(s.graph.Read(ctx, `CALL db.index.fulltext.queryNodes('review_text', $q, {limit: 60}) YIELD node, score
+		WHERE `+filter+` RETURN node.id AS id ORDER BY score DESC LIMIT 30`, p)) // no index before kg-github
+	// 3*k: spare rows for the ACL filter and collapsed duplicates
+	fused := s.rerank.Rerank(ctx, query, rrf(ids(byVector), ids(byText), ids(byReview)), 3*k, s.sourceTexts)
+	idList := make([]string, len(fused))
+	for i, f := range fused {
+		idList[i] = f.ID
+	}
+	rows, err := s.graph.Read(ctx, `UNWIND range(0, size($ids) - 1) AS i MATCH (n:Source {id: $ids[i]})
+		OPTIONAL MATCH (n)-[:PART_OF]->(d:Document)
+		OPTIONAL MATCH (n)-[:DUPLICATE_OF]->(c:Source)
+		RETURN n.id AS id, [l IN labels(n) WHERE l <> 'Source'][0] AS kind, n.key AS key, n.type AS type,
+		       n.status AS status, coalesce(d.title + ' > ', '') + n.title AS title, coalesce(n.url, d.url) AS url,
+		       coalesce(n.source_updated_at, d.source_updated_at) AS source_updated_at,
+		       coalesce(n.ingested_at, d.ingested_at) AS ingested_at, coalesce(n.author, d.author) AS author,
+		       left(coalesce(n.text_masked, n.text), 1200) AS text, coalesce(n.acl, d.acl) AS acl,
+		       coalesce(n.stale, d.stale) AS stale, coalesce(n.stale_reason, d.stale_reason) AS stale_reason,
+		       coalesce(c.id, n.id) AS canonical ORDER BY i`, map[string]any{"ids": idList})
+	if err != nil {
+		return nil, err
+	}
+	out := []map[string]any{}
+	for _, r := range rows {
+		if s.allowed(ctx, r["acl"]) {
+			delete(r, "acl")
+			out = append(out, r)
+		}
+	}
+	return collapseDuplicates(dropEmptyStale(out), k), nil
+}
+
+// sourceTexts sends no text of nodes outside the ACL to the reranker; they score low and the ACL
+// filter in Knowledge removes them.
+func (s *Server) sourceTexts(ctx context.Context, idList []string) (map[string]string, error) {
+	rows, err := s.graph.Read(ctx, `UNWIND $ids AS id MATCH (n:Source {id: id}) OPTIONAL MATCH (n)-[:PART_OF]->(d:Document)
+		RETURN n.id AS id, coalesce(d.title + ' > ', '') + coalesce(n.title, '') + '\n' + left(coalesce(n.text_masked, n.text, ''), $chars) AS text,
+		       coalesce(n.acl, d.acl) AS acl`,
+		map[string]any{"ids": idList, "chars": rerankChars})
+	visible := rows[:0]
+	for _, r := range rows {
+		if s.allowed(ctx, r["acl"]) {
+			visible = append(visible, r)
+		}
+	}
+	return textByID(visible), err
 }

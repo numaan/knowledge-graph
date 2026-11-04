@@ -15,7 +15,7 @@ LANGUAGES = {
     # IBM ODM rule project artefacts
     ".brl": "odm", ".dta": "odm", ".rfl": "odm", ".ilr": "odm", ".bom": "odm", ".b2x": "odm", ".voc": "odm",
     # Unparsed but useful as File nodes
-    ".sql": "sql", ".xml": "xml", ".yaml": "yaml", ".yml": "yaml", ".json": "json", ".toml": "toml",
+    ".sql": "sql", ".prisma": "prisma", ".xml": "xml", ".yaml": "yaml", ".yml": "yaml", ".json": "json", ".toml": "toml",
     ".properties": "properties", ".gradle": "gradle", ".md": "markdown", ".sh": "shell", ".tf": "terraform",
 }
 PARSED = {"python", "java", "kotlin", "typescript", "tsx", "javascript", "go", "csharp"}

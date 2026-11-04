@@ -26,6 +26,17 @@ spec:
   template:
     metadata:
       labels: {{- include "kg.selector" $sel | nindent 8 }}
+      {{- if or $m.aclMapping $.Values.observability.prometheusAnnotations }}
+      annotations:
+        {{- if $m.aclMapping }}
+        checksum/acl-mapping: {{ toYaml $m.aclMapping | sha256sum }}
+        {{- end }}
+        {{- if $.Values.observability.prometheusAnnotations }}
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: {{ $m.port | quote }}
+        {{- end }}
+      {{- end }}
     spec:
       containers:
         - name: mcp
@@ -46,6 +57,12 @@ spec:
             - name: KG_DEFAULT_REPO
               value: {{ . | quote }}
             {{- end }}
+            {{- if not $.Values.llm.enabled }}
+            # llm.enabled=false: no ask tool (the ConfigMap still carries LLM_BASE_URL for the pipeline)
+            - name: LLM_BASE_URL
+              value: ""
+            {{- end }}
+            {{- include "kg.mcpGovernanceEnv" . | nindent 12 }}
             {{- range $k, $v := $m.env }}
             - name: {{ $k }}
               value: {{ $v | quote }}
@@ -63,4 +80,16 @@ spec:
               port: http
             periodSeconds: 30
           resources: {{- toYaml $m.resources | nindent 12 }}
+          {{- if $m.aclMapping }}
+          volumeMounts:
+            - name: acl-mapping
+              mountPath: /etc/kg
+              readOnly: true
+          {{- end }}
+      {{- if $m.aclMapping }}
+      volumes:
+        - name: acl-mapping
+          configMap:
+            name: {{ $name }}-acl-mapping
+      {{- end }}
 {{- end }}

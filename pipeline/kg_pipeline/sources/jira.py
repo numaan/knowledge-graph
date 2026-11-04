@@ -3,6 +3,7 @@
     kg-jira --project PREC                    # incremental: issues updated since the last run
     kg-jira --project PREC --full             # all issues
     kg-jira --project PREC --jql "sprint in openSprints()"
+    kg-jira --project PREC --reconcile        # remove deleted and moved issues (see reconcile.py)
 
 Env: JIRA_BASE_URL (https://your-site.atlassian.net), JIRA_EMAIL, JIRA_API_TOKEN,
 JIRA_ACCEPTANCE_FIELD (optional custom field id with acceptance criteria, e.g. customfield_10042).
@@ -23,12 +24,13 @@ import os
 import re
 
 from ..graph.neo4j_writer import Neo4jWriter
+from ..people import jira_identity
 from .atlassian import Atlassian, adf_to_markdown
 
 log = logging.getLogger("kg_pipeline.jira")
 
 FIELDS = ["summary", "description", "issuetype", "status", "priority", "labels", "components", "fixVersions",
-          "parent", "issuelinks", "created", "updated", "resolutiondate", "comment", "project"]
+          "parent", "issuelinks", "created", "updated", "resolutiondate", "comment", "project", "assignee", "reporter", "creator"]
 PROJECT_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,19}$")
 TEXT_CHARS = 12_000
 COMMENTS = 10
@@ -77,6 +79,9 @@ def ticket_row(api: Atlassian, issue: dict, acceptance_field: str | None) -> dic
         "components": [c["name"] for c in f.get("components") or []],
         "created": f.get("created"), "updated": f.get("updated"), "resolved": f.get("resolutiondate"),
         "url": f"{api.base}/browse/{issue['key']}", "acl": [f"jira:{project}"], "source": "jira",
+        "source_updated_at": f.get("updated"), "jira_id": issue.get("id"),
+        "author": ((f.get("reporter") or f.get("creator")) or {}).get("displayName"),
+        **jira_identity(f),  # assignee and reporter for kg-people; emails only as hashes
     }
 
 
@@ -130,7 +135,9 @@ def sync(w: Neo4jWriter, api: Atlassian, project: str, jql: str | None = None, f
     query = jql or f'project = "{project}"' + (f' AND updated >= "{since}"' if since else "") + " ORDER BY updated ASC"
     releases = [{"id": f"jira:release:{project}:{v['id']}", "project": project, "title": v["name"],
                  "name": v["name"], "released": v.get("released", False), "release_date": v.get("releaseDate"),
-                 "description": v.get("description"), "acl": [f"jira:{project}"], "source": "jira"}
+                 "description": v.get("description"), "acl": [f"jira:{project}"], "source": "jira",
+                 "url": f"{api.base}/projects/{project}/versions/{v['id']}",
+                 "source_updated_at": v.get("releaseDate") or v.get("startDate"), "author": None}
                 for v in fetch_releases(api, project)]
     w.upsert(("Release",), releases)
 
@@ -159,8 +166,14 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--project", required=True)
     ap.add_argument("--jql")
     ap.add_argument("--full", action="store_true")
+    ap.add_argument("--reconcile", action="store_true", help="only remove deleted and moved issues and releases")
+    ap.add_argument("--force", action="store_true", help="with --reconcile: allow removing more than half")
     args = ap.parse_args(argv)
     with Neo4jWriter(os.environ.get("NEO4J_URI", "bolt://localhost:7687"), os.environ.get("NEO4J_USER", "neo4j"),
                      os.environ["NEO4J_PASSWORD"]) as w:
+        if args.reconcile:
+            from .. import reconcile
+            print(json.dumps(reconcile.jira(w, Atlassian(), args.project, args.force), indent=2))
+            return
         print(json.dumps(sync(w, Atlassian(), args.project, args.jql, args.full,
                               os.environ.get("JIRA_ACCEPTANCE_FIELD")), indent=2))

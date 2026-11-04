@@ -1,0 +1,8 @@
+id: export-invitations
+title: GDPR export lists the invitations of the user
+check: export_invitations.py
+prompt: |
+  In this repository (Locus 7), the GDPR data export of a user must also list the invitations that were
+  sent to the email address of the user. Add a field `invitations` to the export: one object per
+  invitation with `org_id`, `role`, `status` and `created_at`. Never include the invitation token.
+  Keep the existing tests passing.

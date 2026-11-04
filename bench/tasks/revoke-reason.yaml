@@ -1,0 +1,8 @@
+id: revoke-reason
+title: Optional reason when an invitation is revoked
+check: revoke_reason.py
+prompt: |
+  In this repository (Locus 7), let an admin give an optional reason when cancelling a pending
+  invitation: the existing revoke endpoint accepts a query parameter `reason`. Store the reason in the
+  audit event of the revoke under the meta key `reason`, next to the existing fields. Without a reason
+  the endpoint works as before. Keep the existing tests passing.

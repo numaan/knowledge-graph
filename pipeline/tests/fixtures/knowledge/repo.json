@@ -1,0 +1,23 @@
+{
+  "files": [
+    {"id": "kgt:app/scenarios/store.py", "path": "app/scenarios/store.py", "language": "python", "lines": 40,
+     "doc": "Persistence of scenarios in the database.",
+     "symbols": [
+       {"qualname": "ScenarioStore", "kind": "Class", "signature": "class ScenarioStore", "role": "repository", "doc": "Reads and writes scenarios."},
+       {"qualname": "ScenarioStore.save", "kind": "Method", "signature": "def save(self, scenario)", "doc": "Insert or update one scenario."}
+     ]},
+    {"id": "kgt:app/scenarios/routes.py", "path": "app/scenarios/routes.py", "language": "python", "lines": 25, "doc": "",
+     "symbols": [
+       {"qualname": "save_scenario", "kind": "Function", "signature": "def save_scenario(body)", "role": "endpoint",
+        "http_method": "PUT", "route": "/scenarios/{id}"}
+     ]},
+    {"id": "kgt:app/util.py", "path": "app/util.py", "language": "python", "lines": 5, "doc": "",
+     "symbols": [{"qualname": "slug", "kind": "Function", "signature": "def slug(s)"}]}
+  ],
+  "capabilities": [
+    {"id": "kgt:capability:app/scenarios", "name": "Scenario management", "module": "app/scenarios",
+     "summary": "Users save and edit test scenarios.",
+     "concepts": [{"name": "Scenario", "kind": "entity", "definition": "A named set of faults to run."}],
+     "rules": ["A scenario name must be unique per topology."]}
+  ]
+}

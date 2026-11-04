@@ -1,0 +1,202 @@
+# CI for the knowledge graph: lint and unit tests, image builds (no push), Helm checks, and an
+# integration job that ingests the bookshop fixture into a Neo4j service container (LLM off, fake
+# embedder) and gates on kg-eval. Actions are pinned by commit SHA; the comment gives the tag.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  workflows:
+    name: actionlint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: mcp/go.mod
+          cache: false
+      - run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
+  go:
+    name: go vet and tests
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: mcp
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: mcp/go.mod
+          cache-dependency-path: mcp/go.sum
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  python:
+    name: ruff and pytest
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pipeline/pyproject.toml
+      - run: pip install -e ".[dev,dagster,otel]"
+      - run: ruff check .
+      - run: pytest -q
+
+  images:
+    name: docker build ${{ matrix.image }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [mcp, pipeline]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.image }}
+          push: false
+          tags: kg-${{ matrix.image }}:ci
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  helm:
+    name: helm lint and template
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: deploy/helm/knowledge-graph
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.19.0
+      - name: lint and template every values file
+        run: |
+          for f in values*.yaml; do
+            echo "::group::$f"
+            helm lint . -f "$f"
+            helm template kg . -f "$f" > /dev/null
+            echo "::endgroup::"
+          done
+      - name: template optional components
+        run: |
+          helm template kg . --set mcp.enabled=true --set mcp.image=kg-mcp:ci > /dev/null
+          helm template kg . --set backup.enabled=true --set backup.image=kg-pipeline:ci > /dev/null
+          helm template kg . --set backup.enabled=true --set backup.image=kg-pipeline:ci \
+            --set backup.target=s3 --set backup.s3.secretName=kg-backup-s3 > /dev/null
+
+  integration:
+    name: ingest fixture and evaluate
+    runs-on: ubuntu-24.04
+    needs: [go, python]
+    services:
+      neo4j:
+        image: neo4j:2026.10.1
+        env:
+          NEO4J_AUTH: neo4j/kg-ci-${{ github.run_id }}
+          NEO4J_server_memory_heap_max__size: 1G
+          NEO4J_server_memory_pagecache_size: 512M
+        ports: ["7687:7687"]
+    env:
+      NEO4J_URI: bolt://localhost:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: kg-ci-${{ github.run_id }}
+      EMBEDDINGS_URL: http://127.0.0.1:8089
+      EMBEDDINGS_MODEL: fake
+      EMBEDDINGS_DIMENSIONS: "256"
+      KG_DEFAULT_REPO: bookshop
+      KG_MCP_URL: http://127.0.0.1:8000/mcp
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pipeline/pyproject.toml
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: mcp/go.mod
+          cache-dependency-path: mcp/go.sum
+      - name: install
+        working-directory: pipeline
+        run: pip install -e ".[dev,otel]"
+      - name: start the fake embedder
+        run: |
+          nohup kg-fake-embedder --port 8089 --dimensions 256 > fake-embedder.log 2>&1 &
+          for _ in $(seq 30); do curl -sf http://127.0.0.1:8089/ && break; sleep 1; done
+      - name: wait for neo4j
+        run: |
+          python - <<'EOF'
+          import os, time
+          from neo4j import GraphDatabase
+          d = GraphDatabase.driver(os.environ["NEO4J_URI"], auth=(os.environ["NEO4J_USER"], os.environ["NEO4J_PASSWORD"]))
+          for _ in range(60):
+              try:
+                  d.verify_connectivity(); break
+              except Exception:
+                  time.sleep(2)
+          else:
+              raise SystemExit("neo4j did not start")
+          EOF
+      - name: ingest the bookshop fixture (LLM off)
+        working-directory: pipeline
+        run: |
+          kg-ingest-code --repo tests/fixtures/bookshop --name bookshop --scip off
+          kg-domain --repo bookshop --no-llm
+          kg-embed --repo bookshop
+      - name: start the MCP server
+        working-directory: mcp
+        run: |
+          go build -o kg-mcp .
+          nohup ./kg-mcp -http 127.0.0.1:8000 > ../kg-mcp.log 2>&1 &
+          for _ in $(seq 30); do curl -sf http://127.0.0.1:8000/healthz && break; sleep 1; done
+      - name: kg-eval with gates
+        working-directory: pipeline
+        # Measured on the fixture: hit@8 0.93, MRR 0.81, impact recall 1.00 (deterministic). Answer gates apply only when
+        # the server has the ask tool; otherwise the answer cases are reported as skipped.
+        run: >
+          kg-eval eval/fixture.yaml --json ../eval.json
+          --min-hit 0.9 --min-mrr 0.7 --min-impact 1
+          --min-citation-recall 0.5 --min-citation-validity 0.9
+      - name: pytest with neo4j (writer, sources, backup, scale generator)
+        working-directory: pipeline
+        run: pytest -q
+      - name: MCP load smoke test
+        working-directory: mcp
+        run: go run ./cmd/kg-load -url "$KG_MCP_URL" -repo bookshop -symbol-prefix order -clients 1,4 -duration 5s -out ../load.json
+      - name: metrics endpoint
+        run: curl -sf http://127.0.0.1:8000/metrics | grep kg_mcp_tool_calls_total
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: integration
+          path: |
+            eval.json
+            load.json
+            kg-mcp.log
+            fake-embedder.log
+          if-no-files-found: ignore

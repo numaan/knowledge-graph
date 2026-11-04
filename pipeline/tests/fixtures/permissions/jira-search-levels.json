@@ -1,0 +1,3 @@
+{"isLast": true, "issues": [
+  {"id": "10003", "key": "KGT-3", "fields": {"security": {"self": "https://example.atlassian.net/rest/api/3/securitylevel/10300", "id": "10300", "name": "Security team"}}},
+  {"id": "10002", "key": "KGT-2", "fields": {"security": {"self": "https://example.atlassian.net/rest/api/3/securitylevel/10301", "id": "10301", "name": "Reporter only"}}}]}

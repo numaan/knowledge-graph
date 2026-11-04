@@ -14,7 +14,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import odm, scip
+from . import contracts, links, odm, scip
 from .files import PARSED, read_sources
 from .model import CodeGraph
 from .resolve import Resolver
@@ -91,6 +91,7 @@ def build_graph(repo: Path, name: str, scip_mode: str = "auto",
     g.counters["files_scip_covered"] = len(covered)
     resolver.link_names(skip_paths=covered)
     resolver.link_bom(bom_to_xom)
+    contracts.build(g, files, syntax)
 
     # Edges to nodes that were never created (external or unresolved) are dropped and counted.
     for key, edge in list(g.edges.items()):
@@ -122,6 +123,7 @@ def main(argv: list[str] | None = None) -> None:
                     help="rewrite every node and edge (default: write only what changed)")
     ap.add_argument("--scip-cache", type=Path, default=Path(os.environ.get("SCIP_CACHE_DIR", ".kg-cache/scip")),
                     help="reuse SCIP indexes of project folders that did not change")
+    ap.add_argument("--no-links", action="store_true", help="do not relink HTTP calls and topics across repositories")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
@@ -142,6 +144,8 @@ def main(argv: list[str] | None = None) -> None:
             t1 = time.time()
             result = w.write_snapshot(g) if args.full_write else w.write_delta(g)
             log.info("wrote snapshot in %.1fs: %s", time.time() - t1, result)
+            if not args.no_links:
+                log.info("links: %s", links.sync(w, links.load_config(None)))
 
 
 if __name__ == "__main__":

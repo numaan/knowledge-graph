@@ -1,0 +1,66 @@
+openapi: 3.0.3
+info:
+  title: Orders API
+  version: 1.2.0
+servers:
+  - url: https://orders.example.com/api
+paths:
+  /orders:
+    post:
+      operationId: createOrder
+      summary: Place an order
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NewOrder'
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+  /orders/{orderId}:
+    parameters:
+      - name: orderId
+        in: path
+        required: true
+        schema: {type: integer}
+    get:
+      operationId: getOrder
+      summary: Read one order
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+  /orders/{orderId}/cancel:
+    post:
+      operationId: cancelOrder
+      summary: Cancel an order (not implemented yet)
+      responses:
+        '204': {description: cancelled}
+components:
+  schemas:
+    NewOrder:
+      type: object
+      required: [customer_id, lines]
+      properties:
+        customer_id: {type: integer}
+        lines:
+          type: array
+          items: {$ref: '#/components/schemas/OrderLine'}
+    Order:
+      type: object
+      properties:
+        id: {type: integer}
+        status: {type: string}
+        lines:
+          type: array
+          items: {$ref: '#/components/schemas/OrderLine'}
+    OrderLine:
+      type: object
+      properties:
+        sku: {type: string}
+        quantity: {type: integer}

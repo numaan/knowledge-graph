@@ -1,0 +1,5 @@
+# Base-URL names that this service calls -> repository that serves them (read by kg-links).
+services:
+  billing:
+    repo: billing-service
+    hints: [BILLING_URL]

@@ -1,0 +1,26 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: cart
+  description: Shopping cart service
+  tags: [python]
+spec:
+  type: service
+  lifecycle: production
+  owner: group:team-checkout
+  system: shop
+  providesApis: [cart-api]
+  consumesApis: [api:default/payments-api]
+  dependsOn: [component:payments, resource:default/cart-db]
+---
+apiVersion: backstage.io/v1alpha1
+kind: API
+metadata:
+  name: cart-api
+spec:
+  type: openapi
+  lifecycle: production
+  owner: team-checkout
+  system: shop
+  definition: |
+    openapi: 3.0.0

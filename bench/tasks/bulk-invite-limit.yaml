@@ -1,0 +1,7 @@
+id: bulk-invite-limit
+title: Lower the bulk invite batch size to 50
+check: bulk_invite_limit.py
+prompt: |
+  In this repository (Locus 7), an admin can invite many people to an organisation in one request.
+  Lower the largest allowed batch from 200 rows to 50 rows. A request with more than 50 rows must be
+  rejected by validation (HTTP 422) before anything is written. Keep the existing tests passing.

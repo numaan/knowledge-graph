@@ -1,0 +1,6 @@
+{"results": [
+  {"id": "1", "principal": {"type": "group", "id": "g1"}, "operation": {"key": "read", "targetType": "space"}},
+  {"id": "2", "principal": {"type": "group", "id": "g2"}, "operation": {"key": "read", "targetType": "space"}},
+  {"id": "3", "principal": {"type": "user", "id": "5b10a2844c20165700ede21g"}, "operation": {"key": "read", "targetType": "space"}},
+  {"id": "4", "principal": {"type": "group", "id": "g3"}, "operation": {"key": "create", "targetType": "page"}}],
+ "_links": {"base": "https://example.atlassian.net/wiki"}}

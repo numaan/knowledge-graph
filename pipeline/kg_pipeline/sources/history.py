@@ -2,6 +2,7 @@
 
     kg-git-history --repo /path/to/checkout --name precept                # new commits since the last run
     kg-git-history --repo /path/to/checkout --name precept --max 5000 --full
+    kg-git-history --repo /path/to/checkout --name precept --reconcile    # drop commits of rewritten history
 
 Run it after kg-ingest-code: symbols are matched against the current code graph.
 
@@ -27,6 +28,8 @@ from collections import defaultdict
 from pathlib import Path
 
 from ..graph.neo4j_writer import Neo4jWriter
+from ..provenance import commit_url, git_remote, web_remote
+from ..people import git_identity
 
 log = logging.getLogger("kg_pipeline.history")
 
@@ -41,7 +44,7 @@ def git_log(repo: Path, since: str | None, max_commits: int) -> str:
     rng = [f"{since}..HEAD"] if since else []
     return subprocess.run(
         ["git", "-C", str(repo), "-c", "core.quotepath=off", "log", "--no-merges", "--no-color", "--no-ext-diff",
-         "-U0", "-p", f"--max-count={max_commits}", f"--format={END}%H{SEP}%an{SEP}%aI{SEP}%s{SEP}%b{SEP}", *rng, "--"],
+         "-U0", "-p", f"--max-count={max_commits}", f"--format={END}%H{SEP}%an{SEP}%ae{SEP}%aI{SEP}%s{SEP}%b{SEP}", *rng, "--"],
         capture_output=True, check=True, text=True, encoding="utf-8", errors="replace").stdout
 
 
@@ -49,7 +52,7 @@ def parse(log_text: str) -> list[dict]:
     """Commits, newest first, each with files: {path: {change, added, deleted, hunks: [(start, end, header)]}}."""
     commits = []
     for block in log_text.split(END)[1:]:
-        sha, author, date, title, body, diff = (block.split(SEP, 5) + [""] * 6)[:6]
+        sha, author, email, date, title, body, diff = (block.split(SEP, 6) + [""] * 7)[:7]
         files: dict[str, dict] = {}
         cur = None
         change = "M"
@@ -80,7 +83,7 @@ def parse(log_text: str) -> list[dict]:
             elif cur is not None and line.startswith("-"):
                 cur["deleted"] += 1
         text = (title + "\n\n" + body).strip()
-        commits.append({"sha": sha.strip(), "author": author, "date": date, "title": title, "text": text[:TEXT_CHARS],
+        commits.append({"sha": sha.strip(), "author": author, **git_identity(author, email), "date": date, "title": title, "text": text[:TEXT_CHARS],
                         "keys": sorted(set(KEY_RE.findall(text))), "files": files})
     return commits
 
@@ -115,7 +118,9 @@ def _by_path(rows: list[dict]) -> dict[str, list[dict]]:
     return by_path
 
 
-def sync(w: Neo4jWriter, repo_dir: Path, name: str, full: bool = False, max_commits: int = 2000) -> dict:
+def sync(w: Neo4jWriter, repo_dir: Path, name: str, full: bool = False, max_commits: int = 2000,
+         remote: str | None = None) -> dict:
+    """remote: clone URL for commit links (default: origin of repo_dir); credentials in it are dropped."""
     cursor = f"git:{name}:head"
     since = None if full else w.state(cursor)
     try:
@@ -131,9 +136,12 @@ def sync(w: Neo4jWriter, repo_dir: Path, name: str, full: bool = False, max_comm
                   "s.start_line AS start, s.end_line AS end", repo=name).records
     symbols = _by_path([r.data() for r in syms])
     cid = lambda sha: f"git:{name}:{sha}"
+    web = web_remote(remote) if remote else git_remote(repo_dir)
     w.upsert(("Commit",), [{"id": cid(c["sha"]), "sha": c["sha"], "repo": name, "author": c["author"], "date": c["date"],
+                            "author_email_hash": c["author_email_hash"], "author_github": c["author_github"],
                             "title": c["title"], "text": c["text"], "ticket_keys": c["keys"],
-                            "files_changed": len(c["files"]), "acl": [f"repo:{name}"], "source": "git"} for c in commits])
+                            "files_changed": len(c["files"]), "acl": [f"repo:{name}"], "source": "git",
+                            "url": commit_url(web, c["sha"]), "source_updated_at": c["date"]} for c in commits])
     ids = [cid(c["sha"]) for c in commits]
     file_rows = [{"src": cid(c["sha"]), "dst": f"{name}:{p}", "change": f["change"], "added": f["added"],
                   "deleted": f["deleted"], "method": "git", "confidence": 1.0}
@@ -168,7 +176,14 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--name", help="repository name in the graph (default: folder name)")
     ap.add_argument("--full", action="store_true", help="ignore the cursor and read the last --max commits")
     ap.add_argument("--max", type=int, default=2000)
+    ap.add_argument("--reconcile", action="store_true", help="only remove commits that are no longer on HEAD")
+    ap.add_argument("--force", action="store_true", help="with --reconcile: allow removing more than half")
     args = ap.parse_args(argv)
     with Neo4jWriter(os.environ.get("NEO4J_URI", "bolt://localhost:7687"), os.environ.get("NEO4J_USER", "neo4j"),
                      os.environ["NEO4J_PASSWORD"]) as w:
+        if args.reconcile:
+            from .. import reconcile
+            print(json.dumps(reconcile.git_history(w, args.repo, args.name or args.repo.resolve().name,
+                                                   force=args.force), indent=2))
+            return
         print(json.dumps(sync(w, args.repo, args.name or args.repo.resolve().name, args.full, args.max), indent=2))

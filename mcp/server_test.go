@@ -103,8 +103,8 @@ func TestToolsIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tools.Tools) != 12 {
-		t.Errorf("want 12 tools, got %d", len(tools.Tools))
+	if len(tools.Tools) != 19 { // 16 read tools + 3 write-back tools
+		t.Errorf("want 19 tools, got %d", len(tools.Tools))
 	}
 
 	call := func(name string, args map[string]any) map[string]any {
@@ -160,6 +160,23 @@ func TestToolsIntegration(t *testing.T) {
 	if k := call("search_knowledge", map[string]any{"query": "scenario builder fault types", "kind": "Section"}); len(k["results"].([]any)) == 0 {
 		t.Log("search_knowledge: no sections (run kg-docs and kg-embed --sources)")
 	}
+
+	// summaries (skipped when kg-summaries did not run for this repository)
+	res, err = cs.CallTool(ctx, &mcp.CallToolParams{Name: "get_summary", Arguments: map[string]any{"node_id": id}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Log("get_summary: no summaries (run kg-summaries --repo " + repo + ")")
+	} else if sum := call("get_summary", map[string]any{"node_id": id})["data"].(map[string]any)["summary"].(map[string]any); sum["text"] == "" {
+		t.Error("get_summary: empty text")
+	}
+	if res, _ := cs.CallTool(ctx, &mcp.CallToolParams{Name: "get_summary", Arguments: map[string]any{"path": "no/such/folder"}}); !res.IsError {
+		if d := call("get_summary", map[string]any{"path": "no/such/folder"})["data"].(map[string]any); d["note"] == nil ||
+			d["summary"].(map[string]any)["target_id"] != repo+":folder:/" {
+			t.Errorf("get_summary: unknown path must fall back to the root folder summary: %v", d)
+		}
+	}
 }
 
 func TestACLScope(t *testing.T) {
@@ -176,11 +193,12 @@ func TestACLScope(t *testing.T) {
 		want bool
 	}{{nil, true}, {[]any{}, true}, {[]any{"jira:PREC"}, true}, {[]any{"jira:HR", "confluence:HR"}, false}}
 	for _, c := range cases {
-		if team.allowed(c.acl) != c.want {
+		if team.allowed(context.Background(), c.acl) != c.want {
 			t.Errorf("allowed(%v) = %v", c.acl, !c.want)
 		}
 	}
-	if !all.allowed([]any{"jira:HR"}) || team.allowedRepo("other") || !team.allowedRepo("precept") {
+	ctx := context.Background()
+	if !all.allowed(ctx, []any{"jira:HR"}) || team.allowedRepo(ctx, "other") || !team.allowedRepo(ctx, "precept") {
 		t.Error("allowedRepo or * wrong")
 	}
 }
@@ -238,5 +256,26 @@ func TestACLIntegration(t *testing.T) {
 	}
 	if res := check("read_cypher", map[string]any{"query": "MATCH (n) RETURN count(n)"}); !res.IsError {
 		t.Error("read_cypher must be off for a scoped server")
+	}
+}
+
+func TestCollapseDuplicates(t *testing.T) {
+	rows := []map[string]any{
+		{"id": "doc:a#s0", "canonical": "confluence:X:1#s0", "title": "A", "url": "file:///a"},
+		{"id": "jira:X-1", "canonical": "jira:X-1", "title": "T"},
+		{"id": "confluence:X:1#s0", "canonical": "confluence:X:1#s0", "title": "C", "url": "https://c"},
+		{"id": "doc:b#s0", "title": "B"},
+		{"id": "doc:c#s0", "canonical": "doc:c#s0", "title": "C2"},
+	}
+	got := collapseDuplicates(rows, 3)
+	if len(got) != 3 || got[0]["id"] != "doc:a#s0" || got[1]["id"] != "jira:X-1" || got[2]["id"] != "doc:b#s0" {
+		t.Fatalf("wrong rows: %+v", got)
+	}
+	also, _ := got[0]["also_in"].([]map[string]any)
+	if len(also) != 1 || also[0]["id"] != "confluence:X:1#s0" || also[0]["url"] != "https://c" {
+		t.Fatalf("copy not listed: %+v", got[0])
+	}
+	if _, ok := got[0]["canonical"]; ok {
+		t.Fatal("canonical must not be returned")
 	}
 }

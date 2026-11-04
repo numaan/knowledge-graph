@@ -1,0 +1,7 @@
+{"permissions": [
+  {"id": 1, "holder": {"type": "projectRole", "parameter": "10002", "value": "10002", "expand": "projectRole"}, "permission": "BROWSE_PROJECTS"},
+  {"id": 2, "holder": {"type": "group", "parameter": "Product-Owners", "value": "ca85fac0-d974-40ca-a615-7af99c48d24f",
+                        "expand": "group", "group": {"name": "Product-Owners", "groupId": "ca85fac0-d974-40ca-a615-7af99c48d24f"}},
+   "permission": "BROWSE_PROJECTS"},
+  {"id": 3, "holder": {"type": "user", "parameter": "5b10a2844c20165700ede21g", "value": "5b10a2844c20165700ede21g"}, "permission": "BROWSE_PROJECTS"},
+  {"id": 4, "holder": {"type": "group", "parameter": "contractors", "value": "c1"}, "permission": "EDIT_ISSUES"}]}

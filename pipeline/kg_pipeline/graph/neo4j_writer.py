@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from neo4j import GraphDatabase
 
 from ..code.model import CodeGraph
+from ..privacy import protect_row
 
 BATCH = 2000
 _NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
@@ -31,6 +32,8 @@ SCHEMA = [
     "CREATE INDEX source_key IF NOT EXISTS FOR (n:Ticket) ON (n.key)",
     "CREATE INDEX commit_sha IF NOT EXISTS FOR (n:Commit) ON (n.sha)",
     "CREATE FULLTEXT INDEX source_text IF NOT EXISTS FOR (n:Ticket|Commit|Section) ON EACH [n.key, n.title, n.text]",
+    "CREATE FULLTEXT INDEX review_text IF NOT EXISTS FOR (n:PullRequest|Review|ReviewComment) ON EACH [n.key, n.title, n.text]",
+    "CREATE INDEX person_github IF NOT EXISTS FOR (n:Person) ON (n.github)",
 ]
 ANCHORS = {"Code", "Source", "Domain", "Requirement"}  # labels with a unique id that edges can join on
 
@@ -66,15 +69,26 @@ class Neo4jWriter:
             self._run(statement)
 
     def upsert(self, labels: tuple[str, ...], rows: list[dict], keep: tuple[str, ...] = ("embedding", "embedding_hash")) -> int:
-        """MERGE :Source nodes by id and replace their properties, keeping computed ones (embeddings)."""
+        """MERGE :Source nodes by id and replace their properties, keeping computed ones (embeddings).
+
+        Secrets are removed from title and text before the write; text_masked holds the text without PII.
+
+        acl: once kg-permissions has written a node's acl (it stamps acl_synced_at), that acl is the
+        precise one (issue security level, page restriction) and the coarse project/space acl of an
+        ingest row must not replace it; the permission sync stays its owner and corrects it on its next run.
+        """
         self.ensure_schema()
+        rows = [protect_row(r) for r in rows]
         extra = "".join(f":{_safe(l)}" for l in labels)
+        keep = tuple(k for k in keep if k not in ("acl", "acl_synced_at")) + ("acl_synced_at",)
         kept = ", ".join(f"n.{_safe(k)} AS {k}" for k in keep)
         restore = ", ".join(f"n.{k} = {k}" for k in keep)
         stamp = datetime.now(timezone.utc).isoformat()
         for batch in _batches([{"id": r["id"], "props": {k: v for k, v in r.items() if v is not None}} for r in rows]):
-            self._run(f"UNWIND $rows AS row MERGE (n:Source {{id: row.id}}) WITH n, row, {kept} "
-                      f"SET n = row.props, n.ingested_at = $stamp, n{extra}, {restore}", rows=batch, stamp=stamp)
+            self._run(f"UNWIND $rows AS row MERGE (n:Source {{id: row.id}}) WITH n, row, {kept}, n.acl AS synced_acl "
+                      f"SET n = row.props, n.ingested_at = $stamp, n{extra}, {restore}, "
+                      f"n.acl = CASE WHEN acl_synced_at IS NULL THEN row.props.acl ELSE synced_acl END",
+                      rows=batch, stamp=stamp)
         return len(rows)
 
     def link(self, etype: str, rows: list[dict], src: str = "Source", dst: str = "Source", replace_from: list[str] | None = None) -> int:
@@ -114,7 +128,8 @@ class Neo4jWriter:
         old_nodes = {r["id"]: r["h"] for r in self._run(
             "MATCH (n:Code {repo: $repo}) RETURN n.id AS id, n.content_hash AS h", repo=g.repo).records}
         old_edges = {(r["a"], r["t"], r["b"]): r["h"] for r in self._run(
-            "MATCH (a:Code {repo: $repo})-[r]->(b:Code) RETURN a.id AS a, type(r) AS t, b.id AS b, r.content_hash AS h",
+            # layer 'links' edges belong to links.py (they join repositories), not to this snapshot.
+            "MATCH (a:Code {repo: $repo})-[r]->(b:Code) WHERE r.layer IS NULL OR r.layer <> 'links' RETURN a.id AS a, type(r) AS t, b.id AS b, r.content_hash AS h",
             repo=g.repo).records}
 
         changed = defaultdict(list)

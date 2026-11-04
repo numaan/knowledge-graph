@@ -1,0 +1,4 @@
+services:
+  orders:
+    repo: orders-service
+    hints: [ORDERS_URL]
