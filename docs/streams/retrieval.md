@@ -95,7 +95,8 @@ Helm:
 | `models.reranker.externalUrl` | `""` | `RERANK_URL` when `models.selfHosted=false` |
 
 The MCP pod reads `LLM_BASE_URL` and `LLM_MODEL` from the `kg-endpoints` ConfigMap, so `ask` is on in a
-cluster. Set `mcp.env.KG_ASK: "off"` to remove it, or `mcp.env.LLM_REASONING_EFFORT: none` for Ollama.
+cluster with `llm.enabled=true`. With `llm.enabled=false`, the MCP pod gets an empty `LLM_BASE_URL`
+and `ask` is off. Set `mcp.env.KG_ASK: "off"` to remove it, or `mcp.env.LLM_REASONING_EFFORT: none` for Ollama.
 
 The ConfigMap key `RERANKER_URL` is now `RERANK_URL` (and `RERANKER_MODEL` is `RERANK_MODEL`). No code
 read the old names.

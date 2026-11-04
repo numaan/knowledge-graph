@@ -1,7 +1,20 @@
 # Developer and user guide
 
 This guide tells you how to set up the knowledge base, ingest data, test it and use it from a coding
-agent. For deployment and incidents, see the [runbook](RUNBOOK.md).
+agent or from the web UI. For deployment and incidents, see the [runbook](RUNBOOK.md). The stream
+notes in [`docs/streams/`](streams/) give the full detail of each part:
+
+| Note | Content |
+|---|---|
+| [data-trust.md](streams/data-trust.md) | deletes and moves, secret and PII masking, provenance, duplicate documents |
+| [retrieval.md](streams/retrieval.md) | reranker, query router, `ask`, result size limits and paging |
+| [knowledge.md](streams/knowledge.md) | summaries, document freshness, corrections overlay |
+| [people.md](streams/people.md) | GitHub pull requests and reviews, service catalog, people, experts and owners |
+| [contracts.md](streams/contracts.md) | API specs, database schemas, HTTP calls and topics across repositories |
+| [web.md](streams/web.md) | web UI and REST layer |
+| [governance.md](streams/governance.md) | OAuth, access per user, audit log, write-back with review, permission sync |
+| [ops-eval.md](streams/ops-eval.md) | CI, answer evaluation, scale test, tracing, metrics, backups, agent benchmark |
+| [kg-test-e2e.md](streams/kg-test-e2e.md) | end-to-end check of the whole system on kind |
 
 - [1. Concepts](#1-concepts)
 - [2. Set up a local environment](#2-set-up-a-local-environment)
@@ -51,7 +64,35 @@ flowchart TB
 | Edge method and confidence | Each code edge says how it was found: `scip` (compiler-grade, 1.0), `parser` (1.0), `treesitter` name match (0.4 to 0.8), `git` (0.6 to 1.0), `text` (0.6) or `llm`. Treat `llm` and low-confidence edges as hints. |
 | Hybrid search | Vector search, full-text search and concept search, fused with reciprocal rank fusion (RRF, k = 60), then expanded through the graph. |
 | Verdict | The result of a requirement check: `supported`, `contradicted` or `unresolved`. "Supported" needs every part of the requirement found in the evidence. |
-| ACL group | A string such as `repo:precept`, `jira:PREC`, `confluence:ENG` or `docs:<collection>` on each source node. The MCP server sees only its groups. |
+| ACL group | A string such as `repo:precept`, `jira:PREC`, `confluence:ENG` or `docs:<collection>` on each source node. Each caller sees only its groups (see [5.4](#54-access-control)). |
+| Provenance | Every source node has `url`, `source_updated_at`, `ingested_at` and `author`. |
+| Stale | A section or document whose code changed after it was written has `stale: true` and `stale_reason`. |
+| Proposal and correction | A write from an agent or a person is a `:Proposal`. A reviewer turns it into an approved `:Correction`, which the pipeline applies after each ingestion. |
+
+More layers sit on top of the four layers above:
+
+```mermaid
+flowchart LR
+  subgraph Knowledge["Knowledge (kg-summaries, kg-freshness)"]
+    SUM[Summary: file, module, repo, domain] -->|SUMMARIZES| T1[File / Folder / Repository / Capability]
+    SEC2[Section] -->|CONFLICTS_WITH| C1[Code]
+  end
+  subgraph People["People (kg-github, kg-catalog, kg-people)"]
+    PR[PullRequest] -->|CONTAINS| CM2[Commit]
+    RV[Review] -->|PART_OF| PR
+    P[Person] -->|AUTHORED / REVIEWED / ASSIGNED| PR
+    TM[Team] -->|OWNS| SVC[Service] -->|IMPLEMENTED_IN| R2[Repository]
+  end
+  subgraph Contracts["Contracts (kg-ingest-code, kg-links)"]
+    EP[endpoint Symbol] -->|IMPLEMENTS| OP[ApiOperation]
+    CL[caller Symbol] -->|CALLS_HTTP / TESTS| EP
+    ORM[Class] -->|MAPS_TO| TB[Table]
+    PUB[Symbol] -->|PUBLISHES / SUBSCRIBES| TP[Topic]
+  end
+  subgraph Governance["Governance (MCP write-back, kg-review)"]
+    PRO[Proposal] --> COR[Correction] --> OV[overlay on every asset]
+  end
+```
 
 ## 2. Set up a local environment
 
@@ -114,14 +155,25 @@ Run the steps in this order. Each step is idempotent: run it again at any time.
 
 ```mermaid
 flowchart LR
-  A[kg-ingest-code] --> B[kg-git-history]
+  A[kg-ingest-code + links] --> B[kg-git-history]
   A --> C[kg-domain] --> D[kg-embed --repo]
+  C --> SU[kg-summaries]
+  A --> CAT[kg-catalog]
   E[kg-jira] --> F[kg-embed --sources]
   G[kg-docs] --> F
+  GH[kg-github] --> F
+  E & G --> PERM[kg-permissions]
+  B & E & G & GH & CAT --> PPL[kg-people]
+  B & G --> FR[kg-freshness]
+  G --> DD[kg-dedupe]
   A --> H[kg-verify]
   C --> H
   D --> H
+  FR & PPL & SU --> CO[kg-corrections apply]
 ```
+
+In Dagster, the assets run in this order by themselves, and every asset applies the approved
+corrections after its writes. From the CLI, run `kg-corrections apply` at the end.
 
 ### 3.1 Code
 
@@ -141,6 +193,13 @@ second run takes 4 s instead of 25 s and writes 0 nodes.
 
 Supported languages: Java, Kotlin, TypeScript, JavaScript, Python, Go, C#, plus IBM ODM rule projects
 (`.brl`, `.dta`, `.rfl`, `.ilr`, `.bom`, `.voc`, `.b2x`).
+
+The same step reads API contracts and database schemas: OpenAPI, Swagger and AsyncAPI files, SQL
+migrations and ORM models, HTTP client calls, HTTP tests and message topics. After the write,
+`links.sync` connects callers, tests and topics across all repositories (`CALLS_HTTP`, `TESTS`,
+`IMPLEMENTS`, `PUBLISHES`, `SUBSCRIBES`). Use `--no-links` to skip it and `kg-links` to relink only.
+A `kg-links.yaml` file in the repository root maps base-URL names to repositories. See
+[contracts.md](streams/contracts.md).
 
 ### 3.2 Git history
 
@@ -229,17 +288,89 @@ flowchart LR
   E -->|otherwise| U[unresolved]
 ```
 
+### 3.8 Summaries
+
+```bash
+kg-summaries --repo my-repo                  # LLM within SUMMARY_BUDGET (300 calls), extractive text for the rest
+kg-summaries --repo my-repo --no-llm         # extractive text only
+```
+
+The command writes one `:Summary` for each file, folder, repository and capability. A summary is
+generated again only when its input changed. See [knowledge.md](streams/knowledge.md).
+
+### 3.9 Pull requests, service catalog and people
+
+```bash
+export GITHUB_TOKEN=<token>                       # read access to pull requests and contents
+kg-github --repo acme/shop --name shop            # pull requests, reviews, review comments
+kg-catalog --repo /path/to/shop --name shop       # catalog-info.yaml and CODEOWNERS
+kg-people --aliases people-aliases.yaml          # merge identities from all sources into :Person
+```
+
+- Run `kg-people` after `kg-git-history`, `kg-github`, `kg-catalog`, `kg-jira` and `kg-docs`.
+- The graph stores no email address, only a salted hash (`PEOPLE_EMAIL_SALT`).
+- Two identities merge only on a strong key (email hash, Atlassian account id, GitHub login, catalog
+  reference) or an alias entry. The same name alone gives a `MAYBE_SAME` edge, not a merge.
+- Without a token, GitHub allows 60 calls per hour. A first run of 1000 pull requests needs about 4000 calls.
+
+See [people.md](streams/people.md).
+
+### 3.10 Data trust: deletes, duplicates, masking
+
+```bash
+kg-jira --project PREC --reconcile               # remove deleted and moved issues
+kg-docs --confluence ENG --reconcile             # remove deleted, archived and moved pages
+kg-git-history --repo /path/to/checkout --name my-repo --reconcile   # remove rewritten commits
+kg-dedupe                                        # DUPLICATE_OF between copies of documents
+```
+
+- A reconcile that would remove more than half of a source (more than 20 items) stops with
+  `TooManyRemovals`. Use `--force` for one run when the removal is correct.
+- Secrets are removed from all stored source text. PII (email, phone, card, IBAN, SSN) is masked in
+  `text_masked`, embeddings, LLM prompts and MCP output. `KG_PII_MODE=off` turns PII masking off;
+  `KG_PII_ALLOW` adds allowed values.
+
+See [data-trust.md](streams/data-trust.md).
+
+### 3.11 Freshness and corrections
+
+```bash
+kg-freshness                                 # after kg-git-history and kg-docs
+kg-freshness --llm --budget 20               # also ask the LLM if a stale section conflicts with the code
+kg-corrections list --status approved
+kg-corrections apply                         # after any CLI ingestion
+```
+
+### 3.12 Permissions
+
+```bash
+kg-permissions --jira PREC --confluence ENG             # ACLs from permission schemes, security levels, page restrictions
+kg-permissions --jira PREC --dry-run                    # print the ACLs, write nothing
+```
+
+Run it after `kg-jira` and `kg-docs --confluence`. When the service account cannot read a
+permission, `KG_ACL_DEFAULT=deny` (default) writes `acl:deny`. See [governance.md](streams/governance.md).
+
 ## 4. Test the knowledge base
 
 ### 4.1 Unit and integration tests
 
 ```bash
-cd pipeline && .venv/Scripts/python -m pytest -q      # 25 tests; Neo4j tests skip without NEO4J_PASSWORD
-cd mcp && go test ./...                                # 7 tests; integration tests skip without NEO4J_PASSWORD
+cd pipeline && .venv/Scripts/python -m pytest -q      # about 160 tests; Neo4j tests skip without NEO4J_PASSWORD
+cd pipeline && .venv/Scripts/python -m ruff check .
+cd mcp && go vet ./... && go test ./...                # integration tests skip without NEO4J_PASSWORD
+cd web && npm test && npm run typecheck                # web UI
 ```
 
 The Neo4j tests create their own data (repositories `it-*`, Jira project `KGT`, Confluence space
 `KGT`) and delete it at the end. They do not change other data.
+
+CI (`.github/workflows/ci.yml`) runs these tests on every pull request. It also builds the images,
+renders the Helm chart, ingests the `bookshop` fixture with a fake embedder and runs `kg-eval` with
+gates. See [ops-eval.md](streams/ops-eval.md).
+
+**Caution:** an antivirus that inspects TLS and HTTP on `127.0.0.1` (for example Avast Web/Mail
+Shield) can make local HTTP tests fail with an empty or broken body. The same tests pass in CI.
 
 ### 4.2 Search quality (evaluation set)
 
@@ -277,6 +408,30 @@ Baseline on `precept` (31 questions):
 | Search hit@3 | 77 % |
 | MRR | 0.53 |
 | Seconds per query | 2.2 |
+
+Other measured results:
+
+| Set | Setup | hit@8 | MRR |
+|---|---|---|---|
+| `precept`, 2026-11-04 | Tree-sitter only, `kg-domain --no-llm`, RRF without the reranker | 74 % | 0.392 |
+| `fixture.yaml` (bookshop) | CI: fake embedder | 93 % | 0.81 |
+| `fixture.yaml` (bookshop) | kind: `qwen3-embedding:0.6b` | 93 % | 0.845 |
+
+The effect of the reranker (`RERANK_URL`) is not measured yet. To measure it, run the same set
+without and with `RERANK_URL` and compare (see [retrieval.md](streams/retrieval.md)).
+
+Answer cases test the `ask` tool. They need `KG_MCP_URL` and an MCP server with an LLM:
+
+```yaml
+answer:
+  - question: Who may invite somebody as an owner of an organisation?
+    expect: [create_invitation]          # citations must match these
+    facts: [owner, [403, forbidden]]     # each fact must be in the answer; an inner list gives alternatives
+```
+
+```bash
+KG_MCP_URL=http://localhost:8000/mcp kg-eval eval/precept.yaml --min-citation-recall 0.6 --json eval.json
+```
 
 ### 4.3 Manual checks
 
@@ -317,6 +472,24 @@ For a cluster, register the HTTP endpoint: `claude mcp add kg --transport http h
 | `search_knowledge` | find tickets and document sections | `{"query": "why scenarios are not in local storage"}` |
 | `get_change_history` | see why code changed | `{"symbol": "scenarioStore.ts"}` |
 | `read_cypher` | anything else, read only | `{"query": "MATCH (s:Symbol {role: 'endpoint'}) RETURN s.route LIMIT 20"}` |
+| `get_summary` | get a short description of a file, folder, repository or capability | `{"path": "backend/app/routers"}` |
+| `get_contract` | see an API operation, table or topic with its users | `{"contract": "POST /api/orders"}` |
+| `find_experts` | find people who know some code or a topic | `{"node": "src/cart.py"}` |
+| `get_owners` | find the owning team and service | `{"node": "cart"}` |
+| `ask` | get an answer in prose with numbered citations (needs an LLM) | `{"question": "why are scenarios not kept in local storage?"}` |
+| `report_wrong_fact` | report a wrong node or edge (write-back) | `{"node_id": "...", "reason": "..."}` |
+| `record_decision` | record a design or business decision (write-back) | `{"text": "...", "links": ["..."]}` |
+| `suggest_link` | suggest a missing edge (write-back) | `{"src": "...", "edge_type": "IMPLEMENTS", "dst": "...", "reason": "..."}` |
+
+The server has 16 read tools, 3 write-back tools and `ask`:
+
+- `ask` is on only when `LLM_BASE_URL` and `LLM_MODEL` are set. `KG_ASK=off` removes it.
+- `KG_WRITEBACK=off` removes the 3 write-back tools.
+- All read tools take `max_chars` (1,000 to 200,000, default 30,000) and `cursor`. A list result that
+  is too long gets `next_cursor` for the next page. A document result is cut and counts the items it
+  left out in `omitted`.
+- Results carry `stale` and `stale_reason` when a node is out of date. `search_knowledge` returns
+  one row for each group of duplicate documents, with the other copies in `also_in`.
 
 ### 5.3 Tell agents to use it
 
@@ -329,18 +502,92 @@ Use the `kg` MCP tools before you read files at random:
 - `search_graph` to find code; `search_knowledge` for specifications, ADRs and runbooks.
 - `impact_analysis` and `find_related_tests` before you change shared code.
 - `trace_requirement` to check a requirement.
+- `get_summary` for an overview; `find_experts` and `get_owners` to know whom to ask.
+- `report_wrong_fact` when a tool result is wrong.
 ```
 
 ### 5.4 Access control
 
-Set `KG_ACL_GROUPS` on the server, not in the tool call. The agent cannot change it.
+The agent cannot change its access in a tool call. Access comes from the server settings and, over
+HTTP with OAuth, from the caller's token.
 
-| Value | The server sees |
+| Mode | Groups of a caller |
+|---|---|
+| stdio, or HTTP without `KG_OIDC_ISSUER` | `KG_ACL_GROUPS` for every caller |
+| HTTP with `KG_OIDC_ISSUER` (OAuth 2.1) | the token groups, mapped with `acl-mapping.yaml` (`KG_ACL_MAPPING`), and only those that are also in `KG_ACL_GROUPS` |
+
+| `KG_ACL_GROUPS` value | The server sees |
 |---|---|
 | `*` (default) | everything; `read_cypher` is on |
 | `repo:precept,jira:PREC,confluence:ENG,docs:precept-docs` | code of `precept`, project PREC, space ENG and that document collection; `read_cypher` is off |
 
-Run one server (or one Helm release) per audience.
+```yaml
+# acl-mapping.yaml: identity-provider group -> ACL groups
+default: []
+passthrough: true            # keep token groups that already are ACL groups (repo:, jira:, ...)
+groups:
+  kg-admins: ["*"]
+  team-precept: [repo:precept, jira:PREC, confluence:ENG]
+```
+
+Register a server with OAuth: `claude mcp add kg --transport http https://kg.example.com/mcp`. The
+client gets the issuer from `/.well-known/oauth-protected-resource/mcp` and signs in there.
+
+Every tool call writes one audit line (`KG_AUDIT`, `KG_AUDIT_FILE`): user, groups, tool, a hash of
+the arguments, result count and the count of results that the ACL hid. It never holds tokens or text.
+See [governance.md](streams/governance.md).
+
+### 5.5 Write-back and review
+
+Agents and people never change the graph directly. They make proposals; a reviewer decides.
+
+```mermaid
+flowchart LR
+  A[report_wrong_fact / record_decision / suggest_link / web feedback] --> P[(:Proposal open)]
+  P --> R{kg-review}
+  R -->|approve| C[(:Correction approved)] --> O[applied after every asset]
+  R -->|reject| X[status rejected]
+```
+
+```bash
+kg-review list
+kg-review approve proposal:3f2a9c... --reviewer sam
+kg-review approve proposal:3f2a9c... --kind mark_outdated --text "Replaced by the v2 API"
+kg-review reject proposal:3f2a9c... --reviewer sam --reason "The link is correct"
+```
+
+| Proposal | Correction after approval |
+|---|---|
+| Wrong edge | `suppress_edge`: the edge is deleted after each ingestion |
+| Wrong node, web feedback `wrong` or `outdated` | `mark_outdated`: `stale = true` with the reason |
+| Link | `add_fact`: the edge is added with `method = 'human'` |
+| Decision | a `:Decision` node with `ABOUT` edges to the linked nodes |
+
+### 5.6 Web UI
+
+The web UI (`web/`, Next.js) is for people. It calls the same tools through the REST layer of the
+MCP server (`/api/*`), so a person sees exactly what their groups allow.
+
+| Page | Route | Use |
+|---|---|---|
+| Search | `/search?q=` | code, tickets and documents |
+| Ask | `/ask` | answers with citations (needs `ask`) |
+| Entity | `/entity?id=` | properties, code, neighbours, change history, graph explorer, feedback buttons |
+| Domain | `/domain?repo=` | capabilities, concepts, rules, endpoints |
+| Requirements | `/requirements` | verdicts and evidence |
+
+Run it locally:
+
+```bash
+cd mcp && go build -o kg-mcp . && ./kg-mcp -http :8000        # with NEO4J_PASSWORD and EMBEDDINGS_* set
+```
+
+```bash
+cd web && npm ci && KG_API_URL=http://localhost:8000 npm run dev
+```
+
+With `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `AUTH_SECRET` and `AUTH_URL`, the web app
+signs people in through Keycloak and sends their token to the REST layer. See [web.md](streams/web.md).
 
 ## 6. Extend the pipeline
 
@@ -356,10 +603,13 @@ Run one server (or one Helm release) per audience.
 
 ### 6.2 Add an MCP tool
 
-1. Add an input struct with `json` and `jsonschema` tags in `mcp/tools.go` or `mcp/sources.go`.
-2. Register the tool with `mcp.AddTool` and a description that tells the agent when to use it.
-3. Use `$repos IS NULL OR x.repo IN $repos` in every query that returns code, and `s.allowed(acl)` for source nodes.
-4. Add the tool to `TestToolsIntegration` and update the tool count.
+1. Add an input struct with `json` and `jsonschema` tags. Embed `Page` in it, so the tool takes
+   `max_chars` and `cursor`.
+2. Register the tool with `addTool` (applies the size limits) and a description that tells the agent
+   when to use it. Write-back tools use `mcp.AddTool` and must write only through `writeProposal`.
+3. Use `$repos IS NULL OR x.repo IN $repos` in every query that returns code, and
+   `s.allowed(ctx, acl)` for source nodes. Both use the groups of the caller in `ctx`.
+4. Update the tool count in `TestToolSchemas` (`mcp/retrieval_test.go`) and `mcp/server_test.go`.
 
 ### 6.3 Conventions
 
@@ -382,7 +632,19 @@ Run one server (or one Helm release) per audience.
 | `kg-docs` | documents and Confluence pages |
 | `kg-verify` | requirement checks |
 | `kg-search` | hybrid search from the shell |
-| `kg-eval` | evaluation set |
+| `kg-eval` | evaluation set (search, impact, requirements, answers) |
+| `kg-links` | relink HTTP calls, tests and topics across repositories |
+| `kg-summaries` | file, module, repository and domain summaries |
+| `kg-freshness` | stale flags and conflicts for documents |
+| `kg-corrections` | list and apply approved corrections |
+| `kg-github` | pull requests, reviews, review comments |
+| `kg-catalog` | Backstage catalog and CODEOWNERS |
+| `kg-people` | people merged from all sources |
+| `kg-permissions` | ACLs from Jira and Confluence permissions |
+| `kg-review` | list, approve and reject proposals |
+| `kg-dedupe` | duplicate documents |
+| `kg-backup` | online backup, check and restore of Neo4j |
+| `kg-fake-embedder` | deterministic embedder for tests and offline work |
 
 ### Environment variables
 
@@ -398,3 +660,16 @@ Run one server (or one Helm release) per audience.
 | `GIT_REPOSITORIES`, `GIT_BRANCH`, `GIT_TOKEN`, `SOURCE_ARCHIVE_PATH` | Dagster | `main`, `/archive` |
 | `SCIP_CACHE_DIR` | code | `.kg-cache/scip` |
 | `KG_DEFAULT_REPO`, `KG_ACL_GROUPS`, `MCP_HTTP_ADDR` | MCP | none, `*`, stdio |
+| `KG_OIDC_ISSUER`, `KG_OIDC_AUDIENCE`, `KG_OIDC_GROUPS_CLAIM`, `KG_OIDC_SCOPES`, `KG_OIDC_WRITE_SCOPE` | MCP (OAuth) | off, `kg-mcp`, `groups` |
+| `KG_ACL_MAPPING`, `KG_AUDIT`, `KG_AUDIT_FILE`, `KG_WRITEBACK` | MCP | none, `stdout` (HTTP), none, on |
+| `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`, `LLM_REASONING_EFFORT`, `KG_ASK`, `KG_ROUTER_LLM` | MCP (`ask`) | none (`ask` off), on, off |
+| `RERANK_URL`, `RERANK_MODEL`, `RERANK_API_KEY`, `RERANK_CANDIDATES` | MCP, search | none (off), `BAAI/bge-reranker-v2-m3`, 30 |
+| `SUMMARY_LLM`, `SUMMARY_BUDGET`, `FRESHNESS_LLM`, `FRESHNESS_LLM_BUDGET` | summaries, freshness | on, 300, off, 20 |
+| `KG_PII_MODE`, `KG_PII_ALLOW`, `KG_DUP_THRESHOLD`, `RECONCILE_FORCE` | data trust | `mask`, none, 0.8, off |
+| `GITHUB_TOKEN`, `GITHUB_API_URL`, `GITHUB_REPOSITORIES` | GitHub | none, `https://api.github.com`, the github.com URLs of `GIT_REPOSITORIES` when `GITHUB_TOKEN` is set |
+| `PEOPLE_ALIASES`, `PEOPLE_EMAIL_SALT` | people | none, `kg-people-v1` |
+| `KG_ACL_DEFAULT` | permissions | `deny` |
+| `KG_LINKS_CONFIG` | links | none |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`, `KG_TRACE_CONTENT` | tracing (MCP, pipeline) | off |
+| `KG_MCP_URL`, `KG_MCP_TOKEN` | `kg-eval` answer cases | none |
+| `KG_API_URL`, `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `AUTH_SECRET`, `AUTH_URL` | web | `http://localhost:8000`, off |
