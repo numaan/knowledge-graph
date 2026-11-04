@@ -225,6 +225,31 @@ func fileOf(id string) string {
 	return id
 }
 
+// Node text that leaves the server (LLM prompt, citation excerpts) reads coalesce(x.text_masked, x.text):
+// the pipeline (pipeline/kg_pipeline/privacy.py) stores a PII-masked copy in text_masked, as
+// search_knowledge and get_context_for_ticket already use.
+const (
+	askHistoryCypher = `MATCH (c:Commit)-[:MODIFIES]->(x:Code) WHERE x.id IN $ids AND ($repos IS NULL OR c.repo IN $repos)
+		WITH DISTINCT c OPTIONAL MATCH (c)-[:REFERENCES]->(t:Ticket)
+		RETURN c.id AS id, c.sha AS sha, c.date AS date, c.author AS author, c.title AS title,
+		       left(coalesce(c.text_masked, c.text), 800) AS message,
+		       c.repo AS repo, c.acl AS acl, collect(t.key + ': ' + t.title) AS tickets
+		ORDER BY date DESC LIMIT $limit`
+
+	askTicketCypher = `MATCH (t:Ticket {id: $id})
+		OPTIONAL MATCH (t)-[:CHILD_OF]->(p:Ticket)
+		OPTIONAL MATCH (c:Commit)-[:REFERENCES]->(t) WHERE $repos IS NULL OR c.repo IN $repos
+		WITH t, p, c ORDER BY c.date DESC
+		RETURN t.id AS id, t.key AS key, t.title AS title, t.type AS type, t.status AS status, t.url AS url,
+		       left(coalesce(t.text_masked, t.text), 3000) AS text, t.acl AS acl, p.key + ': ' + p.title AS parent,
+		       collect(CASE WHEN c IS NULL THEN NULL ELSE {id: c.id, title: c.title, author: c.author, date: c.date, acl: c.acl} END)[..8] AS commits`
+
+	askSummaryCypher = `CALL db.index.vector.queryNodes('summary_embedding', $k, $v) YIELD node, score
+		WHERE ($repo = '' OR node.repo IS NULL OR node.repo = $repo) AND ($repos IS NULL OR node.repo IS NULL OR node.repo IN $repos)
+		RETURN node.id AS id, node.level AS level, coalesce(node.title, node.path, node.name, node.id) AS title, node.path AS path,
+		       node.url AS url, left(coalesce(node.text_masked, node.text), $chars) AS text, node.acl AS acl ORDER BY score DESC`
+)
+
 func (s *Server) askHistory(ctx context.Context, g *gatherer, symbols []string, k int) error {
 	if len(symbols) == 0 {
 		return nil
@@ -234,11 +259,7 @@ func (s *Server) askHistory(ctx context.Context, g *gatherer, symbols []string, 
 	for _, id := range symbols {
 		targets = append(targets, fileOf(id))
 	}
-	rows, err := s.graph.Read(ctx, `MATCH (c:Commit)-[:MODIFIES]->(x:Code) WHERE x.id IN $ids AND ($repos IS NULL OR c.repo IN $repos)
-		WITH DISTINCT c OPTIONAL MATCH (c)-[:REFERENCES]->(t:Ticket)
-		RETURN c.id AS id, c.sha AS sha, c.date AS date, c.author AS author, c.title AS title, left(c.text, 800) AS message,
-		       c.repo AS repo, c.acl AS acl, collect(t.key + ': ' + t.title) AS tickets
-		ORDER BY date DESC LIMIT $limit`, map[string]any{"ids": unique(targets), "limit": k + 4})
+	rows, err := s.graph.Read(ctx, askHistoryCypher, map[string]any{"ids": unique(targets), "limit": k + 4})
 	for _, r := range rows {
 		if !s.allowed(ctx, r["acl"]) {
 			continue
@@ -291,14 +312,7 @@ func (s *Server) askImpact(ctx context.Context, g *gatherer, symbols []string) e
 
 func (s *Server) askTickets(ctx context.Context, g *gatherer, keys []string) error {
 	for _, key := range keys[:min(len(keys), 3)] {
-		rows, err := s.graph.Read(ctx, `MATCH (t:Ticket {id: $id})
-			OPTIONAL MATCH (t)-[:CHILD_OF]->(p:Ticket)
-			OPTIONAL MATCH (c:Commit)-[:REFERENCES]->(t) WHERE $repos IS NULL OR c.repo IN $repos
-			WITH t, p, c ORDER BY c.date DESC
-			RETURN t.id AS id, t.key AS key, t.title AS title, t.type AS type, t.status AS status, t.url AS url,
-			       left(t.text, 3000) AS text, t.acl AS acl, p.key + ': ' + p.title AS parent,
-			       collect(CASE WHEN c IS NULL THEN NULL ELSE {id: c.id, title: c.title, author: c.author, date: c.date, acl: c.acl} END)[..8] AS commits`,
-			map[string]any{"id": "jira:" + strings.ToUpper(key)})
+		rows, err := s.graph.Read(ctx, askTicketCypher, map[string]any{"id": "jira:" + strings.ToUpper(key)})
 		if err != nil {
 			return err
 		}
@@ -366,11 +380,7 @@ func (s *Server) askSummaries(ctx context.Context, g *gatherer, q, repo string, 
 	if err != nil {
 		return err
 	}
-	rows, err := s.graph.Read(ctx, `CALL db.index.vector.queryNodes('summary_embedding', $k, $v) YIELD node, score
-		WHERE ($repo = '' OR node.repo IS NULL OR node.repo = $repo) AND ($repos IS NULL OR node.repo IS NULL OR node.repo IN $repos)
-		RETURN node.id AS id, node.level AS level, coalesce(node.title, node.path, node.name, node.id) AS title, node.path AS path,
-		       node.url AS url, left(node.text, $chars) AS text, node.acl AS acl ORDER BY score DESC`,
-		map[string]any{"v": vec, "k": k, "repo": repo, "chars": askItemChars})
+	rows, err := s.graph.Read(ctx, askSummaryCypher, map[string]any{"v": vec, "k": k, "repo": repo, "chars": askItemChars})
 	for _, r := range rows {
 		if s.allowed(ctx, r["acl"]) {
 			g.add(evidence{ID: str(r["id"]), Label: "Summary", Title: strings.TrimSpace(str(r["level"]) + " summary: " + str(r["title"])),
