@@ -72,16 +72,23 @@ class Neo4jWriter:
         """MERGE :Source nodes by id and replace their properties, keeping computed ones (embeddings).
 
         Secrets are removed from title and text before the write; text_masked holds the text without PII.
+
+        acl: once kg-permissions has written a node's acl (it stamps acl_synced_at), that acl is the
+        precise one (issue security level, page restriction) and the coarse project/space acl of an
+        ingest row must not replace it; the permission sync stays its owner and corrects it on its next run.
         """
         self.ensure_schema()
         rows = [protect_row(r) for r in rows]
         extra = "".join(f":{_safe(l)}" for l in labels)
+        keep = tuple(k for k in keep if k not in ("acl", "acl_synced_at")) + ("acl_synced_at",)
         kept = ", ".join(f"n.{_safe(k)} AS {k}" for k in keep)
         restore = ", ".join(f"n.{k} = {k}" for k in keep)
         stamp = datetime.now(timezone.utc).isoformat()
         for batch in _batches([{"id": r["id"], "props": {k: v for k, v in r.items() if v is not None}} for r in rows]):
-            self._run(f"UNWIND $rows AS row MERGE (n:Source {{id: row.id}}) WITH n, row, {kept} "
-                      f"SET n = row.props, n.ingested_at = $stamp, n{extra}, {restore}", rows=batch, stamp=stamp)
+            self._run(f"UNWIND $rows AS row MERGE (n:Source {{id: row.id}}) WITH n, row, {kept}, n.acl AS synced_acl "
+                      f"SET n = row.props, n.ingested_at = $stamp, n{extra}, {restore}, "
+                      f"n.acl = CASE WHEN acl_synced_at IS NULL THEN row.props.acl ELSE synced_acl END",
+                      rows=batch, stamp=stamp)
         return len(rows)
 
     def link(self, etype: str, rows: list[dict], src: str = "Source", dst: str = "Source", replace_from: list[str] | None = None) -> int:

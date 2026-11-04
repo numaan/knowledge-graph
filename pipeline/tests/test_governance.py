@@ -198,6 +198,49 @@ def test_review_cli_approve_and_reject():
         review.reject(FakeWriter([]), "proposal:nope", "sam")
 
 
+def test_upsert_keeps_the_acl_written_by_the_permission_sync(monkeypatch):
+    """kg-jira / kg-docs write the coarse project or space acl; a node that kg-permissions narrowed keeps its acl."""
+    from kg_pipeline.graph.neo4j_writer import Neo4jWriter
+    w = Neo4jWriter.__new__(Neo4jWriter)
+    sent = []
+    monkeypatch.setattr(Neo4jWriter, "ensure_schema", lambda self: None)
+    monkeypatch.setattr(Neo4jWriter, "_run", lambda self, q, **p: sent.append((q, p)))
+    w.upsert(("Ticket",), [{"id": "jira:PREC-1", "title": "t", "acl": ["jira:PREC"]}])
+    q, p = sent[0]
+    assert p["rows"][0]["props"]["acl"] == ["jira:PREC"]
+    # the old acl and its sync stamp are read before SET n = row.props wipes them ...
+    head, _, tail = q.partition("SET n = row.props")
+    assert "n.acl_synced_at AS acl_synced_at" in head and "n.acl AS synced_acl" in head
+    assert "n.embedding AS embedding" in head                                    # embeddings still kept
+    # ... the stamp is restored, and the row's acl is used only for nodes the permission sync never wrote
+    assert "n.acl_synced_at = acl_synced_at" in tail
+    assert tail.strip().endswith("n.acl = CASE WHEN acl_synced_at IS NULL THEN row.props.acl ELSE synced_acl END")
+
+
+def test_document_sections_take_the_documents_stored_acl():
+    """A Confluence page restricted by kg-permissions: re-ingest must not give its sections the space acl."""
+    from kg_pipeline.sources import documents
+    restricted = ["confluence-group:eng"]
+    upserts = []
+
+    class W(FakeWriter):
+        def upsert(self, labels, rows):
+            upserts.append((labels, rows))
+
+        def link(self, *a, **k):
+            return 0
+
+    doc = {"id": "confluence:ENG:7", "title": "Secret", "source": "confluence", "acl": ["confluence:ENG"]}
+    # MATCH (d:Document {id}) RETURN d.acl answers what upsert kept: the permission-synced acl
+    md = "# Secret\n\nthe plan for the next quarter\n\n## More\n\nwho is going to do which part"
+    assert documents._write_document(W([{"acl": restricted}]), doc, md) == 2
+    assert upserts[0] == (("Document",), [doc])
+    assert upserts[1][0] == ("Section",) and all(r["acl"] == restricted for r in upserts[1][1])
+    upserts.clear()     # a document never synced: sections get the ingest acl
+    documents._write_document(W([{"acl": None}]), doc, md)
+    assert upserts[1][1] and all(r["acl"] == ["confluence:ENG"] for r in upserts[1][1])
+
+
 @pytest.mark.skipif(not os.environ.get("NEO4J_PASSWORD"), reason="NEO4J_PASSWORD not set")
 def test_permissions_and_review_in_neo4j(monkeypatch):
     from kg_pipeline.graph.neo4j_writer import Neo4jWriter
@@ -214,6 +257,8 @@ def test_permissions_and_review_in_neo4j(monkeypatch):
             assert sync_jira(w, fake_atlassian()[0], "KGT")["written"] == 0                     # incremental
             acl = w._run("MATCH (t:Ticket {id: 'jira:KGT-3'}) RETURN t.acl AS a").records[0]["a"]
             assert "jira:KGT" not in acl and "jira-group:security" in acl
+            w.upsert(("Ticket",), [{"id": "jira:KGT-3", "key": "KGT-3", "project": "KGT", "acl": ["jira:KGT"]}])
+            assert w._run("MATCH (t:Ticket {id: 'jira:KGT-3'}) RETURN t.acl AS a").records[0]["a"] == acl  # kg-jira re-run
             assert sync_confluence(w, fake_atlassian("CONFLUENCE")[0], "KGT")["written"] == 1
             sec = w._run("MATCH (s:Section {id: 'confluence:KGT:3#s0'}) RETURN s.acl AS a").records[0]["a"]
             assert sec == ["confluence-group:eng"]

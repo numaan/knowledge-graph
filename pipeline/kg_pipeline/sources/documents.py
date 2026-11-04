@@ -127,10 +127,14 @@ def storage_to_markdown(html: str) -> str:
 
 def _write_document(w: Neo4jWriter, doc: dict, markdown: str) -> int:
     sections = split_sections(markdown)
-    rows = [{"id": f"{doc['id']}#s{i}", "title": h or doc["title"], "text": t, "order": i, "acl": doc["acl"],
+    w.upsert(("Document",), [doc])
+    # upsert keeps an acl that kg-permissions wrote (page restriction); sections, new ones included, take
+    # the document's stored acl so they are never wider than the page.
+    stored = w._run("MATCH (d:Document {id: $id}) RETURN d.acl AS acl", id=doc["id"]).records
+    acl = list(stored[0]["acl"]) if stored and stored[0]["acl"] is not None else doc["acl"]
+    rows = [{"id": f"{doc['id']}#s{i}", "title": h or doc["title"], "text": t, "order": i, "acl": acl,
              "source": doc["source"], "url": doc.get("url"), "source_updated_at": doc.get("source_updated_at"),
              "author": doc.get("author")} for i, (h, t) in enumerate(sections)]
-    w.upsert(("Document",), [doc])
     w.upsert(("Section",), rows)
     w._run("MATCH (s:Section)-[:PART_OF]->(:Document {id: $doc}) WHERE NOT s.id IN $ids DETACH DELETE s",
            doc=doc["id"], ids=[r["id"] for r in rows])

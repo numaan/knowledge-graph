@@ -103,6 +103,33 @@ def test_confluence_reconcile_classifies_missing_pages():
     assert sorted(w.deleted()) == ["confluence:KGT:2", "confluence:KGT:3", "confluence:KGT:4", "confluence:KGT:5"]
 
 
+def test_reconcile_never_removes_what_it_did_not_look_up(monkeypatch, caplog):
+    """Missing items over MAX_LOOKUPS are unknown: deferred to the next run, not deleted."""
+    monkeypatch.setattr(reconcile, "MAX_LOOKUPS", 1)
+    w = FakeWriter({
+        "MATCH (t:Ticket {project: $p})": [{"key": f"KGT-{i}", "id": f"jira:KGT-{i}"} for i in (1, 2, 3, 4, 5)],
+        "MATCH (r:Release {project: $p})": [{"id": "jira:release:KGT:10100"}],
+    })
+    with caplog.at_level("WARNING", logger="kg_pipeline.reconcile"):
+        res = reconcile.jira(w, fake_atlassian(), "KGT")
+    assert res["moved"] == {"KGT-2": "OTH-9"} and res["deleted"] == [] and res["deferred"] == ["KGT-4", "KGT-5"]
+    assert w.deleted() == ["jira:KGT-2"]                     # KGT-4 (really deleted) waits for a lookup
+    assert "2 missing issues" in caplog.text
+    assert json.loads(w.states["reconcile:jira:KGT"])["deferred"] == ["KGT-4", "KGT-5"]
+
+    w = FakeWriter({"MATCH (d:Document {collection: $c})": [{"id": f"confluence:KGT:{i}"} for i in range(1, 7)]})
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="kg_pipeline.reconcile"):
+        res = reconcile.confluence(w, fake_atlassian("CONFLUENCE"), "KGT")
+    assert res["archived"] == ["2"] and res["deleted"] == [] and res["deferred"] == ["3", "4", "5", "6"]
+    assert w.deleted() == ["confluence:KGT:2"]
+    assert "4 missing pages" in caplog.text
+
+    monkeypatch.setattr(reconcile, "MAX_LOOKUPS", 0)          # no lookups at all: nothing is removed
+    w = FakeWriter({"MATCH (d:Document {collection: $c})": [{"id": f"confluence:KGT:{i}"} for i in range(1, 7)]})
+    assert reconcile.confluence(w, fake_atlassian("CONFLUENCE"), "KGT")["removed"] == 0 and w.deleted() == []
+
+
 def test_folder_reconcile_keeps_moved_files_and_removes_deleted(tmp_path):
     import hashlib
     (tmp_path / "guides").mkdir()

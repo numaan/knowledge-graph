@@ -92,8 +92,12 @@ def jira(w: Neo4jWriter, api: Atlassian, project: str, force: bool = False) -> d
     missing = sorted(set(graph) - listed)
     _guard(len(missing), len(graph), f"Jira {project}", force)
     deleted, moved, kept = [], {}, []
-    for i, key in enumerate(missing):
-        state, new = classify_issue(api, key) if i < MAX_LOOKUPS else ("deleted", None)
+    deferred = missing[MAX_LOOKUPS:]   # not looked up: unknown, never removed; the next run looks again
+    if deferred:
+        log.warning("Jira %s: %d missing issues over the %d lookups of this run were skipped, not removed",
+                    project, len(deferred), MAX_LOOKUPS)
+    for key in missing[:MAX_LOOKUPS]:
+        state, new = classify_issue(api, key)
         if state == "deleted":
             deleted.append(key)
         elif state == "moved":
@@ -106,7 +110,7 @@ def jira(w: Neo4jWriter, api: Atlassian, project: str, force: bool = False) -> d
     removed_releases = _delete(w, [i for i in old_releases if i not in releases])
     return _record(w, f"jira:{project}", {
         "project": project, "graph": len(graph), "listed": len(listed), "deleted": deleted, "moved": moved,
-        "kept": kept, "removed": removed, "removed_releases": removed_releases,
+        "kept": kept, "deferred": deferred, "removed": removed, "removed_releases": removed_releases,
         "not_in_graph": len(listed - set(graph))})   # the next sync adds them (moved-in issues have a new `updated`)
 
 
@@ -157,8 +161,12 @@ def confluence(w: Neo4jWriter, api: Atlassian, space_key: str, force: bool = Fal
     _guard(len(missing), len(graph), f"Confluence {space_key}", force)
     out: dict[str, dict | list] = {"deleted": [], "archived": [], "moved": {}, "kept": []}
     keys: dict[str, str] = {}
-    for i, pid in enumerate(missing):
-        state, detail = classify_page(api, pid, space_id, keys) if i < MAX_LOOKUPS else ("deleted", None)
+    deferred = missing[MAX_LOOKUPS:]   # not looked up: unknown, never removed; the next run looks again
+    if deferred:
+        log.warning("Confluence %s: %d missing pages over the %d lookups of this run were skipped, not removed",
+                    space_key, len(deferred), MAX_LOOKUPS)
+    for pid in missing[:MAX_LOOKUPS]:
+        state, detail = classify_page(api, pid, space_id, keys)
         if state == "moved":
             out["moved"][pid] = detail       # the sync of the target space adds it under its own id
         else:
@@ -166,7 +174,7 @@ def confluence(w: Neo4jWriter, api: Atlassian, space_key: str, force: bool = Fal
     gone = out["deleted"] + out["archived"] + list(out["moved"])
     removed = _delete(w, [graph[p] for p in gone])
     return _record(w, f"confluence:{space_key}", {"space": space_key, "graph": len(graph), "listed": len(listed),
-                                                  **out, "removed": removed, "not_in_graph": len(listed - set(graph))})
+                                                  **out, "deferred": deferred, "removed": removed, "not_in_graph": len(listed - set(graph))})
 
 
 # ---- document folders ----------------------------------------------------------------------------------
