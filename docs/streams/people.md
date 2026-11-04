@@ -107,7 +107,7 @@ Use it to confirm a `MAYBE_SAME` pair: `MATCH (a:Person)-[r:MAYBE_SAME]->(b) RET
 |---|---|---|
 | `GITHUB_TOKEN` | `kg-github` | none (60 unauthenticated requests per hour) |
 | `GITHUB_API_URL` | `kg-github` | `https://api.github.com` |
-| `GITHUB_REPOSITORIES` | Dagster `github_prs` | the github.com URLs of `GIT_REPOSITORIES`; format `owner/repo=graph-name,owner/other` |
+| `GITHUB_REPOSITORIES` | Dagster `github_prs` | the github.com URLs of `GIT_REPOSITORIES`, only when `GITHUB_TOKEN` is set; format `owner/repo=graph-name,owner/other` |
 | `PEOPLE_ALIASES` | `kg-people`, Dagster `people` | `people-aliases.yaml` in the working folder (CLI); none (Dagster) |
 | `PEOPLE_EMAIL_SALT` | all sources that hash emails | `kg-people-v1`. Changing it changes every hash: run all sources with `--full` again |
 

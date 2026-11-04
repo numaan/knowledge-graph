@@ -1,6 +1,7 @@
 """Dagster assets of the people stream: GitHub pull requests, service catalog and people.
 
-github_prs (every repository in GITHUB_REPOSITORIES, or the github.com URLs of GIT_REPOSITORIES),
+github_prs (every repository in GITHUB_REPOSITORIES; with GITHUB_TOKEN set, also the github.com URLs of
+GIT_REPOSITORIES: without a token GitHub allows 60 calls per hour, which blocks the run on the rate limit),
 service_catalog (per repository partition, after code_snapshot) and people (after both and the other
 sources). Env: GITHUB_TOKEN, GITHUB_API_URL, GITHUB_REPOSITORIES ("owner/repo=name,..."),
 PEOPLE_ALIASES (path of people-aliases.yaml).
@@ -15,7 +16,7 @@ from . import people as people_mod
 from .graph.neo4j_writer import Neo4jWriter
 from .sources import catalog, git, github
 
-GIT_URLS = [u for u in os.environ.get("GIT_REPOSITORIES", "").split(",") if u]
+GIT_URLS = [u for u in os.environ.get("GIT_REPOSITORIES", "").split(",") if u] if os.environ.get("GITHUB_TOKEN") else []
 GITHUB_REPOS = github.repositories(os.environ.get("GITHUB_REPOSITORIES", ""), GIT_URLS)
 
 

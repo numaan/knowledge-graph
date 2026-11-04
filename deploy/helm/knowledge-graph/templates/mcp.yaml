@@ -57,6 +57,11 @@ spec:
             - name: KG_DEFAULT_REPO
               value: {{ . | quote }}
             {{- end }}
+            {{- if not $.Values.llm.enabled }}
+            # llm.enabled=false: no ask tool (the ConfigMap still carries LLM_BASE_URL for the pipeline)
+            - name: LLM_BASE_URL
+              value: ""
+            {{- end }}
             {{- include "kg.mcpGovernanceEnv" . | nindent 12 }}
             {{- range $k, $v := $m.env }}
             - name: {{ $k }}
