@@ -2,8 +2,15 @@ import type { Answer, Citation } from "./types";
 
 // The ask tool's result, normalised. Accepted shapes: {data: {answer, citations}} or {answer, citations};
 // citations may be called sources, and each citation may name its title as title or name.
+// The Go ask tool (mcp/ask.go, type Citation) sends the node label as `label` and the text as
+// `excerpt`; the older `kind` and `snippet` names are still read as fallbacks.
 
 const str = (v: unknown) => (typeof v === "string" ? v : v == null ? "" : String(v));
+
+const firstText = (...vs: unknown[]) => {
+  for (const v of vs) if (v != null && str(v).trim() !== "") return str(v);
+  return undefined;
+};
 
 export function normaliseAnswer(raw: unknown): Answer {
   const r = (raw ?? {}) as Record<string, unknown>;
@@ -14,8 +21,8 @@ export function normaliseAnswer(raw: unknown): Answer {
     id: c.id ? str(c.id) : undefined,
     title: str(c.title ?? c.name ?? c.id ?? `Source ${i + 1}`),
     url: c.url ? str(c.url) : undefined,
-    kind: c.kind ? str(c.kind) : undefined,
-    snippet: c.snippet ? str(c.snippet) : undefined,
+    kind: firstText(c.label, c.kind),
+    snippet: firstText(c.excerpt, c.snippet),
   }));
   return {
     answer: str(d.answer ?? d.text ?? ""),

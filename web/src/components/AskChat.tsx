@@ -34,6 +34,8 @@ export function AskChat() {
       });
       const body = await res.json().catch(() => ({}));
       if (res.status === 404) turn = { role: "error", notConfigured: true, text: "The ask tool is not configured on this server." };
+      // Session gone (e.g. the access token could not be refreshed); reloading sends the user to sign-in.
+      else if (res.status === 401) turn = { role: "error", text: "Your session has expired. Reload the page to sign in again." };
       else if (!res.ok) turn = { role: "error", text: body.error ?? `Request failed (${res.status})` };
       else turn = { role: "answer", answer: normaliseAnswer(body), question: q };
     } catch (err) {
