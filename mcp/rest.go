@@ -32,6 +32,7 @@ type Caller struct {
 	Name    string   `json:"name,omitempty"`
 	Email   string   `json:"email,omitempty"`
 	Groups  []string `json:"groups,omitempty"`
+	Scopes  []string `json:"scopes,omitempty"` // OAuth scopes of the token (OIDC.Caller)
 }
 
 type callerKey struct{}
@@ -47,7 +48,8 @@ func CallerFrom(ctx context.Context) *Caller {
 }
 
 // IdentityFunc reads the caller from a request. The default trusts nobody: every request is the
-// local user. An OIDC implementation replaces it (REST.Identity) and may return an error for 401.
+// local user. An OIDC implementation replaces it (REST.Identity) and may return an error for 401,
+// or an *httpError with status 403 for a valid token that lacks a required scope.
 type IdentityFunc func(r *http.Request) (*Caller, error)
 
 func localIdentity(*http.Request) (*Caller, error) { return &Caller{Subject: "local"}, nil }
@@ -159,7 +161,11 @@ func (api *REST) with(h func(w http.ResponseWriter, r *http.Request) (int, any, 
 	return func(w http.ResponseWriter, r *http.Request) {
 		caller, err := api.Identity(r)
 		if err != nil || caller == nil {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			status, msg := http.StatusUnauthorized, "unauthorized"
+			if he := (*httpError)(nil); errors.As(err, &he) && he.status == http.StatusForbidden {
+				status, msg = he.status, he.msg
+			}
+			writeJSON(w, status, map[string]string{"error": msg})
 			return
 		}
 		ctx := WithCaller(r.Context(), caller)

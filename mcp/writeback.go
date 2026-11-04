@@ -181,19 +181,27 @@ func limit(name, v string, lo, hi int) error {
 	return nil
 }
 
+// canWrite checks KG_OIDC_WRITE_SCOPE. MCP callers ("token") and REST callers in OIDC mode
+// ("rest", scopes from the Caller that OIDC.Caller filled) need the scope; callers without a
+// token (stdio, REST without OIDC) have no scopes and cannot write while a write scope is set.
 func (s *Server) canWrite(ctx context.Context) error {
-	a := accessFrom(ctx)
-	if a != nil && a.Via == "rest" && s.requireCaller {
-		return nil // the REST layer checked the token; its Caller carries no scopes
+	if s.writeScope == "" {
+		return nil
 	}
-	if s.writeScope != "" && (a == nil || a.Via != "token" || !slices.Contains(a.Scopes, s.writeScope)) {
+	a := accessFrom(ctx)
+	if a == nil || (a.Via != "token" && a.Via != "rest") || !slices.Contains(a.Scopes, s.writeScope) {
 		return deny(ctx, "write-back needs the OAuth scope %s", s.writeScope)
 	}
 	return nil
 }
 
-// visibleNodes fails for nodes that do not exist or that the caller cannot see, with the same
-// message, so that a caller cannot find hidden nodes through write-back.
+// notVisibleError is the error for a node that does not exist or that the caller cannot see. Both
+// have the same message, so that a caller cannot find hidden nodes through write-back.
+type notVisibleError struct{ id string }
+
+func (e *notVisibleError) Error() string { return "node " + e.id + " not found or not visible" }
+
+// visibleNodes fails with a *notVisibleError for nodes that do not exist or that the caller cannot see.
 func (s *Server) visibleNodes(ctx context.Context, ids ...string) error {
 	for _, id := range ids {
 		found, repo, acl, err := s.backend().NodeAccess(ctx, id)
@@ -201,10 +209,11 @@ func (s *Server) visibleNodes(ctx context.Context, ids ...string) error {
 			return err
 		}
 		if !found {
-			return fmt.Errorf("node %s not found or not visible", id)
+			return &notVisibleError{id}
 		}
 		if !s.allowedRepo(ctx, repo) || !s.allowed(ctx, acl) {
-			return deny(ctx, "node %s not found or not visible", id)
+			markDenied(ctx)
+			return &notVisibleError{id}
 		}
 	}
 	return nil
@@ -240,8 +249,12 @@ func proposalProps(p map[string]any, user, via, source string) map[string]any {
 		delete(out, "links")
 	}
 	out["author"], out["author_via"], out["source"] = user, via, source
-	h, _ := json.Marshal([]any{out["kind"], out["target_id"], out["edge_type"], out["other_id"], out["links"],
-		out["title"], out["text"], out["feedback_kind"], user})
+	parts := []any{out["kind"], out["target_id"], out["edge_type"], out["other_id"], out["links"],
+		out["title"], out["text"], out["feedback_kind"], user}
+	if q, ok := out["question"]; ok { // answer feedback (feedback.go); other hashes stay as they were
+		parts = append(parts, q)
+	}
+	h, _ := json.Marshal(parts)
 	sum := sha256.Sum256(h)
 	out["content_hash"] = hex.EncodeToString(sum[:10])
 	b := make([]byte, 8)

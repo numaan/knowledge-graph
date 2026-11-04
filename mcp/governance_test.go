@@ -9,6 +9,7 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"math/big"
 	"net/http"
@@ -493,6 +494,28 @@ func TestWriteScope(t *testing.T) {
 	if err := s.canWrite(ctx); err != nil {
 		t.Error(err)
 	}
+	// REST callers in OIDC mode need the scope too; their scopes come from the Caller
+	s.requireCaller = true
+	if s.canWrite(withAccess(context.Background(), s.restAccess(&Caller{Subject: "u-a", Scopes: []string{"openid"}}))) == nil {
+		t.Error("REST write without the scope")
+	}
+	if err := s.canWrite(withAccess(context.Background(), s.restAccess(&Caller{Subject: "u-a", Scopes: []string{"openid", "kg:write"}}))); err != nil {
+		t.Errorf("REST write with the scope: %v", err)
+	}
+	if s.canWrite(context.Background()) == nil {
+		t.Error("write without a caller")
+	}
+	// without OIDC nobody holds a scope: REST and stdio callers cannot write while a write scope is set
+	s.requireCaller = false
+	for _, a := range []*Access{s.restAccess(&Caller{Subject: "local", Scopes: []string{"kg:write"}}), s.envAccess()} {
+		if s.canWrite(withAccess(context.Background(), a)) == nil {
+			t.Errorf("%s write without OIDC", a.Via)
+		}
+	}
+	s.writeScope = ""
+	if err := s.canWrite(withAccess(context.Background(), s.envAccess())); err != nil {
+		t.Errorf("no write scope configured: %v", err)
+	}
 }
 
 func TestFeedbackSink(t *testing.T) {
@@ -527,6 +550,66 @@ func TestFeedbackSink(t *testing.T) {
 	if sink.Submit(rest, Feedback{NodeID: "jira:PREC-1", Kind: "wrong"}) == nil {
 		t.Error("REST caller wrote feedback on a node outside its groups")
 	}
+	if sink.Submit(context.Background(), Feedback{NodeID: "answer:x", Kind: "helpful"}) == nil {
+		t.Error("OIDC mode stored feedback without a caller")
+	}
+}
+
+// Feedback on an Ask answer ("answer:<question>") has no node; it is stored without target_id.
+// Errors are 4xx: a missing or hidden node is 404 (the same for both), bad input is 400.
+func TestFeedbackAnswerAndStatus(t *testing.T) {
+	f := newFakeBackend()
+	s := &Server{groups: map[string]bool{"*": true}}
+	s.proposals = f
+	ctx := withAccess(context.Background(), &Access{User: "carol", Groups: map[string]bool{"jira:PREC": true}, Via: "rest"})
+	sink := s.feedbackSink()
+	for _, q := range []string{"How are invites sent?", "Who owns billing?"} {
+		if err := sink.Submit(ctx, Feedback{NodeID: "answer:" + q, Kind: "wrong", Comment: "misses the retry"}); err != nil {
+			t.Fatalf("answer feedback: %v", err)
+		}
+	}
+	if len(f.proposals) != 2 {
+		t.Fatalf("two questions must give two proposals, got %d", len(f.proposals))
+	}
+	p := f.proposals[0]
+	if _, ok := p["target_id"]; ok || p["subject"] != "answer" || p["question"] != "How are invites sent?" ||
+		p["kind"] != "feedback" || p["feedback_kind"] != "wrong" || p["author"] != "carol" {
+		t.Errorf("answer feedback proposal: %v", p)
+	}
+	if err := sink.Submit(ctx, Feedback{NodeID: "answer:How are invites sent?", Kind: "wrong", Comment: "misses the retry"}); err != nil || len(f.proposals) != 2 {
+		t.Errorf("the same answer feedback again: %v, %d proposals", err, len(f.proposals))
+	}
+
+	status := func(err error) int {
+		var he *httpError
+		if !errors.As(err, &he) {
+			t.Fatalf("not an httpError (would be HTTP 500): %v", err)
+		}
+		return he.status
+	}
+	for name, c := range map[string]struct {
+		fb   Feedback
+		want int
+	}{
+		"unknown node":   {Feedback{NodeID: "jira:NOPE-1", Kind: "wrong"}, http.StatusNotFound},
+		"hidden node":    {Feedback{NodeID: "jira:HR-7", Kind: "wrong"}, http.StatusNotFound},
+		"empty question": {Feedback{NodeID: "answer: ", Kind: "wrong"}, http.StatusBadRequest},
+		"long question":  {Feedback{NodeID: "answer:" + strings.Repeat("q", maxQuestion+1), Kind: "wrong"}, http.StatusBadRequest},
+		"bad kind":       {Feedback{NodeID: "jira:PREC-1", Kind: "DROP TABLE"}, http.StatusBadRequest},
+	} {
+		err := sink.Submit(ctx, c.fb)
+		if err == nil {
+			t.Errorf("%s: accepted", name)
+			continue
+		}
+		if got := status(err); got != c.want {
+			t.Errorf("%s: status %d, want %d (%v)", name, got, c.want, err)
+		}
+	}
+	unknown, hidden := sink.Submit(ctx, Feedback{NodeID: "jira:NOPE-1", Kind: "wrong"}), sink.Submit(ctx, Feedback{NodeID: "jira:HR-7", Kind: "wrong"})
+	if strings.Replace(unknown.Error(), "NOPE-1", "X", 1) != strings.Replace(hidden.Error(), "HR-7", "X", 1) {
+		t.Errorf("unknown and hidden nodes must read the same: %q / %q", unknown, hidden)
+	}
 }
 
 // The access middleware takes the REST caller (rest.go puts it into the context) like a token.
@@ -550,6 +633,165 @@ func TestMiddlewareRESTCaller(t *testing.T) {
 	got = nil
 	if _, err := h(context.Background(), "tools/call", req); err == nil || got != nil {
 		t.Error("OIDC mode ran a call without a caller")
+	}
+}
+
+// The REST layer with OIDC.Caller enforces KG_OIDC_SCOPES like /mcp (401 bad token, 403 missing
+// scope) and passes the token's scopes on, so KG_OIDC_WRITE_SCOPE holds for /api/tools/{name}.
+func TestRESTOIDCScopes(t *testing.T) {
+	idp := newTestIdP(t)
+	f := newFakeBackend()
+	s := &Server{groups: map[string]bool{"*": true}}
+	s.requireCaller, s.writeScope, s.proposals = true, "kg:write", f
+	s.mapping = &aclMapping{Groups: map[string][]string{"team-precept": {"repo:precept", "jira:PREC"}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	api, err := newREST(ctx, s, newMCPServer(s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { api.Close() })
+	o := newOIDC(idp.issuer(), "kg-mcp", "groups", "", "", []string{"kg:read"})
+	api.Identity, api.Feedback = o.Caller, s.feedbackSink()
+	mux := http.NewServeMux()
+	api.Mount(mux)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	withScope := func(scope string) string {
+		return "Bearer " + idp.token("k1", func(c jwt.MapClaims) { c["scope"] = scope })
+	}
+	report := `{"node_id": "jira:PREC-1", "reason": "fixed in 2.3"}`
+	url := srv.URL + "/api/tools/report_wrong_fact"
+
+	if code, _ := do(t, "POST", url, report); code != http.StatusUnauthorized {
+		t.Errorf("no token: %d", code)
+	}
+	if code, _ := do(t, "POST", url, report, "Authorization", "Bearer abc.def.ghi"); code != http.StatusUnauthorized {
+		t.Errorf("bad token: %d", code)
+	}
+	if code, out := do(t, "POST", url, report, "Authorization", withScope("openid kg:write")); code != http.StatusForbidden || out["error"] != "insufficient scope" {
+		t.Errorf("token without the required scope kg:read: %d %v", code, out)
+	}
+	if code, _ := do(t, "GET", srv.URL+"/api/tools", "", "Authorization", withScope("openid")); code != http.StatusForbidden {
+		t.Errorf("required scope on every REST route: %d", code)
+	}
+	code, out := do(t, "POST", url, report, "Authorization", withScope("openid kg:read"))
+	if msg, _ := out["error"].(string); code != http.StatusUnprocessableEntity || !strings.Contains(msg, "OAuth scope kg:write") {
+		t.Errorf("write-back over REST without kg:write: %d %v", code, out)
+	}
+	if len(f.proposals) != 0 {
+		t.Fatalf("proposal stored without the write scope: %v", f.proposals)
+	}
+	if code, out = do(t, "POST", url, report, "Authorization", withScope("openid kg:read kg:write")); code != http.StatusOK || out["created"] != true {
+		t.Errorf("write-back over REST with kg:write: %d %v", code, out)
+	}
+	if len(f.proposals) != 1 || f.proposals[0]["author"] != "alice" || f.proposals[0]["author_via"] != "rest" {
+		t.Errorf("REST proposal: %v", f.proposals)
+	}
+
+	// feedback needs a valid token with the required scopes, not the write scope
+	fb := srv.URL + "/api/feedback"
+	if code, out = do(t, "POST", fb, `{"node_id": "answer:How are invites sent?", "kind": "helpful"}`, "Authorization", withScope("kg:read")); code != http.StatusAccepted {
+		t.Errorf("answer feedback: %d %v", code, out)
+	}
+	for _, id := range []string{"jira:NOPE-1", "jira:HR-7"} {
+		if code, out = do(t, "POST", fb, `{"node_id": "`+id+`", "kind": "wrong"}`, "Authorization", withScope("kg:read")); code != http.StatusNotFound {
+			t.Errorf("feedback on %s: %d %v, want 404", id, code, out)
+		}
+	}
+	if code, _ = do(t, "POST", fb, `{"node_id": "jira:PREC-1", "kind": "wrong"}`, "Authorization", withScope("kg:write")); code != http.StatusForbidden {
+		t.Errorf("feedback without the required scope: %d", code)
+	}
+}
+
+// A slow JWKS fetch must not block tokens signed by a cached key, and requests that need the new
+// key share one fetch.
+func TestJWKSFetchOutsideLock(t *testing.T) {
+	idp := newTestIdP(t)
+	var mu sync.Mutex
+	var gate chan struct{}
+	fetches, entered := 0, make(chan struct{}, 10)
+	jwks := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		g := gate
+		fetches++
+		mu.Unlock()
+		if g != nil {
+			entered <- struct{}{}
+			<-g
+		}
+		resp, err := http.Get(idp.issuer() + "/protocol/openid-connect/certs")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		io.Copy(w, resp.Body)
+	}))
+	t.Cleanup(jwks.Close)
+	release := make(chan struct{})
+	var once sync.Once
+	open := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(open) // runs before jwks.Close, which waits for the held handler
+
+	o := newOIDC(idp.issuer(), "kg-mcp", "groups", jwks.URL, "", nil)
+	ctx := context.Background()
+	if _, err := o.Verify(ctx, idp.token("k1", nil), nil); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	gate = release
+	mu.Unlock()
+	idp.addEC("k2")
+	o.minRefresh = 0
+	k1, k2 := idp.token("k1", nil), idp.token("k2", nil)
+
+	errs := make(chan error, 3)
+	for range 3 {
+		go func() {
+			_, err := o.Verify(ctx, k2, nil)
+			errs <- err
+		}()
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no JWKS fetch for the new key")
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := o.Verify(ctx, k1, nil)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("cached key during a slow fetch: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a token with a cached key waited for the JWKS fetch")
+	}
+	open()
+	for range 3 {
+		if err := <-errs; err != nil {
+			t.Errorf("rotated key: %v", err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if fetches != 2 {
+		t.Errorf("JWKS fetched %d times, want 2 (start, then one fetch shared by the waiters)", fetches)
+	}
+
+	// a waiter whose request ends does not wait for the fetch
+	o.mu.Lock()
+	o.inflight = make(chan struct{})
+	o.mu.Unlock()
+	cctx, ccancel := context.WithCancel(ctx)
+	ccancel()
+	if _, err := o.key(cctx, "k3"); err == nil {
+		t.Error("unknown key with a cancelled context")
 	}
 }
 

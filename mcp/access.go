@@ -31,8 +31,8 @@ type gov struct {
 type Access struct {
 	User   string
 	Groups map[string]bool // effective groups, already bounded by the server groups
-	Scopes []string        // OAuth scopes of the token (empty in stdio mode)
-	Via    string          // "token" or "env"
+	Scopes []string        // OAuth scopes of the token, also for REST callers with OIDC (empty in stdio mode)
+	Via    string          // "token", "rest" or "env"
 	stats  *callStats
 }
 
@@ -115,10 +115,14 @@ func bound(requested, upper map[string]bool) map[string]bool {
 
 // deny marks the call as denied in the audit log and returns the error for the agent.
 func deny(ctx context.Context, format string, args ...any) error {
+	markDenied(ctx)
+	return fmt.Errorf(format, args...)
+}
+
+func markDenied(ctx context.Context) {
 	if a := accessFrom(ctx); a != nil && a.stats != nil {
 		a.stats.denied.Store(true)
 	}
-	return fmt.Errorf(format, args...)
 }
 
 func sortedGroups(groups map[string]bool) []string {

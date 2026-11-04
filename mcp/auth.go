@@ -49,10 +49,13 @@ type OIDC struct {
 	minRefresh time.Duration // an unknown kid fetches again at most this often (key rotation)
 	leeway     time.Duration
 
-	mu      sync.Mutex
-	keys    map[string]any // kid -> *rsa.PublicKey or *ecdsa.PublicKey
-	fetched time.Time      // last successful fetch
-	tried   time.Time      // last fetch attempt
+	// mu guards the fields below and JWKSURL. It is never held during an HTTP fetch.
+	mu       sync.RWMutex
+	keys     map[string]any // kid -> *rsa.PublicKey or *ecdsa.PublicKey
+	fetched  time.Time      // last successful fetch
+	tried    time.Time      // last fetch attempt
+	inflight chan struct{}  // closed when the running fetch ends; nil when none runs
+	fetchErr error          // result of the last fetch
 }
 
 func oidcFromEnv() *OIDC {
@@ -176,28 +179,76 @@ func claimStrings(claims map[string]any, path string) []string {
 
 // ---- JWKS ----------------------------------------------------------------------------------------
 
+// key returns the public key for kid. Cached keys are read under the read lock; the discovery and
+// JWKS fetch runs without the lock, so a slow issuer never holds up tokens signed by a known key.
 func (o *OIDC) key(ctx context.Context, kid string) (any, error) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if k, ok := o.lookup(kid); ok && time.Since(o.fetched) < o.ttl {
+	o.mu.RLock()
+	k, ok := o.lookup(kid)
+	fresh := time.Since(o.fetched) < o.ttl
+	o.mu.RUnlock()
+	if ok && fresh {
 		return k, nil
 	}
-	if time.Since(o.tried) >= o.minRefresh {
-		o.tried = time.Now()
-		if err := o.refresh(ctx); err != nil {
-			if k, ok := o.lookup(kid); ok { // the issuer is down: keep the known keys
-				return k, nil
-			}
-			return nil, err
-		}
-	}
-	if k, ok := o.lookup(kid); ok {
+	err := o.refresh(ctx, !ok) // a known but old key goes on while the fetch runs
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	if k, ok := o.lookup(kid); ok { // also when the issuer is down: keep the known keys
 		return k, nil
+	}
+	if err != nil {
+		return nil, err
 	}
 	if o.keys == nil {
 		return nil, errors.New("jwks: signing keys not available yet")
 	}
 	return nil, fmt.Errorf("unknown signing key %q", kid)
+}
+
+// refresh starts a fetch of the keys unless one runs already or the last attempt was less than
+// minRefresh ago (an unknown kid must not make every request hit the issuer). Only one fetch runs
+// at a time; wait says whether to wait for it (the caller has no usable key).
+func (o *OIDC) refresh(ctx context.Context, wait bool) error {
+	o.mu.Lock()
+	done := o.inflight
+	if done == nil {
+		if time.Since(o.tried) < o.minRefresh {
+			o.mu.Unlock()
+			return nil
+		}
+		o.tried = time.Now()
+		done = make(chan struct{})
+		o.inflight = done
+		// the fetch belongs to all waiting requests, so the first one's cancellation must not end it;
+		// the client timeout bounds it
+		go o.fetchInto(context.WithoutCancel(ctx), o.JWKSURL, done)
+	}
+	o.mu.Unlock()
+	if !wait {
+		return nil
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.fetchErr
+}
+
+// fetchInto fetches the keys without the lock and stores them.
+func (o *OIDC) fetchInto(ctx context.Context, jwksURL string, done chan struct{}) {
+	keys, jwksURL, err := o.fetch(ctx, jwksURL)
+	o.mu.Lock()
+	if jwksURL != "" {
+		o.JWKSURL = jwksURL
+	}
+	if err == nil {
+		o.keys, o.fetched = keys, time.Now()
+	}
+	o.fetchErr, o.inflight = err, nil
+	o.mu.Unlock()
+	close(done)
 }
 
 func (o *OIDC) lookup(kid string) (any, bool) {
@@ -212,26 +263,27 @@ func (o *OIDC) lookup(kid string) (any, bool) {
 	return nil, false
 }
 
-func (o *OIDC) refresh(ctx context.Context) error {
-	jwksURL := o.JWKSURL
+// fetch reads the JWKS (from the issuer's discovery document when jwksURL is empty) and returns
+// the signing keys and the JWKS URL it used. It touches no state of o.
+func (o *OIDC) fetch(ctx context.Context, jwksURL string) (map[string]any, string, error) {
 	if jwksURL == "" {
 		var doc struct {
 			Issuer  string `json:"issuer"`
 			JWKSURI string `json:"jwks_uri"`
 		}
 		if err := o.getJSON(ctx, o.Issuer+"/.well-known/openid-configuration", &doc); err != nil {
-			return err
+			return nil, "", err
 		}
 		if doc.Issuer != o.Issuer || doc.JWKSURI == "" {
-			return fmt.Errorf("oidc discovery: issuer %q does not match %q or has no jwks_uri", doc.Issuer, o.Issuer)
+			return nil, "", fmt.Errorf("oidc discovery: issuer %q does not match %q or has no jwks_uri", doc.Issuer, o.Issuer)
 		}
-		o.JWKSURL, jwksURL = doc.JWKSURI, doc.JWKSURI
+		jwksURL = doc.JWKSURI
 	}
 	var set struct {
 		Keys []jwk `json:"keys"`
 	}
 	if err := o.getJSON(ctx, jwksURL, &set); err != nil {
-		return err
+		return nil, jwksURL, err
 	}
 	keys := map[string]any{}
 	for _, k := range set.Keys {
@@ -243,10 +295,9 @@ func (o *OIDC) refresh(ctx context.Context) error {
 		}
 	}
 	if len(keys) == 0 {
-		return errors.New("jwks: no usable signing keys")
+		return nil, jwksURL, errors.New("jwks: no usable signing keys")
 	}
-	o.keys, o.fetched = keys, time.Now()
-	return nil
+	return keys, jwksURL, nil
 }
 
 func (o *OIDC) getJSON(ctx context.Context, u string, out any) error {
