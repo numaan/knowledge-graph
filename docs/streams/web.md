@@ -131,16 +131,34 @@ Tests:
 
 | Command | Tests |
 |---|---|
-| `cd mcp && go vet ./... && go test ./...` | 5 REST tests with fake tools, plus `TestRESTIntegration` (skips without `NEO4J_PASSWORD`) |
-| `cd web && npm test` | 17 Vitest tests: answer parsing, entity helpers, feedback buttons, Ask chat (answer, not configured, error) |
+| `cd mcp && go vet ./... && go test ./...` | 5 REST tests with fake tools, plus `TestRESTIntegration` (skips without `NEO4J_PASSWORD`; passed against precept data) |
+| `cd web && npm test` | 18 Vitest tests: answer parsing, entity helpers, feedback buttons, Ask chat (answer, not configured, error) |
 | `cd web && npm run typecheck` | TypeScript |
 | `cd web && npm run build && npm run e2e` | Playwright smoke test against the mock API, desktop and phone (8 runs) |
 | `SHOTS=../docs/streams/web-screenshots npm run e2e` | same, and saves the screenshots below |
 
 ## Screenshots
 
-The screenshots come from the Playwright smoke test against the mock API (`web/e2e/mock-api.mjs`),
-not from a real graph: Docker Desktop was stopped, so no local Neo4j with precept data was available.
+### Real graph (precept)
+
+A local Neo4j (`kg-neo4j-web`, bolt port 7706) with precept data: `kg-ingest-code --scip off`,
+`kg-git-history`, `kg-domain --no-llm`, `kg-docs` on `precept/docs`, `kg-embed --repo` and
+`--sources` (2,486 chunks, 2,173 sections), and `kg-verify --limit 3` on `P10-03-scenario-builder.md`.
+`kg-mcp -http` served the REST layer; the web app ran from the production build. The `ask` tool is not
+on this branch, so the Ask page shows the "not configured" notice. Script: `web/e2e/real-shots.mjs`.
+
+| Page | Desktop | Phone |
+|---|---|---|
+| Search | ![](web-screenshots/real-desktop-search.png) | ![](web-screenshots/real-phone-search.png) |
+| Symbol | ![](web-screenshots/real-desktop-entity.png) | ![](web-screenshots/real-phone-entity.png) |
+| Domain | ![](web-screenshots/real-desktop-domain.png) | ![](web-screenshots/real-phone-domain.png) |
+| Requirements | ![](web-screenshots/real-desktop-requirements.png) | ![](web-screenshots/real-phone-requirements.png) |
+| Ask (tool missing) | ![](web-screenshots/real-desktop-ask.png) | ![](web-screenshots/real-phone-ask.png) |
+
+### Mock API
+
+These come from the Playwright smoke test against the mock API (`web/e2e/mock-api.mjs`). They show
+the parts that the real data above does not have yet: an `ask` answer, a ticket and badges.
 
 | Page | Desktop | Phone |
 |---|---|---|
@@ -154,10 +172,12 @@ not from a real graph: Docker Desktop was stopped, so no local Neo4j with precep
 
 ## Limits
 
-- Not tested against a real Neo4j: Docker Desktop was stopped. The Go integration test and a run with
-  precept data are still to do.
-- The Docker image and `templates/web.yaml` were not built or rendered: Docker and Helm are not
-  available here. The standalone server (`.next/standalone/server.js`) was run and serves pages.
+- Search waits for the query embedding. With the shared Ollama under load, one search took 39 s and
+  one hit the 120 s tool timeout; the page then shows "timed out" for that part.
+- The Docker image was not built: three `docker build` runs failed in the Docker Desktop build engine
+  (`error reading from server: EOF`) while other sessions used Docker. Helm is not installed here, so
+  `templates/web.yaml` was not rendered. The standalone server (`.next/standalone/server.js`) was run
+  and serves pages.
 - The OIDC login was not tested against Keycloak. The access token is not refreshed: when it expires,
   the API rejects calls (once stream 7 checks tokens) until the user signs in again.
 - The `ask` tool and the stale and conflict properties come from other streams; the UI follows the

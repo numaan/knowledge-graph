@@ -74,3 +74,8 @@ export function languageOf(path: unknown): string {
   const ext = typeof path === "string" ? path.split(".").pop()?.toLowerCase() ?? "" : "";
   return EXT[ext] ?? "text";
 }
+
+/** "Doc > Doc > Part" → "Doc > Part": search_knowledge adds the document title before section titles that already start with it. */
+export function breadcrumb(title: string): string {
+  return title.split(" > ").filter((p, i, a) => i === 0 || p !== a[i - 1]).join(" > ");
+}
