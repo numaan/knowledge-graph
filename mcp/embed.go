@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -21,6 +22,8 @@ type Embedder struct {
 	Model  string
 	APIKey string
 	client *http.Client
+	mu     sync.Mutex
+	cache  map[string][]float64 // recent query vectors: ask embeds the same question for several indexes
 }
 
 func NewEmbedder(url, model, key string) *Embedder {
@@ -28,7 +31,26 @@ func NewEmbedder(url, model, key string) *Embedder {
 		client: &http.Client{Timeout: 60 * time.Second}}
 }
 
-func (e *Embedder) Query(ctx context.Context, text string) (_ []float64, err error) {
+func (e *Embedder) Query(ctx context.Context, text string) ([]float64, error) {
+	e.mu.Lock()
+	vec, ok := e.cache[text]
+	e.mu.Unlock()
+	if ok {
+		return vec, nil
+	}
+	vec, err := e.query(ctx, text)
+	if err == nil {
+		e.mu.Lock()
+		if e.cache == nil || len(e.cache) >= 256 {
+			e.cache = map[string][]float64{}
+		}
+		e.cache[text] = vec
+		e.mu.Unlock()
+	}
+	return vec, err
+}
+
+func (e *Embedder) query(ctx context.Context, text string) (_ []float64, err error) {
 	ctx, span, start := childSpan(ctx, "embeddings "+e.Model, attribute.String("gen_ai.operation.name", "embeddings"),
 		attribute.String("gen_ai.request.model", e.Model), attribute.String("openinference.span.kind", "EMBEDDING"))
 	defer func() { endSpan(span, start, embedSeconds, err) }()

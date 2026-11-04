@@ -15,6 +15,8 @@ type Server struct {
 	defaultRepo string
 	groups      map[string]bool // ACL groups this server may see (default and upper bound); see acl.go
 	gov                         // per-user access, audit and write-back; see access.go
+	rerank      *Reranker       // optional cross-encoder after RRF; nil is off (rerank.go)
+	llm         *ChatLLM        // optional chat model for ask; nil turns ask off (ask.go)
 }
 
 func (s *Server) repo(r string) string {
@@ -73,26 +75,31 @@ func must(rows []map[string]any, err error) []map[string]any {
 // ---- inputs and outputs -------------------------------------------------------------------------
 
 type SearchIn struct {
+	Page
 	Query string `json:"query" jsonschema:"question or description in natural language, e.g. 'who can invite users in bulk'"`
 	Repo  string `json:"repo,omitempty" jsonschema:"repository name; empty uses the default or searches all"`
 	K     int    `json:"k,omitempty" jsonschema:"number of results, 1-20 (default 8)"`
 }
 type FindSymbolIn struct {
+	Page
 	Name  string `json:"name" jsonschema:"symbol name, qualified name (Class.method) or prefix; * wildcards allowed"`
 	Repo  string `json:"repo,omitempty" jsonschema:"repository name"`
 	Kind  string `json:"kind,omitempty" jsonschema:"Class, Interface, Enum, Function or Method"`
 	Limit int    `json:"limit,omitempty" jsonschema:"maximum results, 1-50 (default 20)"`
 }
 type SymbolIn struct {
+	Page
 	Symbol string `json:"symbol" jsonschema:"symbol id (from another tool) or qualified name"`
 	Repo   string `json:"repo,omitempty" jsonschema:"repository name, to disambiguate names"`
 }
 type ImpactIn struct {
+	Page
 	Symbol string `json:"symbol" jsonschema:"symbol id or qualified name of the code you plan to change"`
 	Repo   string `json:"repo,omitempty" jsonschema:"repository name"`
 	Depth  int    `json:"depth,omitempty" jsonschema:"how many hops of callers and subtypes to follow, 1-4 (default 3)"`
 }
 type NeighborsIn struct {
+	Page
 	NodeID    string   `json:"node_id" jsonschema:"id of any node (symbol, file, concept, rule, requirement)"`
 	EdgeTypes []string `json:"edge_types,omitempty" jsonschema:"filter, e.g. CALLS, IMPORTS, DEFINES, CONTAINS, REALISES, IMPLEMENTED_BY"`
 	Direction string   `json:"direction,omitempty" jsonschema:"out, in or both (default both)"`
@@ -100,23 +107,31 @@ type NeighborsIn struct {
 	Limit     int      `json:"limit,omitempty" jsonschema:"1-100 (default 50)"`
 }
 type RequirementIn struct {
+	Page
 	Requirement string `json:"requirement" jsonschema:"requirement id, document reference (e.g. FR-P10-03-02) or the requirement text"`
 	Repo        string `json:"repo,omitempty" jsonschema:"repository name"`
 }
 type RepoIn struct {
+	Page
 	Repo string `json:"repo,omitempty" jsonschema:"repository name; empty lists repositories"`
 }
 type CypherIn struct {
+	Page
 	Query  string         `json:"query" jsonschema:"read-only Cypher; nodes have :Code (File, Symbol, Chunk, Module), :Domain (DomainConcept, BusinessRule, Capability) or :Requirement labels"`
 	Params map[string]any `json:"params,omitempty" jsonschema:"query parameters"`
 }
 
 type Rows struct {
-	Results []map[string]any `json:"results"`
-	Note    string           `json:"note,omitempty"`
+	Results    []map[string]any `json:"results"`
+	Note       string           `json:"note,omitempty"`
+	NextCursor string           `json:"next_cursor,omitempty"` // see page.go
+	Truncated  bool             `json:"truncated,omitempty"`
+	Total      int              `json:"total,omitempty"`
 }
 type Doc struct {
-	Data map[string]any `json:"data"`
+	Data      map[string]any `json:"data"`
+	Truncated bool           `json:"truncated,omitempty"`
+	Omitted   map[string]int `json:"omitted,omitempty"` // list items left out per field path
 }
 
 // ---- tools --------------------------------------------------------------------------------------
@@ -127,7 +142,8 @@ func (s *Server) register(m *mcp.Server) {
 	s.registerPeople(m)
 	s.registerContracts(m)
 	s.registerWriteback(m)
-	mcp.AddTool(m, &mcp.Tool{Name: "search_graph", Description: "Find code for a question in natural language. " +
+	s.registerAsk(m)
+	addTool(m, &mcp.Tool{Name: "search_graph", Description: "Find code for a question in natural language. " +
 		"Hybrid search (vectors + full text + domain concepts) over code chunks, then graph expansion: each result has the " +
 		"symbol, its domain concepts, business rules, callers, callees, related tests and a code excerpt. Start here."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in SearchIn) (*mcp.CallToolResult, Rows, error) {
@@ -149,7 +165,7 @@ func (s *Server) register(m *mcp.Server) {
 			return nil, Rows{Results: rows}, nil
 		})
 
-	mcp.AddTool(m, &mcp.Tool{Name: "find_symbol", Description: "Look up classes, interfaces, functions and methods by name. " +
+	addTool(m, &mcp.Tool{Name: "find_symbol", Description: "Look up classes, interfaces, functions and methods by name. " +
 		"Exact name and qualified-name matches come first, then full-text matches."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in FindSymbolIn) (*mcp.CallToolResult, Rows, error) {
 			q := lucene(in.Name)
@@ -171,7 +187,7 @@ func (s *Server) register(m *mcp.Server) {
 			return nil, Rows{Results: dropEmptyStale(rows)}, err
 		})
 
-	mcp.AddTool(m, &mcp.Tool{Name: "get_symbol_code", Description: "Full source code of one symbol (all of its chunks), " +
+	addTool(m, &mcp.Tool{Name: "get_symbol_code", Description: "Full source code of one symbol (all of its chunks), " +
 		"with file path, line range, signature and annotations."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in SymbolIn) (*mcp.CallToolResult, Doc, error) {
 			id, err := s.resolve(ctx, in.Symbol, s.repo(in.Repo))
@@ -192,7 +208,7 @@ func (s *Server) register(m *mcp.Server) {
 			return nil, Doc{Data: row}, nil
 		})
 
-	mcp.AddTool(m, &mcp.Tool{Name: "impact_analysis", Description: "What can break if a symbol changes: every caller, " +
+	addTool(m, &mcp.Tool{Name: "impact_analysis", Description: "What can break if a symbol changes: every caller, " +
 		"subtype and user up to N hops (also HTTP callers in other repositories, HTTP tests and consumers of topics it " +
 		"publishes to), split into production code and tests, plus affected HTTP endpoints, " +
 		"linked requirements and domain concepts. Use before you edit shared code."},
@@ -247,7 +263,7 @@ func (s *Server) register(m *mcp.Server) {
 			}}, nil
 		})
 
-	mcp.AddTool(m, &mcp.Tool{Name: "find_related_tests", Description: "Tests that exercise a symbol: test code that " +
+	addTool(m, &mcp.Tool{Name: "find_related_tests", Description: "Tests that exercise a symbol: test code that " +
 		"calls or uses it directly or through up to 2 intermediate calls, including HTTP tests of the endpoints that " +
 		"reach it (TestClient, supertest, MockMvc, httptest, ...). Run these after you change the symbol."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in SymbolIn) (*mcp.CallToolResult, Rows, error) {
@@ -276,7 +292,7 @@ func (s *Server) register(m *mcp.Server) {
 			return nil, Rows{Results: rows, Note: note}, err
 		})
 
-	mcp.AddTool(m, &mcp.Tool{Name: "get_neighbors", Description: "Walk the graph from any node: typed edges " +
+	addTool(m, &mcp.Tool{Name: "get_neighbors", Description: "Walk the graph from any node: typed edges " +
 		"(CALLS, IMPORTS, DEFINES, CONTAINS, EXTENDS, IMPLEMENTS, USES_TYPE, REALISES, IMPLEMENTED_BY, VALIDATED_BY, COVERS, " +
 		contractDoc + ", ...)."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in NeighborsIn) (*mcp.CallToolResult, Rows, error) {
@@ -312,7 +328,7 @@ func (s *Server) register(m *mcp.Server) {
 			return nil, Rows{Results: dropEmptyStale(out)}, err
 		})
 
-	mcp.AddTool(m, &mcp.Tool{Name: "trace_requirement", Description: "Trace a document requirement to code: its " +
+	addTool(m, &mcp.Tool{Name: "trace_requirement", Description: "Trace a document requirement to code: its " +
 		"verdict (supported, contradicted, unresolved), reasoning, gaps, the implementing or contradicting symbols and " +
 		"the tests that validate it. Accepts an id, a reference such as FR-P10-03-02, or the requirement text."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in RequirementIn) (*mcp.CallToolResult, Doc, error) {
@@ -350,7 +366,7 @@ func (s *Server) register(m *mcp.Server) {
 			return nil, Doc{Data: data}, nil
 		})
 
-	mcp.AddTool(m, &mcp.Tool{Name: "domain_overview", Description: "Business view of a repository: capabilities per " +
+	addTool(m, &mcp.Tool{Name: "domain_overview", Description: "Business view of a repository: capabilities per " +
 		"module, main domain concepts, business rules, entities and HTTP endpoints. Without repo: list repositories."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in RepoIn) (*mcp.CallToolResult, Doc, error) {
 			repo := s.repo(in.Repo)
@@ -381,7 +397,7 @@ func (s *Server) register(m *mcp.Server) {
 			}}, nil
 		})
 
-	mcp.AddTool(m, &mcp.Tool{Name: "read_cypher", Description: "Run a read-only Cypher query when the other tools do " +
+	addTool(m, &mcp.Tool{Name: "read_cypher", Description: "Run a read-only Cypher query when the other tools do " +
 		"not fit. Writes and most procedures are rejected; at most 500 rows; 15 s timeout. Labels: File, Symbol " +
 		"(Class, Interface, Enum, Function, Method), Chunk, Module, Repository, DomainConcept, BusinessRule, Capability, " +
 		"Requirement, ApiOperation, Schema, Table, Column, Topic. Edges: CONTAINS, DEFINES, PART_OF, IMPORTS, CALLS, " +

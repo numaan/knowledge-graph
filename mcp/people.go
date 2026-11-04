@@ -20,10 +20,12 @@ type ExpertsIn struct {
 	Node  string `json:"node,omitempty" jsonschema:"symbol id, qualified name or file path; use instead of topic for one piece of code"`
 	Repo  string `json:"repo,omitempty" jsonschema:"repository name"`
 	Limit int    `json:"limit,omitempty" jsonschema:"number of people, 1-20 (default 5)"`
+	Page
 }
 type OwnersIn struct {
 	Node string `json:"node" jsonschema:"symbol id, qualified name, file path, or a catalog service, API, system or team name"`
 	Repo string `json:"repo,omitempty" jsonschema:"repository name"`
+	Page
 }
 
 // Evidence weights. Recent work counts more: each item halves its weight every halfLife.
@@ -153,7 +155,7 @@ const sourceEvidence = `
 	LIMIT 500`
 
 func (s *Server) registerPeople(m *mcp.Server) {
-	mcp.AddTool(m, &mcp.Tool{Name: "find_experts", Description: "People who know a piece of code or a topic, ranked " +
+	addTool(m, &mcp.Tool{Name: "find_experts", Description: "People who know a piece of code or a topic, ranked " +
 		"by recent commits, pull requests, reviews, review comments, ticket work and code ownership, each with " +
 		"evidence. Give node (symbol or file) for code, or topic for a question. Use it to find a reviewer or " +
 		"someone to ask."},
@@ -198,7 +200,7 @@ func (s *Server) registerPeople(m *mcp.Server) {
 			return nil, Rows{Results: out, Note: note}, nil
 		})
 
-	mcp.AddTool(m, &mcp.Tool{Name: "get_owners", Description: "Owners of code or of a catalog entity: the team and " +
+	addTool(m, &mcp.Tool{Name: "get_owners", Description: "Owners of code or of a catalog entity: the team and " +
 		"people from CODEOWNERS, the service (Backstage catalog) that the code implements, its owning team, " +
 		"system and team members. Give a symbol, a file path or a service, API, system or team name."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in OwnersIn) (*mcp.CallToolResult, Doc, error) {

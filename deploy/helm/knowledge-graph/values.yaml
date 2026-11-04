@@ -89,9 +89,13 @@ models:
     resources:
       requests: { cpu: "2", memory: 4Gi }
       limits: { memory: 8Gi }
+  # Cross-encoder after RRF in search_graph, search_knowledge, ask and kg-search
+  # (TEI /rerank). Off by default: it adds about 0.3 s per query on a CPU.
+  # selfHosted=false: set externalUrl to any TEI /rerank endpoint instead.
   reranker:
-    enabled: true
+    enabled: false
     model: BAAI/bge-reranker-v2-m3
+    externalUrl: ""
     cacheSize: 10Gi
     resources:
       requests: { cpu: "2", memory: 4Gi }

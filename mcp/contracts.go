@@ -22,6 +22,7 @@ const (
 type ContractIn struct {
 	Contract string `json:"contract" jsonschema:"ApiOperation or Table or Topic id, operationId, 'POST /api/orders', a table name or a topic name; an endpoint symbol id also works"`
 	Repo     string `json:"repo,omitempty" jsonschema:"repository name, to disambiguate"`
+	Page
 }
 
 var (
@@ -92,7 +93,7 @@ func (s *Server) findContract(ctx context.Context, ref, repo string) (string, st
 }
 
 func (s *Server) registerContracts(m *mcp.Server) {
-	mcp.AddTool(m, &mcp.Tool{Name: "get_contract", Description: "API contract or database table with everything " +
+	addTool(m, &mcp.Tool{Name: "get_contract", Description: "API contract or database table with everything " +
 		"around it: for an HTTP operation (OpenAPI or code endpoint) its schemas, implementing endpoints, callers in any " +
 		"repository and HTTP tests; for a table its columns, foreign keys, mapped ORM classes, readers, writers and " +
 		"migrations; for a message topic its publishers, subscribers and AsyncAPI specs. Use it before you change an " +

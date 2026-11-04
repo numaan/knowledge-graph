@@ -17,6 +17,7 @@ type SummaryIn struct {
 	Path   string `json:"path,omitempty" jsonschema:"file or folder path inside the repository, e.g. backend/app/routers"`
 	Repo   string `json:"repo,omitempty" jsonschema:"repository name; alone it returns the repository summary"`
 	Domain string `json:"domain,omitempty" jsonschema:"capability name, capability id or module folder"`
+	Page
 }
 
 func folderID(repo, dir string) string {
@@ -132,7 +133,7 @@ func (s *Server) summaryRequest(ctx context.Context, in SummaryIn) (string, []st
 }
 
 func (s *Server) registerSummaries(m *mcp.Server) {
-	mcp.AddTool(m, &mcp.Tool{Name: "get_summary", Description: "Short natural-language summary of a file, folder " +
+	addTool(m, &mcp.Tool{Name: "get_summary", Description: "Short natural-language summary of a file, folder " +
 		"(module), repository or business capability, with the summaries one level down. Give node_id, path, " +
 		"domain or repo. When that level has no summary, it returns the nearest one above it (file, then folder, " +
 		"parent folders, repository) and says so. Use it to orient yourself before you read code."},
