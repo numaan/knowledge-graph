@@ -241,9 +241,12 @@ cd pipeline && .venv/Scripts/python -m pytest -q
 - Not tested against real Jira or Confluence: the fixtures follow the documented Cloud formats.
 - Atlassian groups are matched by name. Nested groups, user holders and the AND of space and page
   permissions are not modelled: a restricted page gets only its restriction groups.
-- Between a source sync and `source_permissions`, a changed page or issue briefly has the default
-  ACL of the base sync (`jira:<KEY>` or `confluence:<KEY>`).
-- REST callers carry no scopes, so `KG_OIDC_WRITE_SCOPE` applies to MCP tokens only; REST feedback needs a valid token.
+- A page or issue that `source_permissions` has never synced has the default ACL of the base sync
+  (`jira:<KEY>` or `confluence:<KEY>`) until the next permission sync. Once synced (`acl_synced_at`),
+  a re-ingest keeps the synced ACL; a lifted restriction therefore stays until the next permission sync.
+- REST callers carry the token's scopes: `KG_OIDC_SCOPES` is enforced on every REST route (403 when missing)
+  and `KG_OIDC_WRITE_SCOPE` on write-back tools. `POST /api/feedback` needs a valid token with the required
+  scopes but not the write scope, because the web client does not request it.
 - One issuer per server. Tokens are not introspected, so a revoked token works until it expires (Keycloak default 15 minutes in the dev realm).
 - No rate limit on proposals.
 

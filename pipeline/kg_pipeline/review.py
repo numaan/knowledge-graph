@@ -74,6 +74,9 @@ def corrections_for(p: dict, reviewer: str, kind: str | None = None, text: str |
         raise ValueError(f"kind must be one of {', '.join(KINDS)}")
     target_id = target or p.get("target_id")
     if not target_id:
+        if p.get("subject") == "answer":
+            raise ValueError(f"answer feedback on {p.get('question', '')!r} names no node; give --target with the "
+                             "node the answer got wrong, or reject it")
         raise ValueError("the proposal names no node; give --target")
     if kind != "mark_outdated" and not (p.get("edge_type") and p.get("other_id")):
         raise ValueError(f"{kind} needs a proposal about an edge (target_id, edge_type, other_id)")
@@ -143,6 +146,8 @@ def _table(rows: list[dict]) -> str:
     out = []
     for p in rows:
         target = p.get("target_id", "")
+        if p.get("subject") == "answer" and not target:
+            target = f"answer to: {p.get('question', '')}"
         if p.get("edge_type"):
             target = f"{target} -[{p['edge_type']}]-> {p.get('other_id', '')}"
         text = (p.get("text") or p.get("title") or "").replace("\n", " ")

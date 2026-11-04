@@ -179,6 +179,14 @@ def test_corrections_from_proposals():
         with pytest.raises(ValueError):
             corrections_for(p, "sam", **kw)
 
+    answer = {"id": "proposal:8", "kind": "feedback", "feedback_kind": "wrong", "subject": "answer",
+              "question": "Who approves invites?", "text": "wrong owner"}
+    with pytest.raises(ValueError, match="answer feedback on 'Who approves invites\?' names no node"):
+        corrections_for(answer, "sam")
+    assert one(answer, target="r:a.py#f")["target_id"] == "r:a.py#f"
+    from kg_pipeline.review import _table
+    assert "answer to: Who approves invites?" in _table([answer])
+
     assert decision_acl([{"acl": ["jira:PREC"]}, {"repo": "precept"}]) == ["jira:PREC", "repo:precept"]
     assert decision_acl([{"acl": ["jira:PREC"]}, {"acl": None, "repo": None}]) is None          # one public node
 
