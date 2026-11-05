@@ -183,6 +183,10 @@ Remove it with `kind delete cluster --name kg-test`.
 
 With `llm.enabled=false`, `kg-mcp` has no `ask` tool and the summaries are extractive.
 
+Dagster reads code only from git URLs. To ingest a folder that is not a git repository, run the CLI
+steps in [guide 3.0](GUIDE.md#30-local-folders-and-code-outside-git). To connect a system that is not in
+this table, see [guide 6.1](GUIDE.md#61-add-a-source).
+
 **Caution:** The embedding model must be the same for the pipeline and `kg-mcp`. If you change it,
 delete the embeddings and the vector indexes, then embed again (see [7.3](#73-change-the-embedding-model)).
 

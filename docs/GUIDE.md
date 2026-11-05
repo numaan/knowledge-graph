@@ -175,6 +175,44 @@ flowchart LR
 In Dagster, the assets run in this order by themselves, and every asset applies the approved
 corrections after its writes. From the CLI, run `kg-corrections apply` at the end.
 
+### 3.0 Local folders and code outside git
+
+Dagster reads code only from git URLs (`sources.git.repositories`): `code_snapshot` makes a bare
+mirror with `git clone --mirror` and parses a checkout of the configured branch. A folder on disk
+that is not a git repository (an export, a vendor drop, a network share) is ingested with the CLI
+from a machine that can reach Neo4j, for example through a port-forward:
+
+```bash
+kubectl -n kg port-forward svc/kg-neo4j 7687:7687     # or set NEO4J_URI to a reachable address
+export NEO4J_URI=bolt://127.0.0.1:7687 NEO4J_USER=neo4j NEO4J_PASSWORD=...
+export EMBEDDINGS_URL=... EMBEDDINGS_MODEL=... EMBEDDINGS_DIMENSIONS=...   # same model as kg-mcp
+
+kg-ingest-code --repo /data/fis-codebase --name fis-codebase     # code, contracts and links
+kg-domain      --repo fis-codebase --no-llm                      # roles; drop --no-llm when an LLM is set
+kg-embed       --repo fis-codebase
+kg-summaries   --repo fis-codebase --no-llm                      # extractive; drop --no-llm when an LLM is set
+kg-docs        --path /data/fis-codebase/business-docs --name fis-docs
+kg-embed       --sources
+kg-corrections apply
+```
+
+| Step | Works without git? | Notes |
+|---|---|---|
+| `kg-ingest-code`, `kg-links` | Yes | `--name` sets the repository id. Without it the folder name is used. Keep the name stable: node ids are `<name>:<path>#<qualname>`. |
+| `kg-domain`, `kg-embed`, `kg-summaries` | Yes | They read what `kg-ingest-code` wrote. |
+| `kg-docs --path` | Yes | `.md` and `.txt` are read directly; `.pdf`, `.docx`, `.pptx` and `.html` need Docling (`DOCLING_URL`). |
+| `kg-git-history` | No | Needs a checkout with history. Without it there are no `Commit` nodes, no `MODIFIES` edges and no `get_change_history`, and `kg-people` finds no authors. |
+| Dagster assets and schedules | No | Only git URLs. Re-run the CLI after the folder changes; unchanged files are not written again. |
+
+To get history and scheduling, put the folder in git (`git init`, commit, push to an internal
+remote) and add the URL to `sources.git.repositories`. A one-commit repository still gives the
+schedules; history starts at that commit.
+
+**Caution:** SCIP indexers build the project. A Maven or Gradle project whose parent POM or
+dependencies cannot be resolved (private repository not reachable) falls back to Tree-sitter name
+matching, with lower-confidence `CALLS` edges and no edges for ambiguous names. Run the indexer where
+the build works, for example in CI, and pass the index with `--scip index.scip`.
+
 ### 3.1 Code
 
 ```bash
@@ -593,13 +631,121 @@ signs people in through Keycloak and sends their token to the REST layer. See [w
 
 ### 6.1 Add a source
 
-1. Create `pipeline/kg_pipeline/sources/<name>.py` with a `sync(w, ...)` function.
-2. Write nodes with `w.upsert(("<Label>",), rows)`. Each row needs `id`, `title`, `text`, `acl` and `source`.
-3. Write edges with `w.link("<TYPE>", rows, dst="Code" | "Source", replace_from=ids)`.
-4. Store a cursor with `w.state("<name>:<key>", value)` for incremental runs.
-5. Call `link_mentions(w, rows)` to link code names in the text.
-6. Add a CLI entry in `pyproject.toml`, an asset in `definitions.py` and fixtures and tests in `tests/`.
-7. Add the label to `_source_texts` in `vectors.py` if agents must find it by meaning.
+A source is a module that reads one external system (a tracker, a wiki, a database, a REST API, a
+file share) and writes `:Source` nodes with edges to code, tickets and documents. Jira
+(`sources/jira.py`) is the reference: read it next to this section.
+
+#### Design first
+
+Decide these before you write code:
+
+| Decision | Rule | Jira example |
+|---|---|---|
+| Label | One extra label per kind of item, next to `:Source`. | `:Source:Ticket`, `:Source:Release` |
+| Id | `<source>:<stable key>`, never a title or a position. Ids are the merge key; a changed id is a delete plus an add. | `jira:PREC-123` |
+| Text | `title` plus `text` is what search and the LLM see. Put the useful content in `text` and cap it (Jira: 12,000 characters). | description, acceptance criteria, last 10 comments |
+| ACL | A list of groups that may read the item. An empty or missing list means **everyone**. Use the coarsest correct group (project, space); a permission sync can narrow it later. | `["jira:PREC"]` |
+| Incremental cursor | A value that says what to fetch next time: an update timestamp, a version, a sequence number. | `jira:PREC:updated` |
+| Edges | Which items link to each other, and which link to code. | `CHILD_OF`, `LINKS`, `IN_RELEASE`, `MENTIONS` |
+
+#### Write the module
+
+`pipeline/kg_pipeline/sources/incidents.py`, a tracker with a REST API:
+
+```python
+"""Incidents from the tracker into the graph.
+
+    kg-incidents --team payments            # incremental
+    kg-incidents --team payments --full     # all incidents
+
+Graph:
+    (:Source:Incident {key, status, severity, title, text, ...})
+        -[:MENTIONS]-> (:Code)      files and symbols named in the text
+        -[:RELATES_TO]-> (:Ticket)  Jira keys named in the text
+"""
+from ..graph.neo4j_writer import Neo4jWriter
+from .jira import link_mentions
+
+
+def incident_row(item: dict, team: str) -> dict:
+    return {
+        "id": f"incident:{item['number']}", "key": item["number"], "title": item["short_description"],
+        "text": (item.get("description") or "")[:12_000], "status": item["state"], "severity": item.get("severity"),
+        "url": item["link"], "acl": [f"incident:{team}"], "source": "incidents",
+        "source_updated_at": item["updated_at"], "author": item.get("opened_by"),
+    }
+
+
+def sync(w: Neo4jWriter, api, team: str, full: bool = False) -> dict:
+    cursor_key = f"incidents:{team}:updated"
+    since = None if full else w.state(cursor_key)
+    items = api.incidents(team, updated_since=since)            # your client; page through all results
+    rows = [incident_row(i, team) for i in items]
+    w.upsert(("Incident",), rows)                               # masks secrets and PII, keeps embeddings
+    ids = [r["id"] for r in rows]
+    tickets = [{"src": r["id"], "dst": f"jira:{k}", "method": "key", "confidence": 1.0}
+               for r, i in zip(rows, items) for k in i.get("jira_keys", [])]
+    w.link("RELATES_TO", tickets, dst="Source", replace_from=ids)   # missing targets are skipped
+    mentioned = link_mentions(w, rows)                          # Incident -> File/Symbol, unique names only
+    if rows:
+        w.state(cursor_key, max(r["source_updated_at"] for r in rows))
+    return {"team": team, "incidents": len(rows), "tickets": len(tickets), "mentions": mentioned, "since": since}
+```
+
+What the writer does for you:
+
+- `upsert` merges by `id`, adds the extra labels and sets `ingested_at`. It removes secrets from
+  `title`, `text` and `description` and stores a PII-masked copy in `text_masked` (`privacy.py`,
+  `KG_PII_MODE`). It keeps `embedding` and `embedding_hash`, so unchanged text is not embedded again.
+  It keeps an `acl` that `kg-permissions` has narrowed (`acl_synced_at`).
+- `link` merges edges between nodes of the anchor labels `Code`, `Source`, `Domain` and
+  `Requirement`. An edge whose end does not exist yet is skipped, not created; run the linking again
+  after the other source (Jira calls `link_references` for commits ingested before the tickets).
+  `replace_from` deletes the old edges of this type from these ids first, so removed links disappear.
+- Every edge carries `method` and `confidence` (`key` 1.0, `text` 0.6). Agents use them to rank.
+- `state` stores the cursor in a `SyncState` node in the graph. Keep a small overlap (Jira re-reads
+  the last minute) so items updated during the run are not missed.
+
+#### Make it searchable
+
+A new label is not found by `search_knowledge` until it is in three places:
+
+1. `_source_texts` in `pipeline/kg_pipeline/vectors.py`: add `OR n:Incident`, so `kg-embed --sources` embeds it.
+2. The `source_text` full-text index in `SCHEMA` (`graph/neo4j_writer.py`): add `Incident` to the label
+   list. The index is created with `IF NOT EXISTS`, so an existing database keeps the old definition:
+   drop it once (`DROP INDEX source_text`) and run any writer to create it again.
+3. The label filter of `Knowledge` in `mcp/search.go`: add `OR node:Incident`, and document the new
+   `kind` value in the tool description.
+
+#### Run it
+
+1. CLI: add `kg-incidents = "kg_pipeline.sources.incidents:main"` to `[project.scripts]` in
+   `pyproject.toml`, with a `main()` like `jira.main` (argparse, `Neo4jWriter` from `NEO4J_*`, print
+   the stats as JSON).
+2. Dagster: in `definitions.py` add an asset in `group_name="sources"` that opens `_writer()` (it
+   applies approved corrections after the writes), add it to `deps` of `source_vectors` and to the
+   `SOURCES` list, so `sources_every_15_min` runs it. Read the settings from environment variables.
+3. Helm: add the values under `sources.<name>` and the secret keys to `sources.credentials`, then
+   document them in the [runbook](RUNBOOK.md#3-configure-sources) table.
+
+#### Keep it correct
+
+- **Deletes and moves.** An incremental sync never sees deleted items. Add a reconcile function in
+  `reconcile.py` that lists the current keys, looks up each missing one, and deletes only those it
+  confirmed are gone. Use `_guard` so a partial listing cannot remove more than half of a source, and
+  never delete what you did not look up. Add it to the `daily_reconcile` assets.
+- **Permissions.** If the system has finer permissions than your coarse `acl`, add a sync to
+  `sources/permissions.py` that writes the precise `acl` and stamps `acl_synced_at`. Map the
+  identity-provider groups to your ACL groups in `acl-mapping.yaml`.
+- **People.** To show owners and experts, return `author` or identity fields as Jira does
+  (`jira_identity`) and add the asset to the `people` dependencies.
+
+#### Test it
+
+Add a fixture of the API responses and a test in `pipeline/tests/` that runs `sync` against a fake
+writer or the Neo4j integration fixture. Check the rows (id, acl, text), the edges, a second run with
+the cursor, and that a run with an empty response writes nothing. Run `pytest -q`; the Neo4j tests run
+when `NEO4J_PASSWORD` is set.
 
 ### 6.2 Add an MCP tool
 
