@@ -210,7 +210,8 @@ schedules; history starts at that commit.
 
 **Caution:** SCIP indexers build the project. A Maven or Gradle project whose parent POM or
 dependencies cannot be resolved (private repository not reachable) falls back to Tree-sitter name
-matching, with lower-confidence `CALLS` edges and no edges for ambiguous names. Run the indexer where
+matching, with lower-confidence `CALLS` edges. Ambiguous names get no edge: `impact_analysis` lists them as
+`possible_callers` instead. Run the indexer where
 the build works, for example in CI, and pass the index with `--scip index.scip`.
 
 ### 3.1 Code
@@ -500,8 +501,8 @@ For a cluster, register the HTTP endpoint: `claude mcp add kg --transport http h
 |---|---|---|
 | `search_graph` | find code for a question | "where are users invited in bulk?" |
 | `find_symbol` | look up a name | `{"name": "Invit*", "kind": "Class"}` |
-| `get_symbol_code` | read one symbol | `{"symbol": "ScenariosView.onSave"}` |
-| `impact_analysis` | see what a change breaks | `{"symbol": "create_invitation", "depth": 3}` |
+| `get_symbol_code` | read one symbol; a class includes its fields, constants and methods | `{"symbol": "ScenariosView.onSave"}` |
+| `impact_analysis` | see what a change breaks, plus `possible_callers` matched by name only | `{"symbol": "create_invitation", "depth": 3}` |
 | `find_related_tests` | know which tests to run | `{"symbol": "scenarioToRun"}` |
 | `get_neighbors` | walk typed edges | `{"node_id": "...", "edge_types": ["CALLS"], "direction": "in"}` |
 | `trace_requirement` | check a requirement | `{"requirement": "FR-P10-03-10"}` |
