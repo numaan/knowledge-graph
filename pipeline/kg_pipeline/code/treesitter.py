@@ -240,11 +240,24 @@ def parse(text: str, lang: str) -> FileSyntax:
     return FileSyntax(symbols, imports, tree.root_node.has_error, top_calls)
 
 
+def _runs(numbers: list[int]) -> list[list[int]]:
+    """Consecutive runs of sorted line numbers: [1, 2, 5, 6] -> [[1, 2], [5, 6]]."""
+    runs: list[list[int]] = []
+    for n in numbers:
+        if runs and n == runs[-1][-1] + 1:
+            runs[-1].append(n)
+        else:
+            runs.append([n])
+    return runs
+
+
 def chunks(text: str, syntax: FileSyntax) -> list[tuple[str | None, int, int]]:
     """(owner qualname or None for file level, start_line, end_line) for AST-aligned chunks.
 
     One chunk per function or method, split when longer than CHUNK_LINES. Classes without
-    methods get their own chunks. File-level code outside every symbol (module constants,
+    methods get their own chunks. A class, enum or interface with methods also gets member chunks
+    for its own lines outside its nested symbols (header, enum constants, fields), so its
+    declaration is searchable and readable. File-level code outside every symbol (module constants,
     `export const store = create(...)`, scripts) gets file chunks, so no code is left out.
     """
     out: list[tuple[str | None, int, int]] = []
@@ -256,6 +269,16 @@ def chunks(text: str, syntax: FileSyntax) -> list[tuple[str | None, int, int]]:
         for start in range(sym.start_line, sym.end_line + 1, CHUNK_LINES):
             out.append((sym.qualname, start, min(start + CHUNK_LINES - 1, sym.end_line)))
     lines = text.split("\n")
+    for owner in syntax.symbols:
+        if owner.kind in {"Function", "Method"} or owner.qualname not in owners_with_methods:
+            continue
+        nested = [s for s in syntax.symbols if s.parent == owner.qualname]
+        own = [n for n in range(owner.start_line, owner.end_line + 1)
+               if not any(s.start_line <= n <= s.end_line for s in nested)]
+        for run in _runs(own):
+            if any(lines[i - 1].strip() and not FILLER.match(lines[i - 1]) for i in run if i <= len(lines)):
+                for start in range(run[0], run[-1] + 1, CHUNK_LINES):
+                    out.append((owner.qualname, start, min(start + CHUNK_LINES - 1, run[-1])))
     covered = [False] * (len(lines) + 2)
     for sym in syntax.symbols:
         for n in range(sym.start_line, sym.end_line + 1):

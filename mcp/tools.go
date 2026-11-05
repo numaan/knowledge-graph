@@ -33,6 +33,45 @@ func clamp(v, lo, hi, def int) int {
 	return max(lo, min(hi, v))
 }
 
+// symbolCodeChars caps get_symbol_code; a longer symbol is cut with a marker.
+const symbolCodeChars = 30000
+
+// joinChunks concatenates chunks sorted by start_line (longest first on ties). A chunk inside one
+// already taken (a nested type inside a class without methods) is skipped, and the lines of a
+// partly overlapping chunk that were already taken are dropped, so no line appears twice.
+func joinChunks(chunks []any) string {
+	var b strings.Builder
+	last := 0
+	for _, x := range chunks {
+		c, _ := x.(map[string]any)
+		start, end := toInt(c["start_line"]), toInt(c["end_line"])
+		text, _ := c["text"].(string)
+		if c == nil || end <= last {
+			continue
+		}
+		if start <= last {
+			lines := strings.Split(text, "\n")
+			text = strings.Join(lines[min(last-start+1, len(lines)):], "\n")
+		}
+		b.WriteString(text)
+		b.WriteString("\n")
+		last = end
+	}
+	return b.String()
+}
+
+func toInt(v any) int {
+	switch n := v.(type) {
+	case int64:
+		return int(n)
+	case int:
+		return n
+	case float64:
+		return int(n)
+	}
+	return 0
+}
+
 func one(rows []map[string]any) map[string]any {
 	if len(rows) == 0 {
 		return nil
@@ -194,16 +233,22 @@ func (s *Server) register(m *mcp.Server) {
 			if err != nil {
 				return nil, Doc{}, err
 			}
+			// A class's code is spread over its own member chunks (header, fields, enum constants) and
+			// the chunks of its methods and nested types: collect them all, in line order.
 			row := one(must(s.graph.Read(ctx, `MATCH (n:Code {id: $id})
-				OPTIONAL MATCH (c:Chunk)-[:PART_OF]->(n) WITH n, c ORDER BY c.start_line
+				OPTIONAL MATCH (n)-[:CONTAINS*0..4]->(m)<-[:PART_OF]-(c:Chunk) WHERE m = n OR m:Symbol
+				WITH n, c ORDER BY c.start_line, c.end_line DESC
+				WITH n, collect(DISTINCT c {.start_line, .end_line, .text}) AS chunks
 				RETURN n.id AS id, n.qualname AS qualname, n.kind AS kind, n.path AS path, n.start_line AS start_line,
 				       n.end_line AS end_line, n.signature AS signature, n.annotations AS annotations, n.role AS role,
-				       n.stale AS stale, n.stale_reason AS stale_reason,
-				       left(reduce(code = '', t IN collect(c.text) | code + t + '\n'), 30000) AS code`,
+				       n.stale AS stale, n.stale_reason AS stale_reason, chunks`,
 				map[string]any{"id": id})))
 			if row == nil {
 				return nil, Doc{}, fmt.Errorf("symbol %s not found", id)
 			}
+			chunks, _ := row["chunks"].([]any)
+			delete(row, "chunks")
+			row["code"] = cutString(joinChunks(chunks), symbolCodeChars)
 			dropEmptyStale([]map[string]any{row})
 			return nil, Doc{Data: row}, nil
 		})
@@ -211,17 +256,25 @@ func (s *Server) register(m *mcp.Server) {
 	addTool(m, &mcp.Tool{Name: "impact_analysis", Description: "What can break if a symbol changes: every caller, " +
 		"subtype and user up to N hops (also HTTP callers in other repositories, HTTP tests and consumers of topics it " +
 		"publishes to), split into production code and tests, plus affected HTTP endpoints, " +
-		"linked requirements and domain concepts. Use before you edit shared code."},
+		"linked requirements and domain concepts. For a method that implements an interface method, callers of the " +
+		"interface method count too. possible_callers lists call sites matched by name only (several candidates, " +
+		"no edge): check them by reading the code. Use before you edit shared code."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in ImpactIn) (*mcp.CallToolResult, Doc, error) {
 			id, err := s.resolve(ctx, in.Symbol, s.repo(in.Repo))
 			if err != nil {
 				return nil, Doc{}, err
 			}
 			depth := clamp(in.Depth, 1, 4, 3)
+			// Callers of a method this symbol overrides (an interface method) reach it through dynamic
+			// dispatch, so they count too; other overrides of that method and their callers do not.
 			affected, err := s.graph.Read(ctx, fmt.Sprintf(`
-				MATCH (t:Code {id: $id})
+				MATCH (t0:Code {id: $id})
+				OPTIONAL MATCH (t0)-[:OVERRIDES*1..2]->(base)
+				WITH t0, [t0] + collect(DISTINCT base) AS targets
+				UNWIND targets AS t
 				MATCH p = (a:Symbol|File)-[:%s*1..%d]->(t)
-				WHERE $repos IS NULL OR a.repo IN $repos
+				WHERE ($repos IS NULL OR a.repo IN $repos) AND a <> t0
+				  AND (t = t0 OR type(last(relationships(p))) <> 'OVERRIDES')
 				WITH a, min(length(p)) AS distance
 				RETURN a.id AS id, coalesce(a.qualname, a.path) AS qualname, a.kind AS kind, a.path AS path, a.repo AS repo,
 				       CASE WHEN a.endpoint_route IS NOT NULL THEN 'endpoint' ELSE a.role END AS role,
@@ -255,11 +308,20 @@ func (s *Server) register(m *mcp.Server) {
 			concepts := must(s.graph.Read(ctx, `MATCH (x)-[:REALISES]->(c:DomainConcept) WHERE x.id IN $ids
 				RETURN c.name AS concept, c.kind AS kind, count(DISTINCT x) AS symbols ORDER BY symbols DESC LIMIT 20`,
 				map[string]any{"ids": ids}))
+			// Call sites whose name matched several symbols got no edge (name matching without SCIP).
+			// List them separately as low-confidence candidates instead of guessing an edge.
+			possible := must(s.graph.Read(ctx, `MATCH (t:Symbol {id: $id})
+				MATCH (a:Code) WHERE a.repo = t.repo AND a:Symbol AND t.name IN a.ambiguous_calls AND a <> t
+				  AND ($repos IS NULL OR a.repo IN $repos)
+				RETURN a.id AS id, a.qualname AS qualname, a.path AS path, a.path =~ $testPath AS is_test,
+				       'name match, several candidates' AS evidence
+				ORDER BY a.path LIMIT 50`, map[string]any{"id": id, "testPath": testPathRegex}))
 			return nil, Doc{Data: map[string]any{
 				"symbol": id, "depth": depth, "affected_code": code, "affected_tests": tests,
 				"affected_endpoints": endpoints, "requirements": reqs, "concepts": concepts,
-				"summary": fmt.Sprintf("%d code symbols, %d tests, %d endpoints, %d requirements within %d hops",
-					len(code), len(tests), len(endpoints), len(reqs), depth),
+				"possible_callers": possible,
+				"summary": fmt.Sprintf("%d code symbols, %d tests, %d endpoints, %d requirements within %d hops; "+
+					"%d possible callers by name only", len(code), len(tests), len(endpoints), len(reqs), depth, len(possible)),
 			}}, nil
 		})
 

@@ -3,7 +3,10 @@
 Order of trust: SCIP (method=scip, confidence 1.0) > Tree-sitter name match in the same file
 (0.8) > in an imported file or the same Go package (0.7) > unique in the repo (0.4).
 Measured against SCIP on a 420-file TypeScript/Python repo: 100% / 99% / 44% correct per tier.
-Ambiguous names produce no edge; they are counted instead.
+An ambiguous name whose candidates are one interface or base method and its overrides links to the
+base method (0.5); methods of a class get OVERRIDES edges to the same-named methods of its resolved
+supertypes (0.7). Other ambiguous names produce no edge: they are counted and kept on the caller as
+`ambiguous_calls`, so impact_analysis can list possible callers without inventing edges.
 """
 from __future__ import annotations
 
@@ -22,6 +25,7 @@ TYPES = {"Class", "Interface", "Enum"}
 FAMILY = {"java": "jvm", "kotlin": "jvm", "typescript": "js", "tsx": "js", "javascript": "js"}
 JS_EXTS = ("", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", "/index.ts", "/index.tsx", "/index.js")
 # Too generic to resolve by repo-wide uniqueness; usually library or builtin calls.
+MAX_AMBIGUOUS = 50  # unresolved call names kept per caller
 COMMON = set("""get set map filter push pop append add remove delete update keys values items join split
 format toString equals hashCode length size then catch finally log print println printf apply call bind
 error info debug warn next close open read write run start stop init reduce forEach find some every
@@ -62,8 +66,10 @@ class Resolver:
                     break
         self.by_name: dict[tuple[str, str], list[tuple[str, Symbol]]] = defaultdict(list)
         self.spans: dict[str, list[tuple[int, int, str, str]]] = defaultdict(list)
+        self.by_qualname: dict[tuple[str, str], Symbol] = {}
         for path, s in syntax.items():
             for sym in s.symbols:
+                self.by_qualname[(path, sym.qualname)] = sym
                 self.by_name[(_family(self.lang[path]), sym.name)].append((path, sym))
                 self.spans[path].append((sym.start_line, sym.end_line, self.sym_id(path, sym), sym.kind))
         self.imported: dict[str, set[str]] = defaultdict(set)
@@ -186,8 +192,52 @@ class Resolver:
             return self.sym_id(*near[0]), 0.7
         if len(cands) == 1 and (allow_common or name not in COMMON):
             return self.sym_id(*cands[0]), 0.4
+        base = self._family_base(cands)
+        if base is not None and (allow_common or name not in COMMON):
+            self.g.counters["names_to_base"] += 1
+            return self.sym_id(*base), 0.5
         self.g.counters["names_ambiguous"] += 1
         return None
+
+    def _owner(self, path: str, sym: Symbol) -> Symbol | None:
+        return self.by_qualname.get((path, sym.parent)) if sym.parent else None
+
+    def _family_base(self, cands: list[tuple[str, Symbol]]) -> tuple[str, Symbol] | None:
+        """The one candidate whose owner type is a direct supertype of every other candidate's owner.
+
+        A call through an interface (`service.search(...)` with `service` typed as the interface) names
+        the interface method and every implementation. The interface method is the declared target;
+        the implementations are reached from it through OVERRIDES.
+        """
+        owners = [(c, self._owner(*c)) for c in cands]
+        if any(o is None for _, o in owners):
+            return None
+        bases = [c for c, o in owners
+                 if all(o.name in (other.supertypes or ()) for c2, other in owners if c2 is not c)]
+        return bases[0] if len(bases) == 1 else None
+
+    def _note_ambiguous(self, src: str, name: str) -> None:
+        """Keep the unresolved call name on the caller, so impact_analysis can list possible callers."""
+        name = name.lstrip(".")
+        if name in COMMON:
+            return
+        props = self.g.nodes[src].props
+        names = props.setdefault("ambiguous_calls", [])
+        if name not in names and len(names) < MAX_AMBIGUOUS:
+            names.append(name)
+
+    def _overrides(self, path: str, sym: Symbol, base_id: str) -> None:
+        """Method -[OVERRIDES]-> the method of the same name in a resolved supertype (tree-sitter mode)."""
+        base_path = self.g.nodes[base_id].props.get("path")
+        base_q = base_id.rsplit("#", 1)[-1]
+        if base_path not in self.syntax:
+            return
+        base_methods = {m.name: m for m in self.syntax[base_path].symbols
+                        if m.parent == base_q and m.kind in CALLABLE}
+        for m in self.syntax[path].symbols:
+            if m.parent == sym.qualname and m.kind in CALLABLE and m.name in base_methods:
+                self.g.add_edge("OVERRIDES", self.sym_id(path, m), self.sym_id(base_path, base_methods[m.name]),
+                                "treesitter", 0.7)
 
     def link_names(self, skip_paths: set[str]) -> None:
         for path, s in self.syntax.items():
@@ -196,16 +246,20 @@ class Resolver:
             for sym in s.symbols:
                 src = self.sym_id(path, sym)
                 for callee in dict.fromkeys(sym.calls):
+                    before = self.g.counters["names_ambiguous"]
                     hit = self._pick(callee, path, CALLABLE | TYPES, allow_common=False)
                     if hit and hit[0] != src:
                         kind = self.g.nodes[hit[0]].labels[-1]
                         self.g.add_edge("CALLS" if kind in CALLABLE else "USES_TYPE", src, hit[0],
                                         "treesitter", hit[1])
+                    elif hit is None and self.g.counters["names_ambiguous"] > before:
+                        self._note_ambiguous(src, callee)
                 for sup in dict.fromkeys(sym.supertypes):
                     hit = self._pick(sup, path, TYPES, allow_common=True)
                     if hit and hit[0] != src:
                         etype = "IMPLEMENTS" if self.g.nodes[hit[0]].labels[-1] == "Interface" else "EXTENDS"
                         self.g.add_edge(etype, src, hit[0], "treesitter", hit[1])
+                        self._overrides(path, sym, hit[0])
 
     # ---- ODM -----------------------------------------------------------------------------------
     def link_bom(self, bom_to_xom: dict[str, str]) -> None:

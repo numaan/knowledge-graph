@@ -202,3 +202,97 @@ def test_delta_write_touches_only_changes(tmp_path):
     assert 0 < changed["nodes_written"] <= 4                                 # b.py, b(), its chunk, repo
     assert removed["stale_nodes_deleted"] >= 3 and left == removed["nodes"]
     assert kept == [1.0]                                                     # untouched node keeps its embedding
+
+
+# ---- member chunks and ambiguous names -------------------------------------------------------------
+
+DISPATCH = {
+    "bl/BlackListService.java": """
+        package bl;
+        public interface BlackListService {
+            Result searchBlacklistByData(Request r);
+        }
+    """,
+    "bl/VisionService.java": """
+        package bl;
+        public class VisionService implements BlackListService {
+            public Result searchBlacklistByData(Request r) { return null; }
+        }
+    """,
+    "bl/BlmsService.java": """
+        package bl;
+        public class BlmsService implements BlackListService {
+            public Result searchBlacklistByData(Request r) { return null; }
+        }
+    """,
+    "bl/Controller.java": """
+        package bl;
+        public class Controller {
+            private BlackListService service;
+            private Object audit;
+            public Result search(Request r) {
+                audit.record(r);
+                return service.searchBlacklistByData(r);
+            }
+        }
+    """,
+    "bl/AuditA.java": """
+        package bl;
+        public class AuditA { void record(Object o) {} }
+    """,
+    "bl/AuditB.java": """
+        package bl;
+        public class AuditB { void record(Object o) {} }
+    """,
+    "bl/Rule.java": """
+        package bl;
+        public enum Rule {
+            NAME_MATCH(1, "Name match"),
+            PASSPORT(2, "Passport");
+
+            private final int id;
+
+            Rule(int id, String label) { this.id = id; }
+
+            public int getId() {
+                return id;
+            }
+        }
+    """,
+}
+
+
+@pytest.fixture(scope="module")
+def dispatch(tmp_path_factory):
+    repo = tmp_path_factory.mktemp("dispatch")
+    for rel, body in DISPATCH.items():
+        path = repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(textwrap.dedent(body).lstrip(), encoding="utf-8")
+    return build_graph(repo, "bl", scip_mode="off")
+
+
+def test_enum_constants_and_fields_are_chunked(dispatch):
+    owned = [n.props["text"] for n in dispatch.nodes.values() if n.labels[-1] == "Chunk"
+             and any(e.type == "PART_OF" and e.src == n.id and e.dst.endswith("Rule.java#Rule")
+                     for e in dispatch.edges.values())]
+    assert owned, "the enum has methods, but its own lines got no chunk"
+    text = "\n".join(owned)
+    assert "NAME_MATCH" in text and "PASSPORT" in text and "private final int id" in text
+    assert "return id" not in text  # method bodies stay in the method chunks
+
+
+def test_call_through_interface_links_the_interface_method(dispatch):
+    call = edge(dispatch, "CALLS", "Controller.java#Controller.search",
+                "BlackListService.java#BlackListService.searchBlacklistByData")
+    assert call and call.props["confidence"] == 0.5
+    for impl in ("VisionService", "BlmsService"):
+        assert edge(dispatch, "OVERRIDES", f"{impl}.java#{impl}.searchBlacklistByData",
+                    "BlackListService.java#BlackListService.searchBlacklistByData")
+
+
+def test_ambiguous_call_is_kept_on_the_caller(dispatch):
+    caller = dispatch.nodes["bl:bl/Controller.java#Controller.search"]
+    assert "record" in caller.props.get("ambiguous_calls", [])
+    assert "searchBlacklistByData" not in caller.props.get("ambiguous_calls", [])
+    assert not any(e.type == "CALLS" and e.src == caller.id and "#Audit" in e.dst for e in dispatch.edges.values())
