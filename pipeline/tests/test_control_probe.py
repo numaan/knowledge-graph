@@ -40,6 +40,14 @@ def env(monkeypatch):
     monkeypatch.setenv("KG_SECRET_KEY", Fernet.generate_key().decode())
 
 
+class FakeDagster:
+    def add_partition(self, key):
+        pass
+
+    def remove_partition(self, key):
+        pass
+
+
 @pytest.fixture
 def engine(env):
     return create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool, future=True)
@@ -48,6 +56,7 @@ def engine(env):
 @pytest.fixture
 def app(engine):
     a = create_app(auth=Authenticator(), engine=engine)
+    a.state.dagster = FakeDagster()
     a.state.prober = probe.Prober(resolver=lambda host: [PUBLIC], fetch=Fake())
     return a
 

@@ -19,7 +19,7 @@ from pathlib import Path
 
 import dagster as dg
 
-from . import corrections, freshness, summaries
+from . import corrections, freshness, sources_registry, summaries
 from .code import links
 from .code.ingest import build_graph
 from .domain.extract import extract
@@ -37,7 +37,35 @@ ARCHIVE = Path(os.environ.get("SOURCE_ARCHIVE_PATH", "/archive"))
 JIRA_PROJECTS = [p.strip() for p in os.environ.get("JIRA_PROJECTS", "").split(",") if p.strip()]
 CONFLUENCE_SPACES = [s.strip() for s in os.environ.get("CONFLUENCE_SPACES", "").split(",") if s.strip()]
 
-repo_partitions = dg.StaticPartitionsDefinition(sorted(REPOS) or ["no-repositories-configured"])
+# Repositories are dynamic partitions: the control API adds a key when a git source is created and removes it on
+# delete; `sync_partitions` (sensor below) registers the env and seeded repositories. The name is fixed by the control
+# API (control/dagster_client.py PARTITIONS_DEF and GIT_JOB); it is repeated here so that this module does not import
+# the control package (fastapi extra) at import time.
+repo_partitions = dg.DynamicPartitionsDefinition(name="repos")
+GIT_JOB = "git_job"
+MODE_TAG = "kg/mode"
+
+
+def _full(context: dg.AssetExecutionContext) -> bool:
+    """True when the run was started with mode full (tag kg/mode, set by the control API)."""
+    return context.run_tags.get(MODE_TAG) == "full"
+
+
+def _repo(name: str) -> tuple[str, str, str | None]:
+    """URL, branch and token of the git source with this name, read from the registry at run time."""
+    for src in sources_registry.get_sources("git"):
+        if src.name == name:
+            branch = src.config.get("branch") or os.environ.get("GIT_BRANCH", "main")
+            token = sources_registry.get_secret(src).get("token") or os.environ.get("GIT_TOKEN") or None
+            return src.config["url"], branch, token
+    raise dg.Failure("Set GIT_REPOSITORIES (sources.git.repositories in the Helm values).")
+
+
+class _RegistryRepos:
+    """Mapping name -> URL over the registry, for assets that still take a dict (service_catalog)."""
+
+    def __getitem__(self, name: str) -> str:
+        return _repo(name)[0]
 
 
 @contextmanager
@@ -53,12 +81,14 @@ def _writer():
 def code_snapshot(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Code layer of one repository (files, symbols, imports, calls, chunks, ODM). Writes only changes."""
     name = context.partition_key
-    if name not in REPOS:
-        raise dg.Failure("Set GIT_REPOSITORIES (sources.git.repositories in the Helm values).")
-    mirror_path = git.mirror(REPOS[name], ARCHIVE)
-    sha = git.head(mirror_path, BRANCH)
+    url, branch, token = _repo(name)
+    mirror_path = git.mirror(url, ARCHIVE, token=token)
+    sha = git.head(mirror_path, branch)
+    # Mode full: no SCIP cache, so every folder is indexed again. write_delta compares content hashes and still
+    # writes only the differences.
+    scip_cache = None if _full(context) else ARCHIVE / "cache" / "scip"
     with git.checkout(mirror_path, sha) as work:
-        graph = build_graph(work, name, scip_mode="auto", scip_cache=ARCHIVE / "cache" / "scip")
+        graph = build_graph(work, name, scip_mode="auto", scip_cache=scip_cache)
     with _writer() as writer:
         result = writer.write_delta(graph)
         context.log.info("links: %s", links.sync(writer, links.load_config(None)))  # HTTP calls and topics across repos
@@ -80,8 +110,9 @@ def code_snapshot(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
 def git_history(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Commits since the last run, the files and symbols they changed, and the tickets they name."""
     name = context.partition_key
+    url, _, token = _repo(name)
     with _writer() as w:
-        stats = history.sync(w, git.mirror(REPOS[name], ARCHIVE), name)
+        stats = history.sync(w, git.mirror(url, ARCHIVE, token=token), name, full=_full(context))
     return dg.MaterializeResult(metadata={k: v for k, v in stats.items() if isinstance(v, int)})
 
 
@@ -89,6 +120,7 @@ def git_history(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
 @traced_asset
 def domain_model(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Roles (entity, endpoint, ...) plus LLM-extracted concepts, business rules and capabilities."""
+    _repo(context.partition_key)  # unknown partition: same failure as code_snapshot
     llm = None if os.environ.get("DOMAIN_LLM") == "off" else LLM()
     with _writer() as w:
         stats = extract(w, context.partition_key, llm, ARCHIVE / "cache" / "llm")
@@ -100,6 +132,7 @@ def domain_model(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
 @traced_asset
 def vector_index(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Embeddings for changed code chunks and domain concepts (Neo4j vector indexes)."""
+    _repo(context.partition_key)
     with _writer() as w:
         stats = embed_repo(w, context.partition_key, Embedder())
     return dg.MaterializeResult(metadata={"chunks": dg.MetadataValue.json(stats["chunks"]),
@@ -109,6 +142,7 @@ def vector_index(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
 @dg.asset(name="summaries", partitions_def=repo_partitions, deps=[domain_model], kinds={"neo4j"}, group_name="knowledge")
 def summaries_asset(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """File, module, repository and domain summaries; only changed inputs are summarised, within SUMMARY_BUDGET."""
+    _repo(context.partition_key)
     llm = None if os.environ.get("SUMMARY_LLM") == "off" else LLM()
     with _writer() as w:
         stats = summaries.summarize(w, context.partition_key, llm, Embedder(), cache=ARCHIVE / "cache" / "llm")
@@ -159,7 +193,7 @@ def doc_freshness(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     return dg.MaterializeResult(metadata={k: v for k, v in stats.items() if isinstance(v, int)})
 
 
-service_catalog = service_catalog_asset(repo_partitions, code_snapshot, REPOS, BRANCH, ARCHIVE)
+service_catalog = service_catalog_asset(repo_partitions, code_snapshot, _RegistryRepos(), BRANCH, ARCHIVE)
 people = people_asset([git_history, jira_issues, confluence_pages, github_prs, service_catalog])
 
 
@@ -191,6 +225,33 @@ def hourly_code(context: dg.ScheduleEvaluationContext):
 sources_every_15_min = dg.ScheduleDefinition(name="sources_every_15_min", target=SOURCES, cron_schedule="*/15 * * * *",
                                              default_status=dg.DefaultScheduleStatus.STOPPED)
 
+git_job = dg.define_asset_job(
+    GIT_JOB, selection=[code_snapshot, git_history, domain_model, vector_index, summaries_asset])
+
+
+def sync_partitions(instance: dg.DagsterInstance) -> list[str]:
+    """Seed the env sources into the registry (database mode) and add a partition for every git source.
+
+    Returns the keys added. Idempotent. This is a function that a sensor calls, not module code: the
+    registry reads the database, and the module must import without a database (tests, `dagster dev` without
+    DATABASE_URL). A sensor is the Dagster hook that runs in the user-code process after start and needs no run.
+    """
+    if os.environ.get("DATABASE_URL", "").strip():
+        sources_registry.seed_from_env()
+    have = set(instance.get_dynamic_partitions(repo_partitions.name))
+    added = sorted({s.name for s in sources_registry.get_sources("git")} - have)
+    if added:
+        instance.add_dynamic_partitions(repo_partitions.name, added)
+    return added
+
+
+@dg.sensor(name="registry_partitions", minimum_interval_seconds=30, default_status=dg.DefaultSensorStatus.RUNNING)
+def registry_partitions(context: dg.SensorEvaluationContext):
+    added = sync_partitions(context.instance)
+    return dg.SkipReason(f"partitions added: {', '.join(added)}" if added else "partitions are up to date")
+
+
 from .trust_assets import TRUST, daily_reconcile  # noqa: E402  data trust: deletes, moves, duplicates
 
-defs = dg.Definitions(assets=CODE + SOURCES + TRUST, schedules=[hourly_code, sources_every_15_min, daily_reconcile])
+defs = dg.Definitions(assets=CODE + SOURCES + TRUST, schedules=[hourly_code, sources_every_15_min, daily_reconcile],
+                      jobs=[git_job], sensors=[registry_partitions])

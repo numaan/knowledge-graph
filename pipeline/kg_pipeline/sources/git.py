@@ -13,9 +13,9 @@ def repo_name(url: str) -> str:
     return Path(url.rstrip("/")).name.removesuffix(".git")
 
 
-def _git(*args: str, cwd: Path | None = None) -> str:
+def _git(*args: str, cwd: Path | None = None, token: str | None = None) -> str:
     cmd = ["git"]
-    token = os.environ.get("GIT_TOKEN")
+    token = token or os.environ.get("GIT_TOKEN")
     if token:
         # Pass the token per command; it is never stored in a URL or in the mirror's config.
         auth = base64.b64encode(f"x-access-token:{token}".encode()).decode()
@@ -23,14 +23,16 @@ def _git(*args: str, cwd: Path | None = None) -> str:
     return subprocess.run([*cmd, *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
 
 
-def mirror(url: str, archive: Path) -> Path:
-    """Create or update a bare mirror at <archive>/git/<name>.git and return its path."""
+def mirror(url: str, archive: Path, token: str | None = None) -> Path:
+    """Create or update a bare mirror at <archive>/git/<name>.git and return its path.
+
+    token: the credential of the source; without it GIT_TOKEN from the environment applies."""
     path = archive / "git" / f"{repo_name(url)}.git"
     if path.exists():
-        _git("fetch", "--prune", "--tags", cwd=path)
+        _git("fetch", "--prune", "--tags", cwd=path, token=token)
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
-        _git("clone", "--mirror", url, str(path))
+        _git("clone", "--mirror", url, str(path), token=token)
     return path
 
 

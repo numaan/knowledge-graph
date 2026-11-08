@@ -139,6 +139,13 @@ class FakeDagster:
         self.logs = []
         self.status_error = None
         self.logs_error = None
+        self.partitions = set()
+
+    def add_partition(self, key):
+        self.partitions.add(key)
+
+    def remove_partition(self, key):
+        self.partitions.discard(key)
 
     def get_status(self, run_id):
         if self.status_error:

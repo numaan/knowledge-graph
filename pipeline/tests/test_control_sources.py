@@ -34,9 +34,31 @@ def engine(env):
     return eng
 
 
+class FakeDagster:
+    def __init__(self, add_error=None, remove_error=None):
+        self.partitions, self.add_error, self.remove_error = set(), add_error, remove_error
+
+    def add_partition(self, key):
+        if self.add_error:
+            raise self.add_error
+        self.partitions.add(key)
+
+    def remove_partition(self, key):
+        if self.remove_error:
+            raise self.remove_error
+        self.partitions.discard(key)
+
+
 @pytest.fixture
-def client(engine):
-    return TestClient(create_app(auth=Authenticator(), engine=engine))
+def dagster():
+    return FakeDagster()
+
+
+@pytest.fixture
+def client(engine, dagster):
+    app = create_app(auth=Authenticator(), engine=engine)
+    app.state.dagster = dagster
+    return TestClient(app)
 
 
 BODIES = {
@@ -143,3 +165,50 @@ def test_requires_admin_before_db(engine, monkeypatch):
     monkeypatch.setenv("KG_OIDC_ISSUER", "https://sso.example.com/realms/kg")
     c = TestClient(create_app(auth=Authenticator.from_env(key_resolver=lambda t: None), engine=engine))
     assert c.get("/api/v1/sources").status_code == 401
+
+
+# ---- dynamic partitions of the git assets ----
+def audit_rows(engine, action):
+    with engine.connect() as conn:
+        return [r.detail for r in conn.execute(select(db.audit).where(db.audit.c.action == action))]
+
+
+def test_git_create_adds_partition_and_other_kinds_do_not(client, dagster):
+    assert client.post("/api/v1/sources", json=BODIES["git"]).status_code == 201
+    assert dagster.partitions == {"repo-a"}
+    client.post("/api/v1/sources", json=BODIES["jira"])
+    assert dagster.partitions == {"repo-a"}
+
+
+def test_git_create_rolls_back_when_dagster_fails(client, dagster, engine):
+    from kg_pipeline.control import dagster_client as dc
+    dagster.add_error = dc.DagsterUnavailable("dagster is unreachable")
+    r = client.post("/api/v1/sources", json=BODIES["git"])
+    assert r.status_code == 502 and SECRET_VALUE not in r.text
+    assert client.get("/api/v1/sources").json()["items"] == []
+    assert audit_rows(engine, "source.create") == []
+    dagster.add_error = None
+    assert client.post("/api/v1/sources", json=BODIES["git"]).status_code == 201
+
+
+def test_git_delete_removes_partition(client, dagster, engine):
+    sid = client.post("/api/v1/sources", json=BODIES["git"]).json()["id"]
+    assert client.delete(f"/api/v1/sources/{sid}").status_code == 204
+    assert dagster.partitions == set()
+    assert audit_rows(engine, "source.delete")[0]["partition_removed"] is True
+
+
+def test_git_delete_survives_dagster_failure(client, dagster, engine):
+    from kg_pipeline.control import dagster_client as dc
+    sid = client.post("/api/v1/sources", json=BODIES["git"]).json()["id"]
+    dagster.remove_error = dc.DagsterError("dagster call failed: PythonError")
+    assert client.delete(f"/api/v1/sources/{sid}").status_code == 204
+    assert client.get(f"/api/v1/sources/{sid}").status_code == 404
+    assert audit_rows(engine, "source.delete")[0]["partition_removed"] is False
+
+
+def test_non_git_delete_does_not_touch_dagster(client, dagster, engine):
+    sid = client.post("/api/v1/sources", json=BODIES["jira"]).json()["id"]
+    dagster.remove_error = RuntimeError("must not be called")
+    assert client.delete(f"/api/v1/sources/{sid}").status_code == 204
+    assert "partition_removed" not in audit_rows(engine, "source.delete")[0]

@@ -68,6 +68,13 @@ class FakeDagster:
         self.status = "STARTED"
         self.logs = []
         self.launch_error = None
+        self.partitions = set()
+
+    def add_partition(self, key):
+        self.partitions.add(key)
+
+    def remove_partition(self, key):
+        self.partitions.discard(key)
 
     def get_status(self, run_id):
         return self.status
