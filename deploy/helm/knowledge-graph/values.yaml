@@ -228,6 +228,45 @@ web:
     limits: { memory: 512Mi }
 
 # ---------------------------------------------------------------------------
+# Control API for the admin UI (docs/streams/admin.md): manages sources and starts Dagster runs.
+# Off by default. It runs from the kg-pipeline image (needs the "control" extra, see pipeline/Dockerfile)
+# and stores sources in the knowledge database of the chart PostgreSQL.
+# To use the admin UI also set web.enabled=true. The web pod then gets CONTROL_API_URL.
+# Dagster user code needs DATABASE_URL and KG_SECRET_KEY too: the dagster-user-deployments env below
+# reads them from the Secret <namePrefix>-control (optional, so env-only installs keep working).
+# ---------------------------------------------------------------------------
+control:
+  enabled: false
+  image: ""      # the kg-pipeline image, e.g. registry/kg-pipeline:0.1.0
+  replicas: 1
+  port: 8090
+  # KG_SECRET_KEY encrypts the secrets of sources (Fernet). Empty existingSecret: the chart generates a
+  # key on first install and keeps it across upgrades in the Secret <namePrefix>-control.
+  # WARNING: if the key is lost or changed, every stored source secret becomes unreadable.
+  # With existingSecret (key name below), also change the KG_SECRET_KEY entry of the Dagster
+  # user deployment env to read that Secret.
+  secretKey:
+    existingSecret: ""
+    key: KG_SECRET_KEY
+  # Token checks (the same Keycloak as the web app). Empty issuer = local mode without authentication:
+  # keep the Service internal in that case.
+  oidc:
+    issuer: ""           # e.g. https://keycloak.example.com/realms/kg
+    audience: ""         # aud claim the access token must carry (empty: not checked)
+    groupsClaim: groups
+    adminGroup: ""       # optional; sets KG_CONTROL_ADMIN_GROUP (the API requires kg-admins by default)
+  dagster:
+    host: ""             # default: <release>-dagster-webserver (Service of the Dagster chart)
+    port: ""             # default: dagster.dagsterWebserver.service.port, else 80
+    webserverUrl: ""     # public Dagster UI URL for links in runs (DAGSTER_WEBSERVER_URL); empty = no link
+  # Extra env, e.g. KG_CONTROL_ALLOW_HTTP: "1" (allow http:// source URLs) or KG_CONTROL_ALLOW_PRIVATE: "1"
+  # (allow connection tests to private addresses). Both are off by default (SSRF guard).
+  env: {}
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { memory: 512Mi }
+
+# ---------------------------------------------------------------------------
 # Tracing: OTLP/HTTP endpoint for the MCP server and the pipeline, e.g.
 # http://phoenix.observability.svc:6006 (Arize Phoenix) or
 # https://langfuse.example.com/api/public/otel (Langfuse; put
@@ -304,6 +343,15 @@ dagster:
         envSecrets:
           - name: kg-credentials
           - name: kg-source-credentials
+        # Source registry (control.enabled=true): the Secret kg-control exists only then, so both
+        # references are optional. includeConfigInLaunchedRuns copies them to the run pods.
+        env:
+          - name: DATABASE_URL
+            valueFrom:
+              secretKeyRef: { name: kg-control, key: DATABASE_URL, optional: true }
+          - name: KG_SECRET_KEY
+            valueFrom:
+              secretKeyRef: { name: kg-control, key: KG_SECRET_KEY, optional: true }
         volumes:
           - name: source-archive
             persistentVolumeClaim:

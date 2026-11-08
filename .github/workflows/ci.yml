@@ -108,6 +108,53 @@ jobs:
           helm template kg . --set backup.enabled=true --set backup.image=kg-pipeline:ci > /dev/null
           helm template kg . --set backup.enabled=true --set backup.image=kg-pipeline:ci \
             --set backup.target=s3 --set backup.s3.secretName=kg-backup-s3 > /dev/null
+      - name: control API is off by default
+        run: |
+          helm template kg . > "$RUNNER_TEMP/default.yaml"
+          if grep -q -e '^  name: kg-control' -e 'CONTROL_API_URL' -e '^  KG_SECRET_KEY: ' "$RUNNER_TEMP/default.yaml"; then
+            echo "default values must render no control resources and no CONTROL_API_URL"
+            grep -n -e '^  name: kg-control' -e 'CONTROL_API_URL' -e '^  KG_SECRET_KEY: ' "$RUNNER_TEMP/default.yaml"
+            exit 1
+          fi
+          helm template kg . --set web.enabled=true --set web.image=kg-web:ci > "$RUNNER_TEMP/web.yaml"
+          if grep -q 'CONTROL_API_URL' "$RUNNER_TEMP/web.yaml"; then
+            echo "web must not get CONTROL_API_URL when control.enabled=false"
+            exit 1
+          fi
+      - name: control API renders with its env
+        run: |
+          out="$RUNNER_TEMP/control.yaml"
+          helm template kg . --set control.enabled=true --set control.image=kg-pipeline:ci \
+            --set web.enabled=true --set web.image=kg-web:ci \
+            --set control.oidc.issuer=https://sso.example.com/realms/kg --set control.oidc.audience=kg-mcp > "$out"
+          expect() {
+            if ! grep -q -F -e "$1" "$out"; then
+              echo "missing in rendered control chart: $1"
+              exit 1
+            fi
+          }
+          expect 'kind: Deployment'
+          expect 'name: kg-control'
+          expect 'port: 8090'
+          expect 'containerPort: 8090'
+          expect 'path: /healthz'
+          expect 'name: DATABASE_URL'
+          expect 'name: KG_SECRET_KEY'
+          expect 'KG_SECRET_KEY: "'
+          expect 'name: KG_OIDC_ISSUER'
+          expect 'name: KG_OIDC_AUDIENCE'
+          expect 'name: KG_OIDC_GROUPS_CLAIM'
+          expect 'name: DAGSTER_GRAPHQL_HOST'
+          expect 'value: "kg-dagster-webserver"'
+          expect 'name: DAGSTER_GRAPHQL_PORT'
+          expect 'value: "80"'
+          expect 'value: "http://kg-control:8090"'
+          # Service kg-control, and Dagster user code env (also copied to run pods) with both variables
+          test "$(awk '/^kind: Service$/{s=1;next} s&&/^  name: kg-control$/{print "svc";s=0} /^---/{s=0}' "$out")" = svc
+          grep -q 'DAGSTER_CLI_API_GRPC_CONTAINER_CONTEXT' "$out"
+          grep -q -F '\"name\":\"KG_SECRET_KEY\"' "$out"
+          grep -q -F '\"name\":\"DATABASE_URL\"' "$out"
+          helm lint . --set control.enabled=true --set control.image=kg-pipeline:ci --set web.enabled=true --set web.image=kg-web:ci
 
   integration:
     name: ingest fixture and evaluate
