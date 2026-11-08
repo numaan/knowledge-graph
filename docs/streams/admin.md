@@ -1,9 +1,9 @@
 # Admin: control API and admin UI
 
-Status: implemented (control API, pipeline registry, web UI, Helm, Keycloak client `kg-web`). Not built: the
-`s3_documents` asset. Kind `s3` is accepted, validated and tested, and `run` returns 501. The control API
-and the pipeline part were tested with fakes and SQLite; no run was made against a live Dagster daemon and
-PostgreSQL. Section 10 lists the differences from the first contract and the open risks.
+Status: implemented (control API, pipeline registry, web UI, Helm, Keycloak client `kg-web`). The `s3_documents`
+asset runs sources of kind `s3` (job `s3_job`, CLI `kg-s3`). The control API
+and the pipeline part were tested with fakes and SQLite; no run was made against a live Dagster daemon,
+PostgreSQL or a real S3 server. Section 10 lists the differences from the first contract and the open risks.
 
 ## 1. Goal
 
@@ -71,7 +71,7 @@ the Secret `<name>-control`. Tests use SQLite.
 ## 4. HTTP API
 
 Base path `/api/v1`. JSON. `Authorization: Bearer <token>`. Errors: `{"error": "text"}` with status
-400, 401, 403, 404, 409, 501 or 502. The health route is `/api/v1/healthz` (the Helm probes use it). A list returns `{"items": [...]}`.
+400, 401, 403, 404, 409 or 502. The health route is `/api/v1/healthz` (the Helm probes use it). A list returns `{"items": [...]}`.
 
 | Method and path | Body | Result |
 |---|---|---|
@@ -83,7 +83,7 @@ Base path `/api/v1`. JSON. `Authorization: Bearer <token>`. Errors: `{"error": "
 | `PATCH /sources/{id}` | Any of `config, secret, schedule, enabled`. `secret: null` keeps it. `secret: {}` clears it. | `Source` |
 | `DELETE /sources/{id}` | | 204. Graph data stays. |
 | `POST /sources/{id}/test` | | `{ok, message, details}`. Checks the connection and the secret. Writes nothing to the graph. Always 200; writes audit `source.test`. |
-| `POST /sources/{id}/run` | `{mode?: "incremental"\|"full"}` | 202 `Run`. 409 if a run of this source is active or the source is disabled. 501 for `s3`. 502 when Dagster is unreachable (the `runs` row is stored as `failed`). |
+| `POST /sources/{id}/run` | `{mode?: "incremental"\|"full"}` | 202 `Run`. 409 if a run of this source is active or the source is disabled. 502 when Dagster is unreachable (the `runs` row is stored as `failed`). |
 | `GET /runs?source_id=&status=&limit=` | | `{"items": [Run]}` newest first. Default limit 50, max 200. |
 | `GET /runs/{id}` | | `Run` with fresh status from Dagster and `log_tail` (list of strings, up to 200; stored secret values are masked) |
 | `POST /runs/{id}/cancel` | | `Run` (status `canceled` at once). 409 if the run is final. 502 if Dagster fails. |
@@ -104,7 +104,30 @@ Contract fixtures (one JSON file per response) are in `web/tests/fixtures/contro
 | git | `url` (required), `branch` (default `main`) | `token` (optional) | `code_snapshot` -> `git_history` -> `domain_model` -> `vector_index` -> `summaries`, partition = `name` |
 | jira | `base_url`, `projects: [KEY]` | `email`, `api_token` | `jira_issues` -> `source_vectors` |
 | confluence | `base_url`, `spaces: [KEY]` | `email`, `api_token` | `confluence_pages` -> `source_vectors` |
-| s3 | `endpoint` (optional), `bucket`, `prefix`, `region`, `include` (globs, optional) | `access_key_id`, `secret_access_key` | `s3_documents` -> `source_vectors` (asset is a later step; the control API accepts and tests the kind, and `run` returns 501 until the asset exists) |
+| s3 | `endpoint` (optional), `bucket`, `prefix`, `region`, `include` (globs, optional) | `access_key_id`, `secret_access_key` | `s3_documents` -> `source_vectors` (job `s3_job`) |
+
+S3 sources (asset `s3_documents`, code in `kg_pipeline/sources/s3.py`):
+
+- `bucket` is required. `prefix` limits the keys. `include` is a list of globs on the key relative to the prefix
+  (`fnmatchcase`: case sensitive, `*` also matches `/`). Only the suffixes of `kg-docs` are read (`.md`,
+  `.markdown`, `.txt`, `.pdf`, `.docx`, `.pptx`, `.html`, `.htm`). Keys that end with `/` are ignored.
+- Secret: `access_key_id` and `secret_access_key`. A ui-origin source without a secret is anonymous (unsigned
+  requests; the `AWS_*` variables and the instance credentials are not read). An env-origin source without a
+  secret keeps the default boto3 credential chain.
+- A custom `endpoint` uses path-style addressing and the URL rules above. Redirects are refused.
+- Objects over `KG_S3_MAX_BYTES` (default 52428800, 50 MiB) are not downloaded. They count as `skipped`.
+- Change detection: an object with the same ETag, size and last-modified as the stored Document is not
+  downloaded. A downloaded object with the same content hash only refreshes these three fields. Mode `full`
+  downloads and rewrites every object.
+- Each object is one `Document` with id `s3:<source name>:<key>`, `collection` = source name, `source` = `s3`, `url`
+  `s3://<bucket>/<key>` and ACL group `docs:<source name>`. A user needs that group to see it.
+- Reconcile removes the Documents of keys that are gone, only after a complete listing. Objects over the size
+  limit count as existing and are never removed. The guard `TooManyRemovals` stops a run that would remove more
+  than half of the Documents of a source (when more than 20); the asset has no force switch, use `kg-s3 --force`.
+- Run stats (top-level, plain integers): `listed`, `new`, `changed`, `unchanged`, `skipped`, `removed`, `bytes`
+  (downloaded bytes only), `failed`. Per-source results are in the `sources` JSON.
+- A failing source (SSRF guard, listing error, `TooManyRemovals`) does not stop the other sources. The asset fails
+  after the last source finished and the run shows each source error.
 
 Validation: unknown keys are rejected. URLs must be `https://` (`http://` only when `KG_CONTROL_ALLOW_HTTP=1`).
 The web form accepts `https://` only, always. `KG_CONTROL_ALLOW_HTTP=1` allows `http://` for direct API calls.
@@ -124,7 +147,7 @@ for it. DNS rebinding between the guard and the clone stays open for git.
   and `get_secret(source)` decrypts. Code never reads the registry at import time.
 - `definitions.py`: git partitions use `DynamicPartitionsDefinition(name="repos")`. Jira and Confluence assets read
   projects, spaces and credentials from the registry. `Atlassian` accepts explicit credentials.
-- Jobs: `git_job` (partitioned), `jira_job`, `confluence_job`. A sensor `due_sources` (60 s) launches a run
+- Jobs: `git_job` (partitioned), `jira_job`, `confluence_job`, `s3_job`. A sensor `due_sources` (60 s) launches a run
   when a source cron is due and no run of it is active.
 - Run result: there is no separate run-status sensor. The status refresh in `GET /runs/{id}` and `GET /runs`
   copies status and asset metadata to `runs`. Sensor `due_sources` does the same copy (`sync_runs`) at each tick
@@ -191,7 +214,7 @@ script `kg-control` runs the same function.
 
 ## 9. Out of scope here
 
-Object storage asset (`s3_documents`), HA, GraphRAG communities, multi-tenant admin roles, key rotation tooling.
+HA, GraphRAG communities, multi-tenant admin roles, key rotation tooling.
 
 ## 10. Deviations from the first contract and open risks
 
@@ -207,7 +230,8 @@ Object storage asset (`s3_documents`), HA, GraphRAG communities, multi-tenant ad
 | `hourly_code`, `service_catalog` | n/a | `hourly_code` still loops over env repositories; UI-only repositories use `due_sources`. `service_catalog` uses env `GIT_BRANCH`. |
 | URL scheme in UI | n/a | The web form accepts `https://` only. |
 | Keycloak | Group and mapper | Client `kg-web` added; the existing scope `kg-mcp` carries audience and groups. |
-| `s3_documents` | Later step | Not built. `run` returns 501. |
+| `s3_documents` | Later step | Built. `run` launches `s3_job`. Version 1.43.110 of boto3 is pinned in the extra `s3`. |
+| S3 ACL | `KG_ACL_DEFAULT` | Documents get the group `docs:<source name>`, as `kg-docs --path` does. |
 
 Open risks:
 
@@ -216,6 +240,9 @@ Open risks:
 | No database uniqueness for one active run per source | Two parallel `POST /run` calls on PostgreSQL can both pass the check. |
 | A scheduled `runs` row stays `queued` if Dagster never creates the run | No timeout. Cancel it in the UI. |
 | The S3 `test` is not pinned against DNS rebinding | The SSRF guard resolves the host first; boto3 resolves it again. |
+| The no-redirect hook of the S3 client is tested on a fake only | The `response-received` hook raises on 3xx; real botocore behaviour is not verified. |
+| No S3 object versions, no bucket events | Only the current object is read; changes are found at the next run. |
+| Reconcile needs a complete listing | A listing error ends the source run without a removal. |
 | Mode `full` does not bypass caches | See section 6. |
 | The log scrub does not mask a base64 of `email:token` for some lengths | No current path echoes it. |
 | The pipeline part was not run against a live Dagster daemon | The first live run can show differences. |

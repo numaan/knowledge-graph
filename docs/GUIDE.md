@@ -266,6 +266,8 @@ kg-docs --confluence ENG                             # one Confluence Cloud spac
   `docker run -p 5001:5001 quay.io/docling-project/docling-serve:v1.38.2`.
 - Confluence needs `CONFLUENCE_BASE_URL` (site root, without `/wiki`), `CONFLUENCE_EMAIL` and
   `CONFLUENCE_API_TOKEN`.
+- For a bucket of S3-compatible storage use `kg-s3 --bucket B --prefix P --name N` (add `--dry-run` to
+  report only). See the [runbook](RUNBOOK.md#931-s3-sources).
 - Unchanged files (content hash) and pages (version number) are skipped. Deleted files and pages are
   removed from the graph.
 
@@ -631,6 +633,7 @@ signs people in through Keycloak and sends their token to the REST layer. See [w
 | `kg-embed` | embeddings (`--repo`, `--sources`) |
 | `kg-jira` | Jira issues and releases |
 | `kg-docs` | documents and Confluence pages |
+| `kg-s3` | documents from an S3-compatible bucket (needs the extra `s3`; see the [runbook](RUNBOOK.md#931-s3-sources)) |
 | `kg-verify` | requirement checks |
 | `kg-search` | hybrid search from the shell |
 | `kg-eval` | evaluation set (search, impact, requirements, answers) |
@@ -655,6 +658,7 @@ signs people in through Keycloak and sends their token to the REST layer. See [w
 | `EMBEDDINGS_URL`, `EMBEDDINGS_MODEL`, `EMBEDDINGS_DIMENSIONS`, `EMBEDDINGS_API_KEY` | embed, search, MCP | `http://localhost:8080`, `Qwen/Qwen3-Embedding-0.6B`, `1024` |
 | `LLM_PROVIDER`, `LLM_BASE_URL`, `LLM_MODEL`, `LLM_CONTEXT_TOKENS`, `LLM_CACHE_DIR` | domain, verify | `ollama`, `http://localhost:11434` |
 | `DOCLING_URL` | docs, verify | `http://localhost:5001` |
+| `KG_S3_MAX_BYTES`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | `kg-s3` (the keys are for the CLI only) | 52428800 (50 MiB), none |
 | `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`, `JIRA_ACCEPTANCE_FIELD`, `JIRA_PROJECTS` | Jira | none |
 | `CONFLUENCE_BASE_URL`, `CONFLUENCE_EMAIL`, `CONFLUENCE_API_TOKEN`, `CONFLUENCE_SPACES` | Confluence | none |
 | `ATLASSIAN_EMAIL`, `ATLASSIAN_API_TOKEN` | Jira and Confluence fallback | none |
