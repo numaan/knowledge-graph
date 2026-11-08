@@ -42,7 +42,7 @@ def _refresh(engine: Engine, client, row):
         values["started_at"] = now
     if new in FINAL:
         values["ended_at"] = now
-        # Asset metadata: only a client that can read it fills `stats`. The Dagster client cannot yet.
+        # Asset metadata: a client that can read it fills `stats` (None when unavailable).
         reader = getattr(client, "get_stats", None)
         if reader:
             try:
@@ -180,9 +180,7 @@ def make_router() -> APIRouter:
             conn.execute(insert(runs).values(
                 id=run_id, source_id=source_id, source_name=src.name, kind=src.kind, status="queued",
                 trigger="manual", mode=mode, requested_by=user.name))
-        tags = {"kg/source": src.name, "kg/source_id": source_id, "kg/run_id": run_id, "kg/mode": mode}
-        if src.kind == "git":
-            tags[dagster_client.PARTITION_TAG] = src.name
+        tags = dagster_client.launch_tags(src.kind, src.name, source_id, run_id, mode)
         error = None
         try:
             dagster_run_id = get_dagster(request).launch(dagster_client.JOB_BY_KIND[src.kind], tags)

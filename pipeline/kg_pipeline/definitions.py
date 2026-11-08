@@ -15,11 +15,12 @@ GitHub, catalog and people: see people_assets.py (github_prs, service_catalog, p
 
 import os
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 import dagster as dg
 
-from . import corrections, freshness, sources_registry, summaries
+from . import corrections, due_sources as due, freshness, sources_registry, summaries
 from .code import links
 from .code.ingest import build_graph
 from .domain.extract import extract
@@ -280,7 +281,21 @@ def registry_partitions(context: dg.SensorEvaluationContext):
     return dg.SkipReason(f"partitions added: {', '.join(added)}" if added else "partitions are up to date")
 
 
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+@dg.sensor(name="due_sources", minimum_interval_seconds=60, default_status=dg.DefaultSensorStatus.RUNNING,
+           jobs=[git_job, jira_job, confluence_job])
+def due_sources(context: dg.SensorEvaluationContext):
+    """Launch the job of each enabled source whose cron schedule (UTC) is due, as the control API would."""
+    if not os.environ.get("DATABASE_URL", "").strip():
+        return dg.SkipReason("DATABASE_URL is not set: no registry schedules")
+    due.sync_runs(context.instance)
+    return due.due_requests(_now()) or dg.SkipReason("no source is due")
+
+
 from .trust_assets import TRUST, daily_reconcile  # noqa: E402  data trust: deletes, moves, duplicates
 
 defs = dg.Definitions(assets=CODE + SOURCES + TRUST, schedules=[hourly_code, sources_every_15_min, daily_reconcile],
-                      jobs=[git_job, jira_job, confluence_job], sensors=[registry_partitions])
+                      jobs=[git_job, jira_job, confluence_job], sensors=[registry_partitions, due_sources])

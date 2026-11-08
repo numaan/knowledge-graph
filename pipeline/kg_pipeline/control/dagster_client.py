@@ -11,6 +11,7 @@ Verified against the installed package source:
 
 Job names are agreed here and created in the pipeline tasks T9 and T10.
 """
+import json
 import os
 from typing import Any
 
@@ -36,6 +37,15 @@ def map_status(dagster_state: str) -> str:
     return _STATUS.get(str(dagster_state).rsplit(".", 1)[-1].upper(), "running")
 
 
+def launch_tags(kind: str, source_name: str, source_id: str, run_id: str, mode: str) -> dict[str, str]:
+    """Tags of every run of a source: POST /sources/{id}/run and the sensor `due_sources` (definitions.py, which
+    repeats this logic in due_sources.py without importing this package; a test keeps both equal)."""
+    tags = {"kg/source": source_name, "kg/source_id": source_id, "kg/run_id": run_id, "kg/mode": mode}
+    if kind == "git":
+        tags[PARTITION_TAG] = source_name
+    return tags
+
+
 class DagsterError(Exception):
     """A Dagster call failed. The message is short and holds no secret."""
 
@@ -49,6 +59,40 @@ query ControlRunLogs($runId: ID!, $cursor: String, $limit: Int) {
   logsForRun(runId: $runId, afterCursor: $cursor, limit: $limit) {
     __typename
     ... on EventConnection { events { __typename ... on MessageEvent { message timestamp level } } cursor hasMore }
+    ... on RunNotFoundError { message }
+    ... on PythonError { message }
+  }
+}
+"""
+# Verified against the installed schema (test_control_stats validates it): MaterializationEvent has assetKey,
+# partition and metadataEntries (interface MetadataEntry; one fragment per value type that we convert).
+_STATS_QUERY = """
+query ControlRunStats($runId: ID!, $cursor: String, $limit: Int) {
+  logsForRun(runId: $runId, afterCursor: $cursor, limit: $limit) {
+    __typename
+    ... on EventConnection {
+      events {
+        __typename
+        ... on MaterializationEvent {
+          assetKey { path }
+          partition
+          metadataEntries {
+            __typename
+            label
+            ... on IntMetadataEntry { intValue intRepr }
+            ... on FloatMetadataEntry { floatValue }
+            ... on TextMetadataEntry { text }
+            ... on BoolMetadataEntry { boolValue }
+            ... on JsonMetadataEntry { jsonString }
+            ... on UrlMetadataEntry { url }
+            ... on PathMetadataEntry { path }
+            ... on MarkdownMetadataEntry { mdStr }
+          }
+        }
+      }
+      cursor
+      hasMore
+    }
     ... on RunNotFoundError { message }
     ... on PythonError { message }
   }
@@ -74,6 +118,26 @@ mutation ControlDeletePartition($sel: RepositorySelector!, $def: String!, $keys:
   }
 }
 """
+
+
+def _entry_value(e: dict):
+    """JSON-safe value of one metadata entry; None for a type that we do not convert."""
+    t = e.get("__typename")
+    if t == "IntMetadataEntry":
+        if e.get("intValue") is not None:
+            return e["intValue"]
+        try:
+            return int(e["intRepr"])
+        except (KeyError, ValueError, TypeError):
+            return None
+    if t == "JsonMetadataEntry":
+        try:
+            return json.loads(e["jsonString"])
+        except (KeyError, ValueError, TypeError):
+            return None
+    field = {"FloatMetadataEntry": "floatValue", "TextMetadataEntry": "text", "BoolMetadataEntry": "boolValue",
+             "UrlMetadataEntry": "url", "PathMetadataEntry": "path", "MarkdownMetadataEntry": "mdStr"}.get(t)
+    return e.get(field) if field else None
 
 
 class DagsterClient:
@@ -155,3 +219,29 @@ class DagsterClient:
                 break
             cursor = res["cursor"]
         return lines
+
+    def get_stats(self, run_id: str, page: int = 500, max_pages: int = 20) -> dict | None:
+        """Metadata of the asset materializations of a run: `{"asset/key": {label: value}}`, JSON-safe.
+
+        A later event of the same asset replaces an earlier one. Returns None on any failure or when the run
+        has no materialization. Never raises: the stats are optional for the run record.
+        """
+        out: dict[str, dict] = {}
+        cursor = None
+        try:
+            for _ in range(max_pages):
+                res = self._call(self._gql._execute, _STATS_QUERY,
+                                 {"runId": run_id, "cursor": cursor, "limit": page})["logsForRun"]
+                if res["__typename"] != "EventConnection":
+                    return None
+                for ev in res["events"]:
+                    if ev.get("__typename") != "MaterializationEvent" or not ev.get("assetKey"):
+                        continue
+                    values = {m["label"]: _entry_value(m) for m in ev.get("metadataEntries") or []}
+                    out["/".join(ev["assetKey"]["path"])] = {k: v for k, v in values.items() if v is not None}
+                if not res["hasMore"]:
+                    break
+                cursor = res["cursor"]
+        except Exception:
+            return None
+        return out or None
