@@ -93,6 +93,19 @@ describe("/api/admin proxy", () => {
     expect(res.status).toBe(200);
   });
 
+  it("accepts the public host from the Host header although req.url holds the bind address", async () => {
+    const headers = { ...good, host: "kg.example.com", origin: "https://kg.example.com", "x-forwarded-proto": "https" };
+    const res = await POST(req("POST", "sources", { headers, body: "{}" }), ctx("sources"));
+    expect(res.status).toBe(200);
+  });
+
+  it("passes a 204 (delete source) through without a body", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 204 })));
+    const res = await DELETE(req("DELETE", "sources/a", { headers: good }), ctx("sources", "a"));
+    expect(res.status).toBe(204);
+    expect(await res.text()).toBe("");
+  });
+
   it("returns 413 for a body over 1 MiB", async () => {
     const big = "x".repeat(1024 * 1024 + 1);
     const res = await POST(req("POST", "sources", { headers: good, body: big }), ctx("sources"));

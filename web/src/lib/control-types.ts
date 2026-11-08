@@ -1,7 +1,11 @@
 // Types of the control API (docs/streams/admin.md, section 4). Shared by browser and server code.
 
-export type SourceKind = "git" | "jira" | "confluence" | "s3";
-export type RunStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
+export const SOURCE_KINDS = ["git", "jira", "confluence", "s3"] as const;
+export const RUN_STATUSES = ["queued", "running", "succeeded", "failed", "canceled"] as const;
+export const RUN_MODES = ["incremental", "full"] as const;
+export type SourceKind = (typeof SOURCE_KINDS)[number];
+export type RunStatus = (typeof RUN_STATUSES)[number];
+export type RunMode = (typeof RUN_MODES)[number];
 
 export type Run = {
   id: string;
@@ -10,7 +14,7 @@ export type Run = {
   kind: SourceKind;
   status: RunStatus;
   trigger: string;
-  mode: "incremental" | "full";
+  mode: RunMode;
   dagster_run_id: string | null;
   dagster_url: string | null;
   stats: Record<string, unknown> | null;
@@ -38,13 +42,17 @@ export type Source = {
 
 export type AuditEntry = {
   id: string;
-  ts?: string;
-  created_at?: string;
+  at: string | null;
   actor: string;
   action: string;
-  target?: string | null;
-  detail?: Record<string, unknown> | null;
-  [key: string]: unknown;
+  target: string | null;
+  detail: Record<string, unknown> | null;
 };
+
+/** Result of POST /sources/{id}/test (HTTP 200 also when the check fails). */
+export type TestResult = { ok: boolean; message: string; details: Record<string, unknown> };
+
+/** Error body of every non-2xx response. */
+export type ApiError = { error: string };
 
 export type MeResult = { user: string; is_admin: boolean };

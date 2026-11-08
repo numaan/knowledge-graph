@@ -1,5 +1,5 @@
 import { controlFetch } from "@/lib/control";
-import { controlPath, csrfOk, methodAllowed, readLimited, declaredTooLarge } from "@/lib/admin-proxy";
+import { controlPath, csrfOk, requestOrigin, methodAllowed, readLimited, declaredTooLarge } from "@/lib/admin-proxy";
 
 // Browser-facing proxy to the control API. It adds the caller's access token on the server and
 // forwards only the allow-listed admin paths. Cookies and the browser Authorization header are
@@ -12,7 +12,7 @@ async function forward(req: Request, path: string[]) {
   const match = controlPath(path);
   if (!match) return err("not found", 404);
   if (!methodAllowed(match, method)) return err("method not allowed", 405);
-  if (!csrfOk(method, req.headers, new URL(req.url).origin)) return err("forbidden", 403);
+  if (!csrfOk(method, req.headers, requestOrigin(req.headers, req.url))) return err("forbidden", 403);
   let body: string | undefined;
   if (method === "POST" || method === "PATCH") {
     if (declaredTooLarge(req.headers)) return err("body too large", 413);
@@ -22,6 +22,7 @@ async function forward(req: Request, path: string[]) {
   }
   const res = await controlFetch<unknown>(match.path + new URL(req.url).search, { method, body });
   if (!res.ok) return err(res.error, res.status);
+  if (res.status === 204) return new Response(null, { status: 204 }); // delete source: no body
   return Response.json(res.data, { status: res.status });
 }
 

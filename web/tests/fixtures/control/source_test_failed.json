@@ -1,0 +1,8 @@
+{
+  "details": {
+    "branch": "main",
+    "host": "git.example.com"
+  },
+  "message": "git ls-remote failed: authentication failed",
+  "ok": false
+}

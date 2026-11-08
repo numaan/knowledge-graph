@@ -33,7 +33,7 @@ export default async function AuditPage({ searchParams }: { searchParams: Promis
             <tbody>
               {items.map((e) => (
                 <tr key={e.id}>
-                  <td>{fmtTime(e.ts ?? e.created_at)}</td>
+                  <td>{fmtTime(e.at)}</td>
                   <td>{e.actor}</td>
                   <td>{e.action}</td>
                   <td>{e.target ?? "-"}</td>

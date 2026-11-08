@@ -70,6 +70,28 @@ export function isMutating(method: string): boolean {
 }
 
 /** CSRF check. Non-mutating methods pass; mutating ones need same origin AND the custom header. */
+/**
+ * The origin the browser used for this request. `req.url` of a Next server holds the bind address
+ * (for example http://localhost:3000), not the public host, so the Host header (or the first
+ * X-Forwarded-Host of the ingress) is used. The scheme comes from X-Forwarded-Proto; without it, the
+ * scheme of the Origin header is used (host and port are still compared). A cross-site page cannot
+ * set these headers: it needs a CORS preflight that this app never grants.
+ */
+export function requestOrigin(headers: Headers, url: string): string {
+  const u = new URL(url);
+  const first = (v: string | null) => v?.split(",")[0].trim() || null;
+  let originProto: string | null = null;
+  try {
+    const o = headers.get("origin");
+    originProto = o ? new URL(o).protocol.replace(":", "") : null;
+  } catch {
+    originProto = null;
+  }
+  const host = first(headers.get("x-forwarded-host")) ?? first(headers.get("host")) ?? u.host;
+  const proto = first(headers.get("x-forwarded-proto")) ?? originProto ?? u.protocol.replace(":", "");
+  return `${proto}://${host}`;
+}
+
 export function csrfOk(method: string, headers: Headers, requestOrigin: string): boolean {
   if (!isMutating(method)) return true;
   if (headers.get(ADMIN_HEADER) !== ADMIN_HEADER_VALUE) return false;

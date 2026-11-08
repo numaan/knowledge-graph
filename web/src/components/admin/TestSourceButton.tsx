@@ -2,8 +2,7 @@
 
 import { useState } from "react";
 import { adminApi } from "@/lib/admin-client";
-
-type TestResult = { ok: boolean; message: string; details?: unknown };
+import type { TestResult } from "@/lib/control-types";
 
 /** Runs POST /sources/{id}/test and shows the result as text in a live region. */
 export function TestSourceButton({ id, label = "Test", ariaLabel, onText }: { id: string; label?: string; ariaLabel?: string; onText?: (t: string) => void }) {

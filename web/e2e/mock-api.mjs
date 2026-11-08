@@ -1,6 +1,7 @@
 // Mock of the kg-mcp REST layer (mcp/rest.go) for the Playwright smoke test and for screenshots.
 //   node e2e/mock-api.mjs [port]        MOCK_NO_ASK=1 removes the ask tool (404, "not configured")
 import { createServer } from "node:http";
+import { handleControl } from "./mock-control.mjs";
 
 const port = Number(process.argv[2] ?? process.env.MOCK_PORT ?? 8799);
 const noAsk = process.env.MOCK_NO_ASK === "1";
@@ -128,6 +129,14 @@ createServer(async (req, res) => {
   for await (const c of req) body += c;
   const args = body ? JSON.parse(body) : {};
   const p = url.pathname;
+  const control = handleControl(req.method, p, args);
+  if (control) {
+    if (control.body === null) {
+      res.writeHead(control.status);
+      return res.end();
+    }
+    return send(res, control.status, control.body);
+  }
   if (req.method === "GET" && p === "/api/tools") {
     return send(res, 200, { tools: Object.keys(tools).filter((t) => !(noAsk && t === "ask")).map((name) => ({ name, description: name, input_schema: { type: "object" } })) });
   }

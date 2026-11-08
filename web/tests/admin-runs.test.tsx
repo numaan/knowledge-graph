@@ -42,7 +42,7 @@ describe("format helpers", () => {
   });
   it("isActive", () => {
     expect(isActive("queued") && isActive("running")).toBe(true);
-    expect(["succeeded", "failed", "cancelled"].some((s) => isActive(s as Run["status"]))).toBe(false);
+    expect(["succeeded", "failed", "canceled"].some((s) => isActive(s as Run["status"]))).toBe(false);
   });
   it("kvText is compact and never HTML", () => {
     expect(kvText(null)).toBe("");
@@ -88,7 +88,7 @@ describe("RunsPage", () => {
 
 describe("AuditPage", () => {
   it("renders compact detail as text, not HTML", async () => {
-    const e: AuditEntry = { id: "a1", ts: "2026-11-08T10:00:00Z", actor: "alice", action: "source.create", target: "src_1", detail: { name: "<b>x</b>" } };
+    const e: AuditEntry = { id: "a1", at: "2026-11-08T10:00:00+00:00", actor: "alice", action: "source.create", target: "src_1", detail: { name: "<b>x</b>" } };
     cf.mockResolvedValue({ ok: true, status: 200, data: { items: [e] } });
     const { container } = render(await AuditPage({ searchParams: Promise.resolve({ limit: "200" }) }));
     expect(cf).toHaveBeenCalledWith("api/v1/audit?limit=200");
@@ -196,16 +196,16 @@ describe("RunDetail", () => {
     expect(pre.querySelector("b")).toBeNull();
   });
 
-  it("cancels with confirmation and shows the cancelled state", async () => {
+  it("cancels with confirmation and shows the canceled state", async () => {
     const user = userEvent.setup();
-    api.post.mockResolvedValue(ok(run({ status: "cancelled" })));
+    api.post.mockResolvedValue(ok(run({ status: "canceled" })));
     render(<RunDetail initial={run()} />);
     await user.click(screen.getByRole("button", { name: "Cancel run" }));
     const dlg = screen.getByRole("alertdialog");
     expect(api.post).not.toHaveBeenCalled();
     await user.click(within(dlg).getByRole("button", { name: "Confirm cancel" }));
     expect(api.post).toHaveBeenCalledWith("runs/r1/cancel");
-    expect(await screen.findByText("cancelled")).toBeInTheDocument();
+    expect(await screen.findByText("canceled")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Cancel run" })).toBeNull();
   });
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { controlPath, csrfOk, declaredTooLarge, methodAllowed, readLimited, MAX_BODY_BYTES } from "@/lib/admin-proxy";
+import { controlPath, csrfOk, declaredTooLarge, methodAllowed, readLimited, requestOrigin, MAX_BODY_BYTES } from "@/lib/admin-proxy";
 
 const p = (s: string) => controlPath(s.split("/"));
 
@@ -80,5 +80,23 @@ describe("body limit", () => {
     expect((await readLimited(stream(MAX_BODY_BYTES)))?.byteLength).toBe(MAX_BODY_BYTES);
     expect(await readLimited(stream(MAX_BODY_BYTES + 1))).toBeNull();
     expect((await readLimited(null))?.byteLength).toBe(0);
+  });
+});
+
+describe("requestOrigin", () => {
+  const h = (o: Record<string, string>) => new Headers(o);
+  it("uses the Host header, not the bind address of req.url", () => {
+    expect(requestOrigin(h({ host: "127.0.0.1:3100", origin: "http://127.0.0.1:3100" }), "http://localhost:3100/api/admin/x")).toBe("http://127.0.0.1:3100");
+  });
+  it("prefers the first forwarded host and proto of the ingress", () => {
+    const headers = h({ host: "web:3000", "x-forwarded-host": "kg.example.com, web", "x-forwarded-proto": "https, http", origin: "https://kg.example.com" });
+    expect(requestOrigin(headers, "http://localhost:3000/x")).toBe("https://kg.example.com");
+  });
+  it("falls back to req.url without headers", () => {
+    expect(requestOrigin(h({}), "http://localhost:3000/x")).toBe("http://localhost:3000");
+  });
+  it("does not accept a foreign origin", () => {
+    const o = requestOrigin(h({ host: "kg.example.com", origin: "https://evil.example" }), "http://localhost:3000/x");
+    expect(csrfOk("POST", h({ "x-kg-admin": "1", origin: "https://evil.example" }), o)).toBe(false);
   });
 });

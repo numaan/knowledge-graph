@@ -22,7 +22,7 @@ export default defineConfig({
       port: APP,
       reuseExistingServer: false,
       timeout: 60_000,
-      env: { KG_API_URL: `http://127.0.0.1:${MOCK}`, NEXT_TELEMETRY_DISABLED: "1" },
+      env: { KG_API_URL: `http://127.0.0.1:${MOCK}`, CONTROL_API_URL: `http://127.0.0.1:${MOCK}`, NEXT_TELEMETRY_DISABLED: "1" },
     },
   ],
 });

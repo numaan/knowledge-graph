@@ -1,11 +1,11 @@
 import Link from "next/link";
 import { fmtDuration, fmtTime, parseLimit, LIMITS, statusClass } from "@/components/admin/format";
 import { controlFetch } from "@/lib/control";
-import type { Run, Source } from "@/lib/control-types";
+import { RUN_STATUSES, type Run, type Source } from "@/lib/control-types";
 
 export const dynamic = "force-dynamic";
 
-const STATUSES = ["queued", "running", "succeeded", "failed", "cancelled"];
+const STATUSES: readonly string[] = RUN_STATUSES;
 type SP = Promise<Record<string, string | string[] | undefined>>;
 
 const one = (v: string | string[] | undefined) => (Array.isArray(v) ? v[0] : v) ?? "";

@@ -1,0 +1,19 @@
+{
+  "config": {
+    "base_url": "https://x.atlassian.net",
+    "projects": [
+      "A"
+    ]
+  },
+  "created_at": "2026-01-01T10:00:01+00:00",
+  "enabled": true,
+  "has_secret": false,
+  "id": "src_000000000002",
+  "kind": "jira",
+  "last_run": null,
+  "name": "jira-main",
+  "origin": "ui",
+  "schedule": null,
+  "secret_keys": [],
+  "updated_at": "2026-01-01T10:00:01+00:00"
+}
