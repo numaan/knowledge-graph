@@ -441,7 +441,7 @@ Also delete its `SyncState` cursor: `MATCH (s:SyncState) WHERE s.key STARTS WITH
 | Control API: no database uniqueness for one active run per source | Two parallel run requests can start two runs | Click Run once; cancel the second run |
 | Control API: a scheduled `runs` row stays `queued` if Dagster never creates the run | The source shows `queued` and the next scheduled run is skipped | Cancel the run in `/admin/runs` |
 | Control API: the S3 connection test is not pinned against DNS rebinding | A changing DNS answer can bypass the SSRF guard | Test only trusted hosts; keep `KG_CONTROL_ALLOW_PRIVATE` off |
-| S3 sources: the no-redirect hook of the client is tested on a fake only | A real server that redirects may not be refused as expected | Use the direct endpoint of the bucket; test with a real server before you rely on it |
+| S3 sources: the no-redirect hook and the AWS region retry are tested on fakes only (the real botocore is not installed in the test environment) | A real server may behave in another way than the fake | Use the direct endpoint of the bucket and set `region`; test with a real server before you rely on it |
 | S3 sources: no object versions and no bucket events | Only the current object is read, and a change shows at the next run | Set a `schedule` on the source |
 | S3 sources: reconcile needs a complete listing | After a listing error nothing is removed and the run fails | Run again; check the endpoint and the credentials |
 | S3 sources: a failing source fails the asset after the other sources finish | The run shows `failed`, but the other sources are written | Read the error per source in the run, fix that source |
@@ -518,6 +518,7 @@ An S3 source reads documents from a bucket of AWS S3, MinIO, SeaweedFS or Ceph i
 | Topic | Rule |
 |---|---|
 | Files read | The suffixes `.md .markdown .txt .pdf .docx .pptx .html .htm`. PDF, DOCX, PPTX and HTML need Docling at `DOCLING_URL`. |
+| Redirects | Redirects are never followed. For AWS (no `endpoint`) a bucket in another region answers with a redirect that carries the header `x-amz-bucket-region`. The run then rebuilds the client once with that region (it must look like `eu-west-1`) and lists again. Set `region` in the source to avoid this. For a custom endpoint a redirect is always an error, and the header is ignored. |
 | Size limit | An object over `KG_S3_MAX_BYTES` (default 52428800) is skipped and counted in `skipped`. Set the variable on the user code. |
 | Listing cap | `KG_S3_MAX_OBJECTS` (default 500000) is the largest number of matching objects of one source. A larger listing fails the run with an error that names the variable and the prefix. Nothing is written or removed. Narrow the `prefix` or the `include` globs, or raise the variable on the user code. |
 | Delete batches | Reconcile deletes in batches of 500 ids per query. A failure between two batches leaves a consistent graph, and the next run removes the rest. |

@@ -35,8 +35,19 @@ MAX_ATTEMPTS = 3
 _ANON = "anonymous"  # placeholder keys: with explicit keys boto3 never walks the credential chain
 
 
+_REGION = re.compile(r"[a-z]{2}(-[a-z]+)+-\d")   # used with fullmatch
+
+
 class RedirectRefused(Exception):
-    """The server answered with a redirect. Redirects are not followed."""
+    """The server answered with a redirect. Redirects are not followed.
+
+    `region` is the value of the x-amz-bucket-region header of the answer. It is set for AWS only (no custom
+    endpoint) and is not validated here; `call_with_region_hint` validates it before it is used.
+    """
+
+    def __init__(self, message: str, region: str | None = None):
+        super().__init__(message)
+        self.region = region
 
 
 def max_bytes() -> int:
@@ -59,10 +70,42 @@ def new_stats() -> dict:
     return {"listed": 0, "new": 0, "changed": 0, "unchanged": 0, "skipped": 0, "removed": 0, "bytes": 0}
 
 
-def _refuse_redirect(response_dict=None, **_):
-    status = (response_dict or {}).get("status_code") or 0
-    if 300 <= status < 400:
-        raise RedirectRefused(f"S3 endpoint answered with redirect {status}; redirects are not followed")
+def _redirect_hook(aws: bool):
+    """`response-received` hook: refuse every 3xx. For AWS the region header of the answer is kept as a hint only;
+    the Location header is never read and the host never changes."""
+    def hook(response_dict=None, **_):
+        response_dict = response_dict or {}
+        status = response_dict.get("status_code") or 0
+        if 300 <= status < 400:
+            region = None
+            if aws:
+                headers = response_dict.get("headers") or {}
+                region = next((str(v) for k, v in headers.items() if str(k).lower() == "x-amz-bucket-region"), None)
+            raise RedirectRefused(f"S3 endpoint answered with redirect {status}; redirects are not followed", region)
+    return hook
+
+
+def call_with_region_hint(config: dict, secret: dict | None, ui_origin: bool, fn, client=None):
+    """Run `fn(client)`. An AWS bucket (no custom endpoint) in another region answers with a redirect that carries
+    the region. Then the client is rebuilt once with that region (only if it matches `_REGION`) and `fn` runs again.
+    `fn` must be safe to repeat: the listing is its first step and fails before anything is written.
+    Any other redirect, a custom endpoint, an invalid region or a second redirect raises RedirectRefused."""
+    client = client or build_client(config, secret, ui_origin)
+    try:
+        return fn(client)
+    except RedirectRefused as e:
+        if config.get("endpoint"):
+            raise
+        hint = e.region or ""
+        if not _REGION.fullmatch(hint) or hint == config.get("region"):
+            raise RedirectRefused("S3 answered with a redirect: the bucket is in another region; "
+                                  "set `region` in the source") from None
+        log.info("bucket %s is in region %s: retrying once", config.get("bucket"), hint)
+    try:
+        return fn(build_client({**config, "region": hint}, secret, ui_origin))
+    except RedirectRefused:
+        raise RedirectRefused("S3 answered with a redirect again after the region change; "
+                              "set `region` in the source") from None
 
 
 def build_client(config: dict, secret: dict | None, ui_origin: bool = False):
@@ -74,8 +117,9 @@ def build_client(config: dict, secret: dict | None, ui_origin: bool = False):
     KG_CONTROL_ALLOW_HTTP=1; the rule is the one of the control API validation).
 
     Redirects: botocore (urllib3) does not follow them itself, but its S3 region redirector would re-send to
-    another host. A `response-received` hook raises on any 3xx first. That hook is only tested on a fake client;
-    the behaviour against a real server is not verified.
+    another host. A `response-received` hook raises on any 3xx first. For AWS (no endpoint) the error carries the
+    x-amz-bucket-region header; see `call_with_region_hint`. The hook is only tested on a fake client (the real
+    botocore is not installed in the test environment); the behaviour against a real server is not verified.
     """
     endpoint = config.get("endpoint") or None
     if endpoint:
@@ -103,7 +147,7 @@ def build_client(config: dict, secret: dict | None, ui_origin: bool = False):
         creds = {"aws_access_key_id": _ANON, "aws_secret_access_key": _ANON}
     client = boto3.client("s3", endpoint_url=endpoint, region_name=config.get("region") or None,
                           config=Config(**opts), **creds)
-    client.meta.events.register("response-received", _refuse_redirect)
+    client.meta.events.register("response-received", _redirect_hook(not endpoint))
     return client
 
 
@@ -313,14 +357,16 @@ def main(argv: list[str] | None = None) -> int:
         env = os.environ
         secret = ({"access_key_id": env["AWS_ACCESS_KEY_ID"], "secret_access_key": env["AWS_SECRET_ACCESS_KEY"]}
                   if env.get("AWS_ACCESS_KEY_ID") and env.get("AWS_SECRET_ACCESS_KEY") else None)
-        client = build_client(config, secret, ui_origin=False)
+        client = build_client(config, secret, ui_origin=False)   # fail fast on a bad config or a missing boto3
         from ..graph.neo4j_writer import Neo4jWriter
         with Neo4jWriter(env.get("NEO4J_URI", "bolt://localhost:7687"), env.get("NEO4J_USER", "neo4j"),
                          env["NEO4J_PASSWORD"]) as w:
             if args.dry_run:
-                res = dry_run(w, client, name, config, args.full)
+                res = call_with_region_hint(config, secret, False, lambda c: dry_run(w, c, name, config, args.full),
+                                            client)
             else:
-                res = sync(w, client, name, config, full=args.full, force=args.force)
+                res = call_with_region_hint(config, secret, False,
+                                            lambda c: sync(w, c, name, config, full=args.full, force=args.force), client)
     except Exception as e:
         print(f"kg-s3: {e}", file=sys.stderr)
         return 1

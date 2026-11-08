@@ -182,3 +182,88 @@ def test_missing_boto3_names_the_extra(monkeypatch):
         monkeypatch.setitem(sys.modules, n, None)  # import raises ImportError
     with pytest.raises(RuntimeError, match=r"kg-pipeline\[s3\]"):
         s3.build_client(CFG, None, ui_origin=True)
+
+
+# --- AWS region hint (301 with x-amz-bucket-region) ----------------------------------------------------------
+# The real botocore is not installed in the test environment: the hook and the retry are tested with fakes only.
+# Whether a real AWS answer reaches the hook with these header names is not verified.
+
+AWS = {"bucket": "b"}   # no endpoint: AWS
+
+
+def redirect(region="eu-west-3", status=301, headers=None):
+    return {"status_code": status, "headers": headers if headers is not None else {"x-amz-bucket-region": region}}
+
+
+def test_hook_carries_the_region_header_for_aws_only(monkeypatch):
+    _, events = fake_boto(monkeypatch)
+    s3.build_client(AWS, None, ui_origin=True)
+    with pytest.raises(s3.RedirectRefused) as e:
+        events.handlers["response-received"](response_dict=redirect())
+    assert e.value.region == "eu-west-3"
+    with pytest.raises(s3.RedirectRefused) as e:   # header names are case insensitive
+        events.handlers["response-received"](response_dict=redirect(headers={"X-Amz-Bucket-Region": "us-west-2"}))
+    assert e.value.region == "us-west-2"
+    with pytest.raises(s3.RedirectRefused) as e:
+        events.handlers["response-received"](response_dict=redirect(headers={"location": "http://evil/"}))
+    assert e.value.region is None
+
+
+def test_hook_ignores_the_region_header_for_a_custom_endpoint(monkeypatch):
+    _, events = fake_boto(monkeypatch)
+    s3.build_client(CFG, None, ui_origin=True)
+    with pytest.raises(s3.RedirectRefused) as e:
+        events.handlers["response-received"](response_dict=redirect())
+    assert e.value.region is None
+
+
+def retry_fixture(monkeypatch, regions):
+    """build_client records its configs; fn raises RedirectRefused(region) for each region in `regions`, then works."""
+    built, left = [], list(regions)
+    monkeypatch.setattr(s3, "build_client", lambda cfg, secret, ui_origin=False: built.append(cfg) or f"c{len(built)}")
+
+    def fn(client):
+        if left:
+            raise s3.RedirectRefused("redirect 301", region=left.pop(0))
+        return f"ok:{client}"
+    return built, fn
+
+
+def test_region_hint_rebuilds_the_client_once_and_retries(monkeypatch):
+    built, fn = retry_fixture(monkeypatch, ["eu-west-3"])
+    assert s3.call_with_region_hint(dict(AWS), None, True, fn) == "ok:c2"
+    assert [c.get("region") for c in built] == [None, "eu-west-3"]
+
+
+def test_region_hint_second_redirect_is_an_error_naming_region(monkeypatch):
+    built, fn = retry_fixture(monkeypatch, ["eu-west-3", "us-east-2"])
+    with pytest.raises(s3.RedirectRefused, match="region"):
+        s3.call_with_region_hint(dict(AWS), None, True, fn)
+    assert len(built) == 2
+
+
+@pytest.mark.parametrize("bad", ["evil.example/x", "EU-WEST-1", "eu-west-1\r\nHost: x", "", "a-b", "eu-west-12"])
+def test_region_hint_with_an_invalid_region_is_not_used(monkeypatch, bad):
+    built, fn = retry_fixture(monkeypatch, [bad])
+    with pytest.raises(s3.RedirectRefused, match="region"):
+        s3.call_with_region_hint(dict(AWS), None, True, fn)
+    assert len(built) == 1
+
+
+def test_region_hint_never_changes_a_custom_endpoint(monkeypatch):
+    built, fn = retry_fixture(monkeypatch, ["eu-west-3"])
+    with pytest.raises(s3.RedirectRefused):
+        s3.call_with_region_hint(dict(CFG), None, True, fn)
+    assert len(built) == 1
+
+
+def test_region_hint_without_header_says_to_set_region(monkeypatch):
+    built, fn = retry_fixture(monkeypatch, [None])
+    with pytest.raises(s3.RedirectRefused, match="region"):
+        s3.call_with_region_hint(dict(AWS), None, True, fn)
+    assert len(built) == 1
+
+
+def test_region_hint_uses_a_given_first_client(monkeypatch):
+    built, fn = retry_fixture(monkeypatch, [])
+    assert s3.call_with_region_hint(dict(AWS), None, True, fn, client="first") == "ok:first" and built == []

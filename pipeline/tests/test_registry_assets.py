@@ -551,3 +551,18 @@ def test_s3_job_and_sensor():
 
 def test_s3_documents_is_a_sources_asset():
     assert d.s3_documents.key.to_user_string() == "s3_documents" and d.s3_documents in d.SOURCES
+
+
+def test_s3_documents_retries_with_the_region_hint(s3fx, registry_db, monkeypatch):
+    from kg_pipeline.sources import s3 as s3mod
+    add_rows(registry_db, ("s3", "aws", {"bucket": "b1"}, None, True))
+    tries = []
+
+    def sync(w, client, name, cfg, full=False, force=False, **kw):
+        tries.append(client)
+        if len(tries) == 1:
+            raise s3mod.RedirectRefused("301", region="eu-west-3")
+        return s3mod.new_stats()
+    monkeypatch.setattr(d.s3, "sync", sync)
+    d.s3_documents(ctx())
+    assert len(tries) == 2 and len(s3fx["client"]) == 2

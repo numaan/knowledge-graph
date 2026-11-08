@@ -115,6 +115,11 @@ S3 sources (asset `s3_documents`, code in `kg_pipeline/sources/s3.py`):
   requests; the `AWS_*` variables and the instance credentials are not read). An env-origin source without a
   secret keeps the default boto3 credential chain.
 - A custom `endpoint` uses path-style addressing and the URL rules above. Redirects are refused.
+- Redirects are never followed. For AWS (no `endpoint`) the 3xx answer of a bucket in another region carries the
+  header `x-amz-bucket-region`. The asset and `kg-s3` rebuild the client once with that region (strict pattern
+  `^[a-z]{2}(-[a-z]+)+-\d$`) and retry the listing. Without a valid hint, or with a custom endpoint, the run fails
+  with an error that says to set `region` in the source. Only fakes test this; the real botocore is not installed
+  in the test environment.
 - Objects over `KG_S3_MAX_BYTES` (default 52428800, 50 MiB) are not downloaded. They count as `skipped`.
 - Change detection: an object with the same ETag, size and last-modified as the stored Document is not
   downloaded. A downloaded object with the same content hash only refreshes these three fields. Mode `full`

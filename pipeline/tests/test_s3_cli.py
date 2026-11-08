@@ -129,3 +129,22 @@ def test_pyproject_and_dockerfile():
     assert p["project"]["scripts"]["kg-s3"] == "kg_pipeline.sources.s3:main"
     assert re.fullmatch(r"boto3==\d+\.\d+\.\d+", p["project"]["optional-dependencies"]["s3"][0])
     assert "[dagster,control,s3]" in (root / "Dockerfile").read_text()
+
+
+def test_cli_retries_with_the_region_hint(cli, capsys, monkeypatch):
+    seen = []
+    real_list = cli["client"].list_objects_v2
+
+    def build(config, secret, ui_origin=False):
+        seen.append(config.get("region"))
+        return cli["client"]
+    monkeypatch.setattr(s3, "build_client", build)
+    left = [s3.RedirectRefused("301", region="eu-west-3")]
+
+    def list_v2(**kw):
+        if left:
+            raise left.pop()
+        return real_list(**kw)
+    cli["client"].list_objects_v2 = list_v2
+    assert s3.main(["--bucket", "B", "--prefix", "docs/", "--name", "n"]) == 0
+    assert seen == [None, "eu-west-3"] and json.loads(capsys.readouterr().out)["new"] == 2
