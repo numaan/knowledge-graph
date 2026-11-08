@@ -546,6 +546,9 @@ def test_ensure_schema_statements():
     vector = next(q for q in w.sent if q.startswith("CREATE VECTOR INDEX community_report_embedding"))
     assert "FOR (n:CommunityReport) ON n.embedding" in vector
     assert "`vector.dimensions`: 256" in vector and "'cosine'" in vector
+    # CI found an extra closing brace (Neo4j SyntaxError): the braces must balance, as in vectors.ensure_indexes.
+    assert vector.count("{") == vector.count("}") == 2
+    assert vector.endswith("'cosine'}}")
     assert ("CREATE FULLTEXT INDEX community_report_text IF NOT EXISTS FOR (n:CommunityReport) "
             "ON EACH [n.title, n.summary]") in text
 

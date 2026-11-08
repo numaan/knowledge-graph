@@ -475,7 +475,7 @@ def ensure_schema(w, dimensions: int | None) -> None:
     if dimensions:
         w._run("CREATE VECTOR INDEX community_report_embedding IF NOT EXISTS FOR (n:CommunityReport) "
                f"ON n.embedding OPTIONS {{indexConfig: {{`vector.dimensions`: {int(dimensions)}, "
-               "`vector.similarity_function`: 'cosine'}}}")
+               f"`vector.similarity_function`: 'cosine'}}}}")
 
 
 # --- build and write ----------------------------------------------------------------------------------
