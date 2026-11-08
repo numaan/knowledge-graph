@@ -212,3 +212,28 @@ def test_non_git_delete_does_not_touch_dagster(client, dagster, engine):
     dagster.remove_error = RuntimeError("must not be called")
     assert client.delete(f"/api/v1/sources/{sid}").status_code == 204
     assert "partition_removed" not in audit_rows(engine, "source.delete")[0]
+
+
+# ---- FIX 9: duplicate-name race ----
+def test_duplicate_name_race_is_409_and_keeps_the_winner_partition(client, dagster, monkeypatch):
+    from kg_pipeline.control import repo
+    body = {"kind": "git", "name": "race-repo", "config": {"url": "https://git.example.com/r.git"}}
+    assert client.post("/api/v1/sources", json=body).status_code == 201
+    monkeypatch.setattr(repo, "name_taken", lambda conn, name: False)  # both requests passed the check
+    r = client.post("/api/v1/sources", json=body)
+    assert r.status_code == 409, r.text
+    assert "race-repo" in r.json()["error"]
+    assert "race-repo" in dagster.partitions  # the first source keeps its partition
+
+
+def test_integrity_error_after_add_partition_removes_the_partition(client, dagster, monkeypatch):
+    from sqlalchemy.exc import IntegrityError
+    from kg_pipeline.control import audit
+
+    def boom(*a, **kw):
+        raise IntegrityError("insert", {}, Exception("unique"))
+
+    monkeypatch.setattr(audit, "write", boom)
+    body = {"kind": "git", "name": "late-repo", "config": {"url": "https://git.example.com/l.git"}}
+    assert client.post("/api/v1/sources", json=body).status_code == 409
+    assert "late-repo" not in dagster.partitions

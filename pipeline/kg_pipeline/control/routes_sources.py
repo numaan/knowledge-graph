@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
 from sqlalchemy import delete as sql_delete, insert, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import Engine
 
 from . import audit, dagster_client, probe, repo, secrets, validate
@@ -58,22 +59,34 @@ def make_router() -> APIRouter:
             raise _bad(e) from e
         now = datetime.now(timezone.utc)
         source_id = new_id("src")
-        with engine.begin() as conn:
-            if repo.name_taken(conn, name):
-                raise HTTPException(409, f"a source named {name} already exists")
-            conn.execute(insert(sources).values(
-                id=source_id, kind=kind, name=name, config=config, secret=token, schedule=schedule, enabled=enabled,
-                origin="ui", created_at=now, updated_at=now, created_by=user.name))
-            if kind == "git":
-                # A git run needs its partition. If Dagster fails, leaving this block rolls the row back.
+        added = False
+        try:
+            with engine.begin() as conn:
+                if repo.name_taken(conn, name):
+                    raise HTTPException(409, f"a source named {name} already exists")
+                conn.execute(insert(sources).values(
+                    id=source_id, kind=kind, name=name, config=config, secret=token, schedule=schedule,
+                    enabled=enabled, origin="ui", created_at=now, updated_at=now, created_by=user.name))
+                if kind == "git":
+                    # A git run needs its partition. If Dagster fails, leaving this block rolls the row back.
+                    try:
+                        get_dagster(request).add_partition(name)
+                        added = True
+                    except dagster_client.DagsterError as e:
+                        log.warning("source %s: add_partition failed: %s", name, e)
+                        raise HTTPException(
+                            502, "dagster could not register the repository; the source was not created") from e
+                audit.write(conn, user.name, "source.create", source_id,
+                            {"name": name, "kind": kind, "secret_keys": secrets.secret_keys(secret if token else None)})
+                return repo.serialize_source(conn, repo.get_source(conn, source_id))
+        except IntegrityError:
+            # two creates with the same name at the same time: the unique constraint of `name` refused the second
+            if added:
                 try:
-                    get_dagster(request).add_partition(name)
+                    get_dagster(request).remove_partition(name)
                 except dagster_client.DagsterError as e:
-                    log.warning("source %s: add_partition failed: %s", name, e)
-                    raise HTTPException(502, "dagster could not register the repository; the source was not created") from e
-            audit.write(conn, user.name, "source.create", source_id,
-                        {"name": name, "kind": kind, "secret_keys": secrets.secret_keys(secret if token else None)})
-            return repo.serialize_source(conn, repo.get_source(conn, source_id))
+                    log.warning("source %s: remove_partition failed after a refused insert: %s", name, e)
+            raise HTTPException(409, f"a source named {name} already exists") from None
 
     @router.get("/sources/{source_id}")
     def get(source_id: str, user: User = Depends(require_admin), engine: Engine = Depends(_engine)):
