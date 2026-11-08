@@ -177,8 +177,10 @@ describe("SourceForm create", () => {
     await userEvent.selectOptions(screen.getByLabelText("Kind"), "s3");
     expect(screen.getByLabelText("Bucket")).toBeInTheDocument();
     expect(screen.getByLabelText("Secret access key")).toHaveAttribute("type", "password");
-    expect(screen.getByText(/S3 pipeline is not available yet/)).toBeInTheDocument();
-    expect(screen.getByText(/501/)).toBeInTheDocument();
+    expect(screen.queryByText(/not available yet/)).toBeNull();
+    expect(screen.queryByText(/501/)).toBeNull();
+    expect(screen.queryByText(/not implemented/)).toBeNull();
+    expect(screen.getByText(/Without access keys the source uses anonymous access/)).toBeInTheDocument();
   });
   it("shows the API error", async () => {
     api.post.mockResolvedValue({ ok: false, status: 409, error: "name already exists" });
