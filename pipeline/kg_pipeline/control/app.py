@@ -31,6 +31,10 @@ def create_app(auth: Authenticator | None = None, engine: Engine | None = None) 
     app.state.engine = engine
     if engine is not None:
         db.create_all(engine)
+        if os.environ.get("DATABASE_URL", "").strip():
+            from .. import sources_registry
+
+            sources_registry.seed_from_env(engine)
 
     @app.exception_handler(StarletteHTTPException)
     async def http_error(_: Request, exc: StarletteHTTPException):
