@@ -107,10 +107,20 @@ def test_env_path_without_database(fakes, monkeypatch):
         run_snapshot("unknown")
 
 
-def test_db_row_without_secret_falls_back_to_env_token(fakes, registry_db, monkeypatch):
+def test_ui_row_without_secret_runs_without_credentials(fakes, registry_db, monkeypatch):
     from sqlalchemy import update
     with registry_db.begin() as conn:
         conn.execute(update(db.sources).values(secret=None))
+    monkeypatch.setenv("GIT_TOKEN", "env-tok")
+    run_snapshot("repo-a")
+    assert ("mirror", "https://git.example.com/org/repo-a.git", None) in fakes.calls
+    assert not any("env-tok" in str(c) for c in fakes.calls)
+
+
+def test_env_row_without_secret_falls_back_to_env_token(fakes, registry_db, monkeypatch):
+    from sqlalchemy import update
+    with registry_db.begin() as conn:
+        conn.execute(update(db.sources).values(secret=None, origin="env"))
     monkeypatch.setenv("GIT_TOKEN", "env-tok")
     run_snapshot("repo-a")
     assert ("mirror", "https://git.example.com/org/repo-a.git", "env-tok") in fakes.calls
@@ -189,8 +199,8 @@ def test_sync_partitions_seeds_database(monkeypatch, tmp_path):
 class FakeAtlassian:
     made = []
 
-    def __init__(self, base_url=None, email=None, token=None, fetch=None, prefix="JIRA"):
-        self.base, self.email, self.token, self.prefix = base_url, email, token, prefix
+    def __init__(self, base_url=None, email=None, token=None, fetch=None, prefix="JIRA", use_env=True):
+        self.base, self.email, self.token, self.prefix, self.use_env = base_url, email, token, prefix, use_env
         FakeAtlassian.made.append(self)
 
 
@@ -214,14 +224,14 @@ def atl(monkeypatch):
     return calls
 
 
-def add_rows(engine, *rows):
+def add_rows(engine, *rows, origin="ui"):
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
     with engine.begin() as conn:
         for i, (kind, name, config, secret, enabled) in enumerate(rows):
             conn.execute(insert(db.sources).values(
                 id=f"src_0000000001{i:02d}", kind=kind, name=name, config=config,
-                secret=secrets.encrypt(secret) if secret else None, schedule=None, enabled=enabled, origin="ui",
+                secret=secrets.encrypt(secret) if secret else None, schedule=None, enabled=enabled, origin=origin,
                 created_at=now, updated_at=now, created_by="t"))
 
 
@@ -254,11 +264,31 @@ def test_no_sources_keeps_skipped_message(atl, registry_db):
     assert atl["jira"] == [] and atl["confluence"] == []
 
 
-def test_row_without_secret_falls_back_to_env_credentials(atl, registry_db):
-    add_rows(registry_db, ("jira", "site1", {"base_url": "https://a.atlassian.net", "projects": ["A"]}, None, True))
+def test_env_row_without_secret_falls_back_to_env_credentials(atl, registry_db):
+    add_rows(registry_db, ("jira", "site1", {"base_url": "https://a.atlassian.net", "projects": ["A"]}, None, True),
+             origin="env")
     d.jira_issues(ctx())
     api = FakeAtlassian.made[0]
     assert api.base == "https://a.atlassian.net" and api.email is None and api.token is None  # real class reads env
+    assert api.use_env is True
+
+
+def test_ui_row_without_secret_gets_no_env_credentials(atl, registry_db):
+    add_rows(registry_db, ("jira", "site1", {"base_url": "https://a.atlassian.net", "projects": ["A"]}, None, True),
+             ("confluence", "wiki", {"base_url": "https://a.atlassian.net", "spaces": ["E"]}, None, True))
+    d.jira_issues(ctx())
+    d.confluence_pages(ctx())
+    assert [a.use_env for a in FakeAtlassian.made] == [False, False]
+
+
+def test_atlassian_without_env_ignores_env_credentials(monkeypatch):
+    monkeypatch.setenv("JIRA_EMAIL", "env@x")
+    monkeypatch.setenv("JIRA_API_TOKEN", "envtk")
+    monkeypatch.setenv("ATLASSIAN_EMAIL", "env@x")
+    monkeypatch.setenv("ATLASSIAN_API_TOKEN", "envtk")
+    from kg_pipeline.sources.atlassian import Atlassian
+    assert Atlassian("https://a.atlassian.net", use_env=False)._auth is None
+    assert Atlassian("https://a.atlassian.net", "e", "t", use_env=False)._auth is not None
 
 
 def test_real_atlassian_env_fallback(monkeypatch):

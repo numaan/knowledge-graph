@@ -131,8 +131,9 @@ unless `KG_CONTROL_ALLOW_PRIVATE=1`.
   writes only differences), the embedding cache or the summary cache. A full run re-reads the source, but it
   does not force a rewrite or a new LLM call for unchanged content.
 - Jira and Confluence sources made in the UI are one per site, each with its own `projects` or `spaces`. Env
-  seed makes one source `jira` and one source `confluence`. A DB row without a secret falls back to the env
-  credentials (`ATLASSIAN_*`, `GIT_TOKEN`).
+  seed makes one source `jira` and one source `confluence`. Only a row with `origin = 'env'` and no
+  secret falls back to the env credentials (`ATLASSIAN_*`, `GIT_TOKEN`). A UI row without a secret runs without
+  credentials, so an admin cannot send the platform tokens to a host of their choice.
 
 ## 7. Web UI (`web/`)
 

@@ -59,7 +59,9 @@ def _repo(name: str) -> tuple[str, str, str | None]:
     for src in sources_registry.get_sources("git"):
         if src.name == name:
             branch = src.config.get("branch") or os.environ.get("GIT_BRANCH", "main")
-            token = sources_registry.get_secret(src).get("token") or os.environ.get("GIT_TOKEN") or None
+            token = sources_registry.get_secret(src).get("token")
+            if not token and src.origin == "env":  # a UI source without a secret runs without credentials
+                token = os.environ.get("GIT_TOKEN") or None
             return src.config["url"], branch, token
     raise dg.Failure("Set GIT_REPOSITORIES (sources.git.repositories in the Helm values).")
 
@@ -153,9 +155,10 @@ def summaries_asset(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
 
 
 def _atlassian(src: sources_registry.Source, prefix: str) -> Atlassian:
-    """Client with the credentials of a registry source. Missing values fall back to the env (prefix_*)."""
+    """Client with the credentials of a registry source. Missing values of an env source fall back to the env (prefix_*)."""
     secret = sources_registry.get_secret(src)
-    return Atlassian(src.config.get("base_url") or None, secret.get("email"), secret.get("api_token"), prefix=prefix)
+    return Atlassian(src.config.get("base_url") or None, secret.get("email"), secret.get("api_token"), prefix=prefix,
+                     use_env=src.origin == "env")
 
 
 def _targets(kind: str, key: str):

@@ -6,7 +6,8 @@ With `DATABASE_URL` unset, `get_sources` returns the sources derived from the en
 
 `seed_from_env` copies those env sources into the database as rows with `origin = 'env'`. Env credentials are stored
 as the encrypted secret only when `KG_SECRET_KEY` is set. Without the key the row has no secret, `get_secret` returns
-`{}` and the asset falls back to the env credentials (`GIT_TOKEN`, `JIRA_EMAIL`, ...).
+`{}` and the asset falls back to the env credentials (`GIT_TOKEN`, `JIRA_EMAIL`, ...). That fallback is only for rows
+with `origin = 'env'`. A UI row (`origin = 'ui'`) without a secret runs without credentials.
 """
 import logging
 import os
@@ -88,7 +89,7 @@ def get_sources(kind: str) -> list[Source]:
 
 
 def get_secret(source: Source) -> dict:
-    """Plain secret values of a source. `{}` when the source has no secret (caller falls back to env)."""
+    """Plain secret values of a source. `{}` when the source has no secret (only an env-origin source falls back to env)."""
     if source.encrypted_secret:
         from .control import secrets
 
