@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -284,6 +285,7 @@ const globalReduceSystem = "You answer a broad question about a software system.
 	"answer the question, say so in one sentence. Write at most 250 words."
 
 func (s *Server) registerGraphRAG(m *mcp.Server) {
+	s.registerLocalSearch(m)
 	mcp.AddTool(m, &mcp.Tool{Name: "global_search", Description: "Answer a broad question about the whole system or a large " +
 		"area (themes, main parts, how areas relate) from community reports of the knowledge graph. Use it when no single " +
 		"symbol or document answers the question. It is for agents that are not coding agents, such as analysis, planning " +
@@ -700,4 +702,239 @@ func (s *Server) expandLocal(ctx context.Context, seeds []string, hops int) (loc
 		frontier = next
 	}
 	return g, nil
+}
+
+// ---- local_search -------------------------------------------------------------------------------------
+
+type LocalSearchIn struct {
+	Question    string   `json:"question,omitempty" jsonschema:"question about an entity or a small area; used to find seeds when none are given"`
+	Seeds       []string `json:"seeds,omitempty" jsonschema:"node ids or exact names to start from (max 5); empty finds seeds from the question"`
+	Hops        int      `json:"hops,omitempty" jsonschema:"relation steps from the seeds, 1-3 (default 2)"`
+	TokenBudget int      `json:"token_budget,omitempty" jsonschema:"output size in tokens (chars / 4), 500-16000 (default 4000)"`
+}
+
+// Every item carries a citation id (E, R, S or C and a number) so an agent can cite it.
+type LocalEntity struct {
+	Cite string `json:"cite"`
+	ID   string `json:"id"`
+	Name string `json:"name,omitempty"`
+	Kind string `json:"kind,omitempty"`
+	Hop  int    `json:"hop"`
+}
+
+type LocalRelation struct {
+	Cite string `json:"cite"`
+	From string `json:"from"`
+	To   string `json:"to"`
+	Type string `json:"type"`
+}
+
+type LocalSnippet struct {
+	Cite   string `json:"cite"`
+	ID     string `json:"id"`
+	Entity string `json:"entity"`
+	Text   string `json:"text"`
+}
+
+type LocalCommunity struct {
+	Cite  string `json:"cite"`
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	Level int    `json:"level"`
+}
+
+type LocalSearchOut struct {
+	Entities    []LocalEntity    `json:"entities"`
+	Relations   []LocalRelation  `json:"relations"`
+	Snippets    []LocalSnippet   `json:"snippets"`
+	Communities []LocalCommunity `json:"communities"`
+	Truncated   bool             `json:"truncated,omitempty"`
+	Omitted     map[string]int   `json:"omitted,omitempty"`
+	Note        string           `json:"note,omitempty"`
+}
+
+const localSnippetPerNode = 2 // chunks read per entity
+
+func (s *Server) registerLocalSearch(m *mcp.Server) {
+	mcp.AddTool(m, &mcp.Tool{Name: "local_search", Description: "Collect the context around one entity or a small area: " +
+		"the neighbours of the seeds (typed relations, up to 3 hops), text snippets of those entities and the titles of the " +
+		"communities they belong to. Use it to understand one named thing in depth. It is for agents that are not coding " +
+		"agents, such as analysis, planning or support agents; coding agents use search_graph and impact_analysis. It needs " +
+		"no LLM. Every item has a citation id. The output is cut to token_budget and the counts of cut items are in omitted."},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in LocalSearchIn) (*mcp.CallToolResult, LocalSearchOut, error) {
+			out, err := s.localSearch(ctx, in)
+			return nil, out, err
+		})
+}
+
+func (s *Server) localSearch(ctx context.Context, in LocalSearchIn) (LocalSearchOut, error) {
+	out := LocalSearchOut{Entities: []LocalEntity{}, Relations: []LocalRelation{}, Snippets: []LocalSnippet{}, Communities: []LocalCommunity{}}
+	if strings.TrimSpace(in.Question) == "" && len(in.Seeds) == 0 {
+		return out, fmt.Errorf("give a question or seeds")
+	}
+	seeds, err := s.localSeeds(ctx, in.Question, in.Seeds)
+	if err != nil {
+		return out, err
+	}
+	if len(seeds) == 0 {
+		out.Note = "No matching entity found. Try other words, or give node ids as seeds (see search_graph)."
+		return out, nil
+	}
+	sub, err := s.expandLocal(ctx, seeds, in.Hops)
+	if err != nil {
+		return out, err
+	}
+	nodeIDs := make([]string, len(sub.Nodes))
+	for i, n := range sub.Nodes {
+		nodeIDs[i] = n.ID
+	}
+	snippets, err := s.localSnippets(ctx, nodeIDs)
+	if err != nil {
+		log.Printf("local_search: snippets: %v", err)
+	}
+	comms, err := s.localCommunities(ctx, nodeIDs)
+	if err != nil {
+		log.Printf("local_search: communities: %v", err)
+	}
+	for i, n := range sub.Nodes {
+		out.Entities = append(out.Entities, LocalEntity{Cite: fmt.Sprintf("E%d", i+1), ID: n.ID, Name: n.Name, Kind: n.Kind, Hop: n.Hop})
+	}
+	for i, r := range sub.Rels {
+		out.Relations = append(out.Relations, LocalRelation{Cite: fmt.Sprintf("R%d", i+1), From: r.From, To: r.To, Type: r.Type})
+	}
+	for i, sn := range snippets {
+		sn.Cite = fmt.Sprintf("S%d", i+1)
+		out.Snippets = append(out.Snippets, sn)
+	}
+	for i, c := range comms {
+		c.Cite = fmt.Sprintf("C%d", i+1)
+		out.Communities = append(out.Communities, c)
+	}
+	out.Truncated = sub.Truncated
+	trimLocal(&out, localTokens(in.TokenBudget)*4)
+	return out, nil
+}
+
+// trimLocal cuts the lists to the budget in characters. Order of priority: entities, relations,
+// communities, snippets. A relation whose entity was cut is dropped too.
+func trimLocal(out *LocalSearchOut, budget int) {
+	size := func(v any) int { b, _ := json.Marshal(v); return len(b) }
+	left := budget - 300 // fixed fields of the envelope
+	omit := map[string]int{}
+	cut := func(name string, dropped int) {
+		if dropped > 0 {
+			omit[name] += dropped
+			out.Truncated = true
+		}
+	}
+	n := len(out.Entities)
+	out.Entities, _ = trimToBudget(out.Entities, left, func(e LocalEntity) int { return size(e) })
+	cut("entities", n-len(out.Entities))
+	kept := map[string]bool{}
+	for _, e := range out.Entities {
+		left -= size(e)
+		kept[e.ID] = true
+	}
+	n = len(out.Relations)
+	both := []LocalRelation{}
+	for _, r := range out.Relations {
+		if kept[r.From] && kept[r.To] {
+			both = append(both, r)
+		}
+	}
+	out.Relations, _ = trimToBudget(both, left, func(r LocalRelation) int { return size(r) })
+	cut("relations", n-len(out.Relations))
+	for _, r := range out.Relations {
+		left -= size(r)
+	}
+	n = len(out.Communities)
+	out.Communities, _ = trimToBudget(out.Communities, left, func(c LocalCommunity) int { return size(c) })
+	cut("communities", n-len(out.Communities))
+	for _, c := range out.Communities {
+		left -= size(c)
+	}
+	n = len(out.Snippets)
+	out.Snippets, _ = trimToBudget(out.Snippets, left, func(sn LocalSnippet) int { return size(sn) })
+	cut("snippets", n-len(out.Snippets))
+	if len(omit) > 0 {
+		out.Omitted = omit
+	}
+}
+
+// localSnippets reads the text of the given nodes, at most localSnippetPerNode chunks each. The ids are
+// the ids of visible nodes only; the text is the masked text when it exists.
+func (s *Server) localSnippets(ctx context.Context, idList []string) ([]LocalSnippet, error) {
+	out := []LocalSnippet{}
+	for i := 0; i < len(idList); i += localBatch {
+		rows, err := s.reader().Read(ctx, `UNWIND $ids AS id MATCH (n) WHERE n.id = id
+			OPTIONAL MATCH (c:Chunk)-[:PART_OF]->(n)
+			WITH n, c ORDER BY c.id
+			WITH n, collect(c)[..`+fmt.Sprint(localSnippetPerNode)+`] AS cs
+			UNWIND (CASE WHEN size(cs) = 0 THEN [null] ELSE cs END) AS c
+			RETURN n.id AS node, coalesce(c.id, n.id) AS id, coalesce(c.text_masked, c.text, n.text_masked, n.text) AS text`,
+			map[string]any{"ids": idList[i:min(i+localBatch, len(idList))]})
+		if err != nil {
+			return out, err
+		}
+		for _, r := range rows {
+			if t := strings.TrimSpace(asString(r["text"])); t != "" {
+				out = append(out, LocalSnippet{ID: asString(r["id"]), Entity: asString(r["node"]), Text: excerpt(t, graphragExcerptChars)})
+			}
+		}
+	}
+	return out, nil
+}
+
+// localCommunities returns the visible community reports of the given nodes: the reports that cover most
+// of the nodes first, then by rank. At most localCommunityCap.
+func (s *Server) localCommunities(ctx context.Context, idList []string) ([]LocalCommunity, error) {
+	count := map[string]int{}
+	byID := map[string]reportRow{}
+	var firstErr error
+	for i := 0; i < len(idList); i += localBatch {
+		rows, err := s.reader().Read(ctx, `UNWIND $ids AS id MATCH (n) WHERE n.id = id
+			MATCH (n)-[:IN_COMMUNITY]->(:Community)<-[:REPORTS_ON]-(r:CommunityReport)
+			RETURN n.id AS node, r.id AS id, r.title AS title, r.summary AS summary, r.rank AS rank, r.level AS level,
+			       r.acl AS acl, r.repo AS repo, r.community_id AS community_id`,
+			map[string]any{"ids": idList[i:min(i+localBatch, len(idList))]})
+		if err != nil {
+			firstErr = err
+			break
+		}
+		for _, row := range rows {
+			r := toReport(row)
+			if _, seen := byID[r.ID]; !seen {
+				if !s.visibleReport(ctx, r) {
+					continue
+				}
+				byID[r.ID] = r
+			}
+			count[r.ID]++
+		}
+	}
+	reps := make([]reportRow, 0, len(byID))
+	for _, r := range byID {
+		reps = append(reps, r)
+	}
+	sort.Slice(reps, func(i, j int) bool {
+		a, b := reps[i], reps[j]
+		if count[a.ID] != count[b.ID] {
+			return count[a.ID] > count[b.ID]
+		}
+		if a.Rank != b.Rank {
+			return a.Rank > b.Rank
+		}
+		if a.Level != b.Level {
+			return a.Level < b.Level
+		}
+		return a.ID < b.ID
+	})
+	if len(reps) > localCommunityCap {
+		reps = reps[:localCommunityCap]
+	}
+	out := make([]LocalCommunity, len(reps))
+	for i, r := range reps {
+		out[i] = LocalCommunity{ID: r.ID, Title: excerpt(r.Title, globalNameChars), Level: r.Level}
+	}
+	return out, firstErr
 }

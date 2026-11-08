@@ -736,3 +736,194 @@ func TestExpandLocalRepoScope(t *testing.T) {
 		t.Fatalf("hidden seed expanded: %v", g)
 	}
 }
+
+// ---- local_search tool ------------------------------------------------------------------------------
+
+// localToolGraph adds snippet and community rows to a local fake. Snippets exist for every node id asked
+// for, so the test shows that the code only asks for visible ids.
+func localToolGraph(nodes []map[string]any, edges [][2]string, reports map[string][]map[string]any) *localFake {
+	lf := newLocalFake(nodes, edges)
+	lf.rules = append([]fakeRule{
+		{"c.text_masked", func(p map[string]any) []map[string]any {
+			out := []map[string]any{}
+			for _, id := range p["ids"].([]string) {
+				out = append(out, map[string]any{"node": id, "id": "chunk:" + id, "text": "text of " + id})
+			}
+			return out
+		}},
+		{"IN_COMMUNITY", func(p map[string]any) []map[string]any {
+			out := []map[string]any{}
+			for _, id := range p["ids"].([]string) {
+				for _, r := range reports[id] {
+					row := map[string]any{"node": id}
+					for k, v := range r {
+						row[k] = v
+					}
+					out = append(out, row)
+				}
+			}
+			return out
+		}},
+	}, lf.rules...)
+	return lf
+}
+
+func localCall(t *testing.T, s *Server, args map[string]any) (LocalSearchOut, string) {
+	t.Helper()
+	res, err := connect(t, newMCPServer(s)).CallTool(callerCtx("*"), &mcp.CallToolParams{Name: "local_search", Arguments: args})
+	if err != nil || res.IsError {
+		t.Fatalf("call: %v %+v", err, res)
+	}
+	b, _ := json.Marshal(res.StructuredContent)
+	var out LocalSearchOut
+	json.Unmarshal(b, &out)
+	return out, string(b)
+}
+
+func TestLocalSearchStructured(t *testing.T) {
+	nodes := []map[string]any{nodeRow("a", nil, ""), nodeRow("b", nil, ""), nodeRow("c", nil, "")}
+	reps := map[string][]map[string]any{"a": {report("report:one", 0, []any{}, "")}, "b": {report("report:one", 0, []any{}, "")}}
+	s := graphragServer(t, localToolGraph(nodes, [][2]string{{"a", "b"}, {"a", "c"}}, reps))
+	out, raw := localCall(t, s, map[string]any{"question": "how?", "seeds": []any{"a"}})
+	if len(out.Entities) != 3 || len(out.Relations) != 2 || len(out.Snippets) != 3 || len(out.Communities) != 1 || out.Truncated {
+		t.Fatalf("lists: %s", raw)
+	}
+	cites := map[string]bool{}
+	var all []string
+	for _, e := range out.Entities {
+		all = append(all, e.Cite)
+	}
+	for _, e := range out.Relations {
+		all = append(all, e.Cite)
+	}
+	for _, e := range out.Snippets {
+		all = append(all, e.Cite)
+	}
+	for _, e := range out.Communities {
+		all = append(all, e.Cite)
+	}
+	for _, c := range all {
+		if c == "" || cites[c] {
+			t.Errorf("citation id %q empty or repeated", c)
+		}
+		cites[c] = true
+	}
+	if out.Communities[0].ID != "report:one" || out.Communities[0].Title != "Title report:one" || out.Snippets[0].Text == "" {
+		t.Errorf("items: %s", raw)
+	}
+	if s.llm != nil {
+		t.Fatal("test server must have no LLM")
+	}
+}
+
+func TestLocalSearchTokenBudget(t *testing.T) {
+	nodes, edges := starNodes(15, 0)
+	s := graphragServer(t, localToolGraph(nodes, edges, nil))
+	full, _ := localCall(t, s, map[string]any{"question": "q", "seeds": []any{"hub"}, "hops": 1, "token_budget": 16000})
+	if full.Truncated || len(full.Entities) != 16 {
+		t.Fatalf("full: truncated %v, %d entities", full.Truncated, len(full.Entities))
+	}
+	out, raw := localCall(t, s, map[string]any{"question": "q", "seeds": []any{"hub"}, "hops": 1, "token_budget": 500})
+	if !out.Truncated || len(out.Omitted) == 0 {
+		t.Fatalf("budget 500: %s", raw)
+	}
+	if len(raw) > 500*4+600 {
+		t.Errorf("output of %d chars is far over the budget", len(raw))
+	}
+	have := map[string]bool{}
+	for _, e := range out.Entities {
+		have[e.ID] = true
+	}
+	for _, r := range out.Relations {
+		if !have[r.From] || !have[r.To] {
+			t.Errorf("relation %v touches an entity that was cut", r)
+		}
+	}
+}
+
+func TestLocalSearchACLLeak(t *testing.T) {
+	const marker = "ZX-LOCAL-4412"
+	secretReport := report("report:secret", 0, []any{"jira:PREC"}, "")
+	secretReport["title"] = "Secret " + marker
+	nodes := []map[string]any{nodeRow("a", nil, ""), nodeRow("b", nil, ""), nodeRow("secret", []any{"jira:PREC"}, "")}
+	nodes[2]["name"] = "name " + marker
+	reps := map[string][]map[string]any{"a": {report("report:pub", 0, []any{}, ""), secretReport}, "b": {secretReport}}
+	lf := localToolGraph(nodes, [][2]string{{"a", "b"}, {"a", "secret"}, {"b", "secret"}}, reps)
+	s := graphragServer(t, lf)
+	out, err := s.localSearch(callerCtx("confluence:ENG"), LocalSearchIn{Question: "q", Seeds: []string{"a"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(out)
+	for _, bad := range []string{"secret", marker, "Secret"} {
+		if strings.Contains(string(b), bad) {
+			t.Errorf("leak of %q in %s", bad, b)
+		}
+	}
+	// no snippet query asks for the hidden node
+	for i, q := range lf.seen {
+		if ids, ok := lf.args[i]["ids"].([]string); ok && strings.Contains(q, "c.text_masked") {
+			for _, id := range ids {
+				if id == "secret" {
+					t.Errorf("snippet query asked for the hidden node")
+				}
+			}
+		}
+	}
+	if len(out.Entities) != 2 || len(out.Relations) != 1 || len(out.Snippets) != 2 || len(out.Communities) != 1 || out.Communities[0].ID != "report:pub" {
+		t.Fatalf("visible output: %s", b)
+	}
+	out, _ = s.localSearch(callerCtx("jira:PREC"), LocalSearchIn{Question: "q", Seeds: []string{"a"}})
+	if len(out.Entities) != 3 || len(out.Relations) != 3 || len(out.Communities) != 2 {
+		t.Errorf("authorised caller: %+v", out)
+	}
+}
+
+func TestLocalSearchCommunityCap(t *testing.T) {
+	var reps []map[string]any
+	for i := 0; i < 8; i++ {
+		reps = append(reps, report(fmt.Sprintf("report:%d", i), 0, []any{}, ""))
+	}
+	s := graphragServer(t, localToolGraph([]map[string]any{nodeRow("a", nil, "")}, nil, map[string][]map[string]any{"a": reps}))
+	out, err := s.localSearch(callerCtx("*"), LocalSearchIn{Seeds: []string{"a"}})
+	if err != nil || len(out.Communities) != localCommunityCap {
+		t.Fatalf("communities: %d %v", len(out.Communities), err)
+	}
+}
+
+func TestLocalSearchNoResult(t *testing.T) {
+	s := graphragServer(t, &fakeGraph{})
+	out, err := s.localSearch(callerCtx("*"), LocalSearchIn{Question: "nothing here"})
+	if err != nil {
+		t.Fatalf("no result must not be an error: %v", err)
+	}
+	if !strings.Contains(out.Note, "No ") || out.Entities == nil || len(out.Entities) != 0 || out.Relations == nil || out.Snippets == nil || out.Communities == nil {
+		t.Errorf("empty: %+v", out)
+	}
+	if _, err = s.localSearch(callerCtx("*"), LocalSearchIn{}); err == nil {
+		t.Error("no question and no seeds must be an error")
+	}
+}
+
+func TestToolsWithoutLLM(t *testing.T) {
+	tools, err := connect(t, newMCPServer(graphragServer(t, &fakeGraph{}))).ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]string{}
+	for _, tool := range tools.Tools {
+		names[tool.Name] = tool.Description
+	}
+	if len(tools.Tools) != 21 {
+		t.Errorf("want 21 tools without an LLM, got %d", len(tools.Tools))
+	}
+	for _, n := range []string{"global_search", "local_search"} {
+		d, ok := names[n]
+		if !ok {
+			t.Errorf("%s not registered", n)
+		}
+		if !strings.Contains(d, "not coding agents") {
+			t.Errorf("%s description: %s", n, d)
+		}
+	}
+}
