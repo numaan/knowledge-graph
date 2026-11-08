@@ -284,3 +284,26 @@ def test_sensor_skips_a_source_with_a_blocked_host(engine, monkeypatch, caplog):
     assert [r.run_key for r in reqs] == [f"src_000000000002:{MINUTE}"]
     assert "internal" in caplog.text and "SSRF guard" in caplog.text
     assert {r.source_name for r in all_runs(engine)} == {"public"}
+
+
+def test_lost_race_with_a_manual_run_skips_only_that_source(engine):
+    from sqlalchemy import event
+    from sqlalchemy.engine import Engine
+    add_source(engine, "src_000000000001", "a")
+    add_source(engine, "src_000000000002", "b")
+    fired = []
+
+    def race(conn, cursor, statement, parameters, context, executemany):
+        # A manual run for "a" commits between the sensor's check and its insert.
+        if statement.startswith("INSERT INTO runs") and "src_000000000001" in parameters and not fired:
+            fired.append(1)
+            cursor.execute("INSERT INTO runs (id, source_id, source_name, kind, status, trigger, mode) VALUES "
+                           "('run_manual000000', 'src_000000000001', 'a', 'git', 'queued', 'manual', 'incremental')")
+
+    event.listen(Engine, "before_cursor_execute", race)
+    try:
+        reqs = due_sources.due_requests(NOW)
+    finally:
+        event.remove(Engine, "before_cursor_execute", race)
+    assert fired
+    assert [r.run_key for r in reqs] == [f"src_000000000002:{MINUTE}"]

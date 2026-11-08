@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 import dagster as dg
 from dagster._utils.schedules import get_next_cron_tick, is_valid_cron_string
 from sqlalchemy import insert, select, update
+from sqlalchemy.exc import IntegrityError
 
 from .control import db, probe
 from .control.dagster_client import ACTIVE, JOB_BY_KIND, launch_tags, map_status  # noqa: F401  (JOB_BY_KIND re-exported)
@@ -59,31 +60,39 @@ def due_requests(now: datetime) -> list[dg.RunRequest]:
     requests: list[dg.RunRequest] = []
     engine = db.get_engine()
     try:
-        with engine.begin() as conn:
+        with engine.connect() as conn:
             rows = conn.execute(select(db.sources).where(
                 db.sources.c.enabled.is_(True), db.sources.c.schedule.is_not(None),
                 db.sources.c.kind.in_(list(JOB_BY_KIND))).order_by(db.sources.c.name)).all()
-            for src in rows:
-                if not cron_is_due(src.schedule, now):
-                    continue
-                if conn.execute(select(db.runs.c.id).where(
-                        db.runs.c.source_id == src.id, db.runs.c.status.in_(ACTIVE))).first():
-                    continue
-                try:
-                    probe.guard_source(src.kind, src.config)
-                except probe.Blocked as e:
-                    log.warning("source %s skipped: %s", src.name, e)
-                    continue
-                run_id = _run_id(src.id, minute)
-                if conn.execute(select(db.runs.c.id).where(db.runs.c.id == run_id)).first():
-                    continue  # already launched in this minute (and finished)
-                conn.execute(insert(db.runs).values(
-                    id=run_id, source_id=src.id, source_name=src.name, kind=src.kind, status="queued",
-                    trigger="schedule", mode="incremental", requested_by="schedule", created_at=now))
-                tags = launch_tags(src.kind, src.name, src.id, run_id, "incremental")
-                requests.append(dg.RunRequest(
-                    run_key=f"{src.id}:{minute}", job_name=JOB_BY_KIND[src.kind],
-                    partition_key=src.name if src.kind == "git" else None, tags=tags))
+        for src in rows:
+            if not cron_is_due(src.schedule, now):
+                continue
+            try:
+                probe.guard_source(src.kind, src.config)
+            except probe.Blocked as e:
+                log.warning("source %s skipped: %s (set KG_CONTROL_ALLOW_PRIVATE=1 or KG_CONTROL_ALLOW_HTTP=1 on the "
+                            "Dagster user code to allow an internal or http host)", src.name, e)
+                continue
+            run_id = _run_id(src.id, minute)
+            try:
+                # One transaction for each source: a lost race with a manual run (unique index on active runs)
+                # skips this source only.
+                with engine.begin() as conn:
+                    if conn.execute(select(db.runs.c.id).where(
+                            db.runs.c.source_id == src.id, db.runs.c.status.in_(ACTIVE))).first():
+                        continue
+                    if conn.execute(select(db.runs.c.id).where(db.runs.c.id == run_id)).first():
+                        continue  # already launched in this minute (and finished)
+                    conn.execute(insert(db.runs).values(
+                        id=run_id, source_id=src.id, source_name=src.name, kind=src.kind, status="queued",
+                        trigger="schedule", mode="incremental", requested_by="schedule", created_at=now))
+            except IntegrityError:
+                log.info("source %s skipped: a run became active first", src.name)
+                continue
+            tags = launch_tags(src.kind, src.name, src.id, run_id, "incremental")
+            requests.append(dg.RunRequest(
+                run_key=f"{src.id}:{minute}", job_name=JOB_BY_KIND[src.kind],
+                partition_key=src.name if src.kind == "git" else None, tags=tags))
     finally:
         engine.dispose()
     return requests
