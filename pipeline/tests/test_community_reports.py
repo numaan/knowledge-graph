@@ -159,3 +159,177 @@ def test_context_is_capped_and_lists_top_members_by_degree():
 def test_extractive_report_of_empty_member_list_is_still_valid():
     report = cr.extractive_report({"id": "community:e:0:q", "level": 0, "acl": []}, [], [], {})
     assert report["title"] and report["summary"] and report["findings"] and 0.0 <= report["rank"] <= 10.0
+
+
+# ---- T11: report generation, budget, cache, fallback, embedding ------------------------------------------------
+
+class World:
+    """Stateful fake graph: communities with members, reports written by the code, embedding hashes."""
+
+    def __init__(self, n=5, marker_at=None):
+        self.communities = {}
+        for i in range(n):
+            cid = f"community:p:0:m{i}"
+            body = f"{MARKER} body" if i == marker_at else f"plain body {i}"
+            self.communities[cid] = {
+                "level": 0, "acl": ["jira:PREC"] if i == marker_at else ["repo:shop"], "hash": f"h{i}",
+                "members": [{"id": f"m{i}", "labels": ["Symbol"], "name": f"Thing{i}", "text_masked": body},
+                            {"id": f"k{i}", "labels": ["Symbol"], "name": f"Other{i}", "text_masked": None}],
+                "edges": [(f"m{i}", f"k{i}", "CALLS")], "summaries": {}}
+        self.reports, self.queries = {}, []
+
+    def _run(self, query, **p):
+        self.queries.append((query, p))
+        ids = p.get("ids", [])
+        sel = {i: self.communities[i] for i in ids if i in self.communities}
+        if "$level" in query:
+            lv = p.get("level")
+            return Result([{"cid": i} for i, c in sorted(self.communities.items()) if lv is None or c["level"] == lv])
+        if "MERGE (r:CommunityReport" in query:
+            for row in p["rows"]:
+                old = self.reports.get(row["id"], {})
+                self.reports[row["id"]] = {**old, **row}
+            return Result([])
+        if "SET n.embedding" in query:
+            for row in p["rows"]:
+                self.reports[row["id"]]["embedding_hash"] = row["hash"]
+            return Result([])
+        if "RETURN r.id AS rid" in query:
+            return Result([{"rid": r["id"], "cid": r["community_id"], "content_hash": r["content_hash"],
+                            "model": r["model"], "embedding_hash": r.get("embedding_hash"), "title": r["title"],
+                            "summary": r["summary"], "findings": r["findings"], "rank": r["rank"],
+                            "acl": r["acl"], "level": r["level"]}
+                           for r in self.reports.values() if r["community_id"] in ids])
+        if query.lstrip().startswith("CREATE"):
+            return Result([])
+        if "SUMMARIZES" in query:
+            return Result([{"cid": i, "mid": m, "text": t} for i, c in sel.items() for m, t in c["summaries"].items()])
+        if "type(r)" in query:
+            return Result([{"cid": i, "src": s, "dst": d, "type": t} for i, c in sel.items() for s, d, t in c["edges"]])
+        if "IN_COMMUNITY" in query:
+            return Result([{"cid": i, "mid": m["id"], "labels": m["labels"], "name": m["name"],
+                            "text_masked": m["text_masked"]} for i, c in sel.items() for m in c["members"]])
+        return Result([{"cid": i, "level": c["level"], "size": len(c["members"]), "acl": c["acl"], "repo": None,
+                        "content_hash": c["hash"]} for i, c in sel.items()])
+
+
+class StubLLM:
+    name = "stub:model"
+
+    def __init__(self, fail=False):
+        self.prompts, self.fail = [], fail
+
+    def json(self, system, user, schema):
+        self.prompts.append(user)
+        if self.fail:
+            raise RuntimeError("llm down")
+        return {"title": "LLM title", "summary": "LLM summary", "findings": ["f1", "f2"], "rank": 42}
+
+
+class StubEmb:
+    model = "stub-emb"
+    dimensions = 8
+
+    def __init__(self):
+        self.texts = []
+
+    def documents(self, texts):
+        self.texts += texts
+        return [[0.1] * self.dimensions for _ in texts]
+
+
+def test_a_no_llm_gives_extractive_report_per_community(monkeypatch):
+    w = World(3)
+    stats = cr.build_reports(w, None, None, budget=10)
+    assert len(w.reports) == 3 and all(r["model"] == "extractive" for r in w.reports.values())
+    assert all(r["title"] and r["summary"] and r["findings"] for r in w.reports.values())
+    assert stats["extractive"] == 3 and stats["llm_calls"] == 0 and stats["written"] == 3
+    monkeypatch.setenv("COMMUNITY_LLM", "off")
+    llm = StubLLM()
+    w2 = World(2)
+    cr.build_reports(w2, llm, None, budget=10)
+    assert llm.prompts == [] and all(r["model"] == "extractive" for r in w2.reports.values())
+
+
+def test_b_llm_only_for_changed_hash_second_run_is_free(tmp_path):
+    w, llm, emb = World(3), StubLLM(), StubEmb()
+    s1 = cr.build_reports(w, llm, emb, budget=10, cache=tmp_path)
+    assert s1["llm_calls"] == 3 and s1["written"] == 3 and s1["embedded"] == 3
+    assert all(r["model"] == "stub:model" and r["rank"] == 10.0 for r in w.reports.values())   # rank clamped
+    s2 = cr.build_reports(w, llm, emb, budget=10, cache=tmp_path)
+    assert len(llm.prompts) == 3 and len(emb.texts) == 3
+    assert s2["llm_calls"] == 0 and s2["embedded"] == 0 and s2["written"] == 0
+    w.communities["community:p:0:m1"]["hash"] = "changed"
+    w.communities["community:p:0:m1"]["members"][0]["name"] = "Renamed1"     # the prompt changes, so no cache hit
+    s3 = cr.build_reports(w, llm, emb, budget=10, cache=tmp_path)
+    assert s3["llm_calls"] == 1 and s3["written"] == 1 and len(llm.prompts) == 4
+    assert s3["embedded"] == 0                                  # same report text, same embedding hash
+
+
+def test_c_budget_then_later_run_replaces_extractive():
+    w, llm = World(5), StubLLM()
+    s1 = cr.build_reports(w, llm, None, budget=2)
+    models = sorted(r["model"] for r in w.reports.values())
+    assert models == ["extractive"] * 3 + ["stub:model"] * 2
+    assert s1["llm_calls"] == 2 and s1["extractive"] == 3 and s1["over_budget"] == 3
+    s2 = cr.build_reports(w, llm, None, budget=1)
+    assert s2["llm_calls"] == 1 and s2["written"] == 1 and s2["over_budget"] == 2
+    assert sorted(r["model"] for r in w.reports.values()).count("extractive") == 2
+
+
+def test_d_llm_failure_falls_back_to_extractive():
+    w, llm = World(2), StubLLM(fail=True)
+    stats = cr.build_reports(w, llm, None, budget=10)
+    assert stats["llm_failed"] == 2 and stats["extractive"] == 2 and stats["llm_calls"] == 0
+    assert all(r["model"] == "extractive" and r["title"] for r in w.reports.values())
+
+
+def test_e_no_prompt_of_another_community_has_the_marker():
+    w, llm = World(4, marker_at=2), StubLLM()
+    cr.build_reports(w, llm, None, budget=10)
+    with_marker = [p for p in llm.prompts if MARKER in p]
+    assert len(with_marker) == 1 and "community:p:0:m2" in with_marker[0]     # sanity: own prompt has it
+    assert len(llm.prompts) == 4
+    for p in llm.prompts:
+        if "community:p:0:m2" not in p:
+            assert MARKER not in p
+    other = [r for r in w.reports.values() if r["community_id"] != "community:p:0:m2"]
+    assert other and all(MARKER not in repr(r) for r in other)
+
+
+def test_f_embedder_called_only_for_changed_text():
+    w, emb = World(3), StubEmb()
+    s1 = cr.build_reports(w, None, emb, budget=0)
+    assert s1["embedded"] == 3 and len(emb.texts) == 3
+    assert any("CREATE VECTOR INDEX community_report_embedding" in q and "8" in q for q, _ in w.queries)
+    cr.build_reports(w, None, emb, budget=0)
+    assert len(emb.texts) == 3
+    w.communities["community:p:0:m0"]["members"][0]["name"] = "Renamed"
+    s3 = cr.build_reports(w, None, emb, budget=0)
+    assert s3["embedded"] == 1 and len(emb.texts) == 4 and "Renamed" in emb.texts[-1]
+
+
+def test_g_report_acl_equals_community_acl_and_links_to_it():
+    w = World(3, marker_at=1)
+    cr.build_reports(w, None, None, budget=0)
+    for cid, c in w.communities.items():
+        rep = w.reports[f"report:{cid}"]
+        assert rep["acl"] == c["acl"] and rep["level"] == c["level"] and rep["community_id"] == cid
+    upserts = [q for q, _ in w.queries if "MERGE (r:CommunityReport" in q]
+    assert upserts and all("REPORTS_ON" in q for q in upserts)
+
+
+def test_level_filter_and_stats_keys():
+    w = World(3)
+    w.communities["community:p:0:m2"]["level"] = 1
+    stats = cr.build_reports(w, None, None, level=0, budget=0)
+    assert len(w.reports) == 2
+    for k in ("llm_calls", "llm_cache_hits", "extractive", "over_budget", "embedded", "written", "llm_failed"):
+        assert k in stats
+
+
+def test_cache_hit_is_free(tmp_path):
+    llm = StubLLM()
+    cr.build_reports(World(2), llm, None, budget=5, cache=tmp_path)
+    s = cr.build_reports(World(2), llm, None, budget=0, cache=tmp_path)    # fresh graph, warm cache
+    assert s["llm_cache_hits"] == 2 and s["llm_calls"] == 0 and len(llm.prompts) == 2
