@@ -461,3 +461,10 @@ def test_create_all_with_duplicate_active_rows_warns_and_skips_index(tmp_path, c
         db.create_all(eng)
     assert "src_1" in caplog.text
     assert db.ACTIVE_RUN_INDEX.name not in {i["name"] for i in inspect(eng).get_indexes("runs")}
+
+
+def test_manual_run_row_has_created_at(client, engine):
+    sid = make(client, GIT)
+    assert client.post(f"/api/v1/sources/{sid}/run", json={}).status_code == 202
+    with engine.connect() as conn:
+        assert conn.execute(select(db.runs.c.created_at)).scalar() is not None

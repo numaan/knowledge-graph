@@ -185,7 +185,8 @@ def make_router() -> APIRouter:
                 run_id = new_id("run")
                 conn.execute(insert(runs).values(
                     id=run_id, source_id=source_id, source_name=src.name, kind=src.kind, status="queued",
-                    trigger="manual", mode=mode, requested_by=user.name))
+                    trigger="manual", mode=mode, requested_by=user.name,
+                    created_at=datetime.now(timezone.utc)))
         except IntegrityError:
             # a racing request inserted its active row first (unique index on the active runs of a source)
             raise HTTPException(409, "source already has an active run") from None

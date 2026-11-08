@@ -7,6 +7,7 @@ validates the expression in the control API, and one function (`cron_is_due`) is
 This module imports no fastapi. It reads the database when called, never at import.
 """
 import hashlib
+import os
 from datetime import datetime, timedelta, timezone
 
 import dagster as dg
@@ -17,6 +18,23 @@ from .control import db
 from .control.dagster_client import ACTIVE, JOB_BY_KIND, launch_tags, map_status  # noqa: F401  (JOB_BY_KIND re-exported)
 
 FINAL = ("succeeded", "failed", "canceled")
+QUEUE_TIMEOUT_S = 600  # a queued row without a Dagster run after this many seconds failed to launch
+LAUNCH_LOST = "launch did not reach Dagster"
+
+
+def _queue_timeout() -> int:
+    try:
+        return int(os.environ.get("KG_CONTROL_QUEUE_TIMEOUT_S", QUEUE_TIMEOUT_S))
+    except ValueError:
+        return QUEUE_TIMEOUT_S
+
+
+def _expired(row, now: datetime) -> bool:
+    """True for a queued row with no Dagster run that is older than the timeout. No `created_at` counts as not expired."""
+    if row.status != "queued" or row.dagster_run_id or row.created_at is None:
+        return False
+    created = row.created_at if row.created_at.tzinfo else row.created_at.replace(tzinfo=timezone.utc)
+    return (now - created).total_seconds() > _queue_timeout()
 
 
 def cron_is_due(cron: str, when: datetime) -> bool:
@@ -53,7 +71,7 @@ def due_requests(now: datetime) -> list[dg.RunRequest]:
                     continue  # already launched in this minute (and finished)
                 conn.execute(insert(db.runs).values(
                     id=run_id, source_id=src.id, source_name=src.name, kind=src.kind, status="queued",
-                    trigger="schedule", mode="incremental", requested_by="schedule"))
+                    trigger="schedule", mode="incremental", requested_by="schedule", created_at=now))
                 tags = launch_tags(src.kind, src.name, src.id, run_id, "incremental")
                 requests.append(dg.RunRequest(
                     run_key=f"{src.id}:{minute}", job_name=JOB_BY_KIND[src.kind],
@@ -86,12 +104,14 @@ def _stats(instance, dagster_run_id: str) -> dict | None:
         return None
 
 
-def sync_runs(instance) -> int:
+def sync_runs(instance, now: datetime | None = None) -> int:
     """Copy the Dagster status of active `runs` rows (found by tag kg/run_id) into the table. Returns rows changed.
 
+    A queued row that has no Dagster run after KG_CONTROL_QUEUE_TIMEOUT_S (default 600) is marked failed.
     This also stores `dagster_run_id` for a run that the sensor requested (the sensor cannot know it earlier).
     """
     changed = 0
+    now = now or datetime.now(timezone.utc)
     engine = db.get_engine()
     try:
         with engine.connect() as conn:
@@ -99,13 +119,18 @@ def sync_runs(instance) -> int:
         for row in active:
             found = instance.get_runs(filters=dg.RunsFilter(tags={"kg/run_id": row.id}), limit=1)
             if not found:
+                if _expired(row, now):
+                    with engine.begin() as conn:
+                        conn.execute(update(db.runs).where(db.runs.c.id == row.id, db.runs.c.status == "queued",
+                                                           db.runs.c.dagster_run_id.is_(None))
+                                     .values(status="failed", error=LAUNCH_LOST, ended_at=now))
+                    changed += 1
                 continue
             status = map_status(found[0].status.value)
             values: dict = {}
             if row.dagster_run_id != found[0].run_id:
                 values["dagster_run_id"] = found[0].run_id
             if status != row.status:
-                now = datetime.now(timezone.utc)
                 values["status"] = status
                 if status != "queued" and row.started_at is None:
                     values["started_at"] = now

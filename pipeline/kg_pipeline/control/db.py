@@ -4,7 +4,7 @@ import os
 import uuid
 
 from sqlalchemy import (JSON, Boolean, Column, DateTime, ForeignKey, Index, MetaData, String, Table, Text, create_engine,
-                        func, inspect, select)
+                        func, inspect, select, text)
 from sqlalchemy.engine import Engine
 
 log = logging.getLogger(__name__)
@@ -41,6 +41,7 @@ runs = Table(
     Column("started_at", DateTime(timezone=True), nullable=True),
     Column("ended_at", DateTime(timezone=True), nullable=True),
     Column("requested_by", String, nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=True),  # NULL for rows from before this column
 )
 
 # At most one active run for each source. The route and the sensor check first; this index closes the race.
@@ -72,9 +73,13 @@ def get_engine(url: str | None = None) -> Engine:
 
 
 def create_all(engine: Engine) -> None:
-    """Idempotent. Also upgrades a database that was created before the active-run index."""
+    """Idempotent. Also upgrades a database that was created before the active-run index and `runs.created_at`."""
     metadata.create_all(engine)
     insp = inspect(engine)
+    if "created_at" not in {c["name"] for c in insp.get_columns("runs")}:
+        coltype = DateTime(timezone=True).compile(dialect=engine.dialect)
+        with engine.begin() as conn:
+            conn.execute(text(f"ALTER TABLE runs ADD COLUMN created_at {coltype}"))
     if ACTIVE_RUN_INDEX.name in {i["name"] for i in insp.get_indexes("runs")}:
         return
     with engine.connect() as conn:

@@ -208,6 +208,52 @@ def test_sync_ignores_unknown_and_final_runs(engine):
     assert {r.id: r.status for r in all_runs(engine)} == {"run_bbbbbbbbbbbb": "succeeded", "run_cccccccccccc": "queued"}
 
 
+# ---- FIX 2: a queued row that never reached Dagster ----
+def add_queued(engine, rid, created_at, dagster_run_id=None):
+    with engine.begin() as conn:
+        conn.execute(insert(db.runs).values(
+            id=rid, source_id=None, source_name="x", kind="git", status="queued", trigger="schedule",
+            mode="incremental", requested_by="schedule", created_at=created_at, dagster_run_id=dagster_run_id))
+
+
+def test_queued_row_without_dagster_run_fails_after_timeout(engine):
+    add_queued(engine, "run_old000000000", NOW - timedelta(minutes=11))
+    add_queued(engine, "run_new000000000", NOW - timedelta(minutes=9))
+    add_queued(engine, "run_null00000000", None)
+    add_queued(engine, "run_withid0000000", NOW - timedelta(hours=1), dagster_run_id="dag-9")
+    assert due_sources.sync_runs(FakeInstance([]), now=NOW) == 1
+    rows = {r.id: r for r in all_runs(engine)}
+    old = rows["run_old000000000"]
+    assert old.status == "failed" and old.error == "launch did not reach Dagster" and old.ended_at is not None
+    assert [rows[k].status for k in ("run_new000000000", "run_null00000000", "run_withid0000000")] == ["queued"] * 3
+
+
+def test_queue_timeout_comes_from_env(engine, monkeypatch):
+    monkeypatch.setenv("KG_CONTROL_QUEUE_TIMEOUT_S", "30")
+    add_queued(engine, "run_old000000000", NOW - timedelta(seconds=31))
+    assert due_sources.sync_runs(FakeInstance([]), now=NOW) == 1
+
+
+def test_expired_source_can_be_scheduled_again(engine):
+    add_source(engine, "src_000000000001", "due")
+    due_sources.due_requests(NOW - timedelta(minutes=20))
+    assert all_runs(engine)[0].created_at is not None
+    assert due_sources.due_requests(NOW) == []  # still blocked by the stuck queued row
+    due_sources.sync_runs(FakeInstance([]), now=NOW)
+    assert len(due_sources.due_requests(NOW)) == 1
+
+
+def test_create_all_adds_created_at_to_an_old_runs_table(tmp_path):
+    from sqlalchemy import inspect, text
+    eng = create_engine(f"sqlite:///{tmp_path / 'old.db'}", future=True)
+    db.create_all(eng)
+    with eng.begin() as conn:
+        conn.execute(text("ALTER TABLE runs DROP COLUMN created_at"))
+    db.create_all(eng)
+    db.create_all(eng)
+    assert "created_at" in {c["name"] for c in inspect(eng).get_columns("runs")}
+
+
 # ---- definitions unchanged ----
 def test_existing_schedules_and_asset_keys_unchanged():
     repo = d.defs.get_repository_def()
