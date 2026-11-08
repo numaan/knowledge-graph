@@ -51,6 +51,7 @@ JIRA_JOB = "jira_job"
 CONFLUENCE_JOB = "confluence_job"
 S3_JOB = "s3_job"
 MODE_TAG = "kg/mode"
+SOURCE_TAG = "kg/source"
 
 
 def _full(context: dg.AssetExecutionContext) -> bool:
@@ -221,9 +222,17 @@ def confluence_pages(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
 def s3_documents(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Documents of each enabled S3 source (bucket + prefix): new and changed objects, and removal of deleted keys."""
     sources = sources_registry.get_sources("s3")
+    # A run of the control API (POST /run, due_sources sensor) carries the tag kg/source: it handles that source only.
+    # The schedule and a manual run have no tag: they handle every enabled source and never force.
+    only = context.run_tags.get(SOURCE_TAG)
+    if only:
+        sources = [s for s in sources if s.name == only]
+        if not sources:
+            raise dg.Failure(f"s3 source '{only}' of this run was not found or is disabled")
     if not sources:
         return dg.MaterializeResult(metadata={"skipped": "no enabled s3 source"})
     out, errors, total = {}, {}, s3.new_stats()
+    force = bool(only) and _full(context)
     with _writer() as w:
         for src in sources:
             try:
@@ -231,10 +240,11 @@ def s3_documents(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
                 # A ui source never uses the platform credentials: without a secret the client is anonymous.
                 secret, ui = sources_registry.get_secret(src), src.origin != "env"
                 client = s3.build_client(src.config, secret, ui_origin=ui)
-                # Mode full is an explicit admin action (the UI asks for a confirmation): it lifts the removal guard.
+                # Mode full of ONE named source is an explicit admin action (the UI asks for a confirmation):
+                # it lifts the removal guard of that source only.
                 out[src.name] = s3.call_with_region_hint(
                     src.config, secret, ui,
-                    lambda c: s3.sync(w, c, src.name, src.config, full=_full(context), force=_full(context)), client)
+                    lambda c: s3.sync(w, c, src.name, src.config, full=_full(context), force=force), client)
             except Exception as e:   # the other sources still run; the asset fails at the end
                 context.log.error("s3 source %s failed: %s: %s", src.name, type(e).__name__, e)
                 errors[src.name] = f"{type(e).__name__}: {e}"
