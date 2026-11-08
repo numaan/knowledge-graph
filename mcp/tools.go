@@ -17,6 +17,8 @@ type Server struct {
 	gov                         // per-user access, audit and write-back; see access.go
 	rerank      *Reranker       // optional cross-encoder after RRF; nil is off (rerank.go)
 	llm         *ChatLLM        // optional chat model for ask; nil turns ask off (ask.go)
+
+	graphOverride graphReader // test seam for the GraphRAG tools; nil uses graph (graphrag.go)
 }
 
 func (s *Server) repo(r string) string {
