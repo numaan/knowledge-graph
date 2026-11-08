@@ -455,6 +455,39 @@ func buildPrompt(q string, items []evidence) (string, []evidence) {
 	return b.String(), kept
 }
 
+// checkCitations removes citation numbers outside 1..n from the text. It returns the cleaned text, the
+// valid cited numbers and the removed numbers, both sorted.
+func checkCitations(text string, n int) (string, []int, []int) {
+	cited := map[int]bool{}
+	invalid := map[int]bool{}
+	text = citeRe.ReplaceAllStringFunc(text, func(m string) string {
+		var ok []string
+		for _, part := range numRe.FindAllString(m, -1) {
+			c, _ := strconv.Atoi(part)
+			if c >= 1 && c <= n {
+				cited[c] = true
+				ok = append(ok, part)
+			} else {
+				invalid[c] = true
+			}
+		}
+		if len(ok) == 0 {
+			return ""
+		}
+		return "[" + strings.Join(ok, ", ") + "]"
+	})
+	var valid, bad []int
+	for c := range cited {
+		valid = append(valid, c)
+	}
+	for c := range invalid {
+		bad = append(bad, c)
+	}
+	sort.Ints(valid)
+	sort.Ints(bad)
+	return strings.TrimSpace(spaceRe.ReplaceAllString(text, "$1")), valid, bad
+}
+
 // answer calls the LLM and validates its citations against the numbered context.
 func answer(ctx context.Context, llm *ChatLLM, q string, route Route, items []evidence) (AskOut, error) {
 	out := AskOut{Route: route, Citations: []Citation{}, ToolsUsed: []string{}}
@@ -468,39 +501,13 @@ func answer(ctx context.Context, llm *ChatLLM, q string, route Route, items []ev
 	if err != nil {
 		return out, err
 	}
-	cited := map[int]bool{}
-	invalid := map[int]bool{}
-	text = citeRe.ReplaceAllStringFunc(text, func(m string) string {
-		var ok []string
-		for _, part := range numRe.FindAllString(m, -1) {
-			n, _ := strconv.Atoi(part)
-			if n >= 1 && n <= len(kept) {
-				cited[n] = true
-				ok = append(ok, part)
-			} else {
-				invalid[n] = true
-			}
-		}
-		if len(ok) == 0 {
-			return ""
-		}
-		return "[" + strings.Join(ok, ", ") + "]"
-	})
-	out.Answer = strings.TrimSpace(spaceRe.ReplaceAllString(text, "$1"))
-	ns := make([]int, 0, len(cited))
-	for n := range cited {
-		ns = append(ns, n)
-	}
-	sort.Ints(ns)
+	var ns []int
+	out.Answer, ns, out.InvalidCitations = checkCitations(text, len(kept))
 	for _, n := range ns {
 		e := kept[n-1]
 		out.Citations = append(out.Citations, Citation{N: n, ID: e.ID, Label: e.Label, Title: e.Title, Path: e.Path,
 			URL: e.URL, Excerpt: cutString(strings.TrimSpace(e.Text), askExcerptChars)})
 	}
-	for n := range invalid {
-		out.InvalidCitations = append(out.InvalidCitations, n)
-	}
-	sort.Ints(out.InvalidCitations)
 	if len(out.InvalidCitations) > 0 {
 		out.Note = fmt.Sprintf("removed %d citation numbers that were not in the context", len(out.InvalidCitations))
 	}

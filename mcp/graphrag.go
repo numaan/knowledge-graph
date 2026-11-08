@@ -2,7 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"log"
+	"strings"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // Shared parts of the GraphRAG tools global_search and local_search: the reader seam, community report
@@ -225,4 +230,169 @@ func excerpt(text string, n int) string {
 		return text
 	}
 	return string(r[:n]) + "…"
+}
+
+// ---- global_search ------------------------------------------------------------------------------
+
+type GlobalSearchIn struct {
+	Question string `json:"question" jsonschema:"broad question about the whole system or a large area, e.g. 'what are the main themes of the payment domain?'"`
+	Level    *int   `json:"level,omitempty" jsonschema:"community level: 0 is the finest, higher levels are broader; empty searches all levels"`
+	TopK     int    `json:"top_k,omitempty" jsonschema:"reports to read, 1-20 (default 8)"`
+}
+
+// GlobalReport is one ranked community report with its visible member entities.
+type GlobalReport struct {
+	ID       string      `json:"id"`
+	Title    string      `json:"title"`
+	Level    int         `json:"level"`
+	Rank     float64     `json:"rank"`
+	Summary  string      `json:"summary"`
+	Entities []memberRef `json:"entities"`
+}
+
+// GlobalCitation points from a citation number in the answer to a report and its visible members.
+type GlobalCitation struct {
+	N        int         `json:"n"`
+	ID       string      `json:"id"`
+	Title    string      `json:"title"`
+	Entities []memberRef `json:"entities"`
+}
+
+type GlobalSearchOut struct {
+	Answer           string           `json:"answer,omitempty"`
+	Reports          []GlobalReport   `json:"reports"`
+	Citations        []GlobalCitation `json:"citations"`
+	InvalidCitations []int            `json:"invalid_citations,omitempty"`
+	Note             string           `json:"note,omitempty"`
+	Truncated        bool             `json:"truncated,omitempty"`
+}
+
+const (
+	globalMembers   = 10  // member entities listed per report
+	globalNameChars = 200 // longest member name in the output
+	globalMapTokens = 300
+	globalRedTokens = 1000
+	globalItemChars = 2500 // one report in a prompt
+)
+
+const globalMapSystem = "You read one community report about a software system. Answer the question with the facts of " +
+	"this report only, in at most 80 words. When the report has nothing relevant, answer exactly NONE."
+
+const globalReduceSystem = "You answer a broad question about a software system. Use only the numbered context items. " +
+	"Each item is a partial answer from one community report. Put the number of the supporting item in square brackets " +
+	"after each claim, for example [2] or [1][3]. Use only numbers that appear in the context. When the context does not " +
+	"answer the question, say so in one sentence. Write at most 250 words."
+
+func (s *Server) registerGraphRAG(m *mcp.Server) {
+	mcp.AddTool(m, &mcp.Tool{Name: "global_search", Description: "Answer a broad question about the whole system or a large " +
+		"area (themes, main parts, how areas relate) from community reports of the knowledge graph. Use it when no single " +
+		"symbol or document answers the question. It is for agents that are not coding agents, such as analysis, planning " +
+		"or support agents; coding agents use search_graph and impact_analysis. It returns ranked reports with member " +
+		"entities and, when an LLM is configured, an answer with numbered citations to the reports."},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in GlobalSearchIn) (*mcp.CallToolResult, GlobalSearchOut, error) {
+			if strings.TrimSpace(in.Question) == "" {
+				return nil, GlobalSearchOut{}, fmt.Errorf("question is empty")
+			}
+			out, err := s.globalSearch(ctx, in)
+			return nil, out, err
+		})
+}
+
+func (s *Server) globalSearch(ctx context.Context, in GlobalSearchIn) (GlobalSearchOut, error) {
+	out := GlobalSearchOut{Reports: []GlobalReport{}, Citations: []GlobalCitation{}}
+	k := clamp(in.TopK, 1, 20, 8)
+	rows, err := s.reportHits(ctx, in.Question, in.Level, k)
+	if err != nil {
+		return out, err
+	}
+	if len(rows) == 0 {
+		out.Answer = "No community report matches this question. Try other words, another level, or search_knowledge."
+		out.Note = "no reports found; no LLM call"
+		return out, nil
+	}
+	members := make([][]memberRef, len(rows))
+	for i, r := range rows {
+		ms, err := s.reportMembers(ctx, r.ID, globalMembers)
+		if err != nil {
+			log.Printf("global_search: members of %s: %v", r.ID, err)
+			ms = []memberRef{}
+		}
+		for j := range ms {
+			ms[j].Name = excerpt(ms[j].Name, globalNameChars)
+		}
+		members[i] = ms
+	}
+	var cited []citeRef
+	if s.llm == nil {
+		out.Note = "no LLM configured; ranked reports only"
+	} else {
+		cited = s.globalReduce(ctx, in.Question, rows, &out)
+	}
+	for i, r := range rows {
+		out.Reports = append(out.Reports, GlobalReport{ID: r.ID, Title: r.Title, Level: r.Level, Rank: r.Rank,
+			Summary: excerpt(r.Summary, graphragExcerptChars), Entities: members[i]})
+	}
+	for _, c := range cited {
+		out.Citations = append(out.Citations, GlobalCitation{N: c.n, ID: rows[c.row].ID, Title: rows[c.row].Title, Entities: members[c.row]})
+	}
+	size := func(v any) int { b, _ := json.Marshal(v); return len(b) }
+	budget := graphragOutputChars - len(out.Answer) - len(out.Note) - 400
+	var cut bool
+	out.Citations, cut = trimToBudget(out.Citations, budget/3, func(c GlobalCitation) int { return size(c) })
+	out.Truncated = cut
+	used := 0
+	for _, c := range out.Citations {
+		used += size(c)
+	}
+	out.Reports, cut = trimToBudget(out.Reports, budget-used, func(r GlobalReport) int { return size(r) })
+	out.Truncated = out.Truncated || cut
+	return out, nil
+}
+
+// citeRef links a citation number of the answer to an index in the report rows.
+type citeRef struct{ n, row int }
+
+// globalReduce runs one map call per report and one reduce call. It fills the answer, the invalid
+// citation numbers and the note, and returns the valid citations. An
+// LLM failure is not an error: the ranked reports still return, with a note.
+func (s *Server) globalReduce(ctx context.Context, q string, rows []reportRow, out *GlobalSearchOut) []citeRef {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Question: %s\n\nContext:\n", q)
+	index := []int{} // context number -> index in rows
+	for i, r := range rows {
+		prompt := fmt.Sprintf("Question: %s\n\nReport: %s\n%s\n%s", q, r.Title, r.Summary, strings.Join(r.Findings, "\n"))
+		part, err := s.llm.Complete(ctx, globalMapSystem, cutString(prompt, globalItemChars), globalMapTokens)
+		if err != nil {
+			log.Printf("global_search: map %s: %v", r.ID, err)
+			out.Note = "an LLM call failed; ranked reports only"
+			return nil
+		}
+		part = strings.TrimSpace(part)
+		if part == "" || strings.EqualFold(strings.Trim(part, ". "), "NONE") {
+			continue
+		}
+		index = append(index, i)
+		fmt.Fprintf(&b, "[%d] %s (id: %s)\n%s\n\n", len(index), r.Title, r.ID, cutString(part, globalItemChars))
+	}
+	if len(index) == 0 {
+		out.Answer = "No community report holds an answer to this question."
+		out.Note = "no report was relevant; the reports below are the closest matches"
+		return nil
+	}
+	text, err := s.llm.Complete(ctx, globalReduceSystem, b.String(), globalRedTokens)
+	if err != nil {
+		log.Printf("global_search: reduce: %v", err)
+		out.Note = "an LLM call failed; ranked reports only"
+		return nil
+	}
+	answer, valid, invalid := checkCitations(text, len(index))
+	out.Answer, out.InvalidCitations = answer, invalid
+	if len(invalid) > 0 {
+		out.Note = fmt.Sprintf("removed %d citation numbers that were not in the context", len(invalid))
+	}
+	cited := make([]citeRef, 0, len(valid))
+	for _, n := range valid {
+		cited = append(cited, citeRef{n, index[n-1]})
+	}
+	return cited
 }

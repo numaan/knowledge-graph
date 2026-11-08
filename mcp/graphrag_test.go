@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -286,4 +289,205 @@ func TestExcerpt(t *testing.T) {
 	if excerpt("short", 400) != "short" {
 		t.Error("short text must stay")
 	}
+}
+
+// ---- global_search ----
+
+// recLLM is a chat endpoint that records every request body and answers by the system prompt.
+type recLLM struct {
+	mu     sync.Mutex
+	bodies []string
+	maps   int
+	reduce int
+}
+
+func newRecLLM(t *testing.T, mapReply, reduceReply string) (*ChatLLM, *recLLM) {
+	t.Helper()
+	rec := &recLLM{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var in struct {
+			Messages []struct{ Role, Content string }
+		}
+		json.Unmarshal(raw, &in)
+		rec.mu.Lock()
+		rec.bodies = append(rec.bodies, string(raw))
+		reply := reduceReply
+		if strings.HasPrefix(in.Messages[0].Content, "You read one community report") {
+			rec.maps++
+			reply = mapReply
+		} else {
+			rec.reduce++
+		}
+		rec.mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"role": "assistant", "content": reply}}}})
+	}))
+	t.Cleanup(srv.Close)
+	return NewChatLLM(srv.URL, "m", ""), rec
+}
+
+func memberRow(id, name string, acl []any) map[string]any {
+	return map[string]any{"id": id, "name": name, "kind": "Ticket", "acl": acl, "repo": "", "report_acl": []any{}, "report_repo": ""}
+}
+
+// globalGraph is a report graph with n public reports r1..rn and the given members for every report.
+func globalGraph(n int, members ...map[string]any) *fakeGraph {
+	var order []string
+	var reps []map[string]any
+	for i := 1; i <= n; i++ {
+		id := fmt.Sprintf("report:r%d", i)
+		order = append(order, id)
+		reps = append(reps, report(id, 0, []any{}, ""))
+	}
+	g := reportGraph(order, nil, reps...)
+	g.rules = append([]fakeRule{{"REPORTS_ON", fixed(members...)}}, g.rules...)
+	return g
+}
+
+func TestGlobalSearchNoLLM(t *testing.T) {
+	g := globalGraph(3, memberRow("m:1", "Member One", []any{}))
+	s := graphragServer(t, g)
+	cs := connect(t, newMCPServer(s)) // registered without an LLM
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "global_search", Arguments: map[string]any{"question": "themes?"}})
+	if err != nil || res.IsError {
+		t.Fatalf("call: %v %+v", err, res)
+	}
+	var out GlobalSearchOut
+	b, _ := json.Marshal(res.StructuredContent)
+	json.Unmarshal(b, &out)
+	if len(out.Reports) != 3 || out.Note == "" || out.Answer != "" || len(out.Citations) != 0 {
+		t.Fatalf("no llm: %s", b)
+	}
+	r := out.Reports[0]
+	if r.ID != "report:r1" || r.Title == "" || r.Summary == "" || len(r.Entities) != 1 || r.Entities[0].ID != "m:1" {
+		t.Errorf("report fields: %+v", r)
+	}
+}
+
+func TestGlobalSearchMapReduce(t *testing.T) {
+	llm, rec := newRecLLM(t, "Partial finding.", "Theme A [1] and theme B [2][9].")
+	g := globalGraph(5, memberRow("m:1", "Member One", []any{}))
+	s := graphragServer(t, g)
+	s.llm = llm
+	out, err := s.globalSearch(callerCtx("*"), GlobalSearchIn{Question: "themes?", TopK: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.maps != 3 || rec.reduce != 1 {
+		t.Fatalf("calls: %d map, %d reduce", rec.maps, rec.reduce)
+	}
+	if len(out.Reports) != 3 || len(out.Citations) != 2 {
+		t.Fatalf("out: %+v", out)
+	}
+	if out.Citations[0].ID != "report:r1" || out.Citations[1].ID != "report:r2" || out.Citations[0].Entities[0].ID != "m:1" {
+		t.Errorf("citations: %+v", out.Citations)
+	}
+	if len(out.InvalidCitations) != 1 || out.InvalidCitations[0] != 9 || strings.Contains(out.Answer, "[9]") || !strings.Contains(out.Answer, "[2]") {
+		t.Errorf("invalid citations: %v answer %q", out.InvalidCitations, out.Answer)
+	}
+}
+
+// A caller without the group must not get the restricted report anywhere: not in the output and not in
+// any prompt sent to the LLM. Members the caller cannot see are absent too.
+func TestGlobalSearchACLLeak(t *testing.T) {
+	const marker = "ZX-MARKER-7731"
+	restricted := report("report:secret", 0, []any{"jira:PREC"}, "")
+	restricted["title"] = "Secret Title " + marker
+	restricted["summary"] = "text with " + marker
+	restricted["findings"] = []any{marker}
+	public := report("report:pub", 0, []any{}, "")
+	g := reportGraph([]string{"report:secret", "report:pub"}, []string{"report:secret", "report:pub"}, restricted, public)
+	g.rules = append([]fakeRule{{"REPORTS_ON", fixed(
+		memberRow("m:visible", "Visible Name", []any{}),
+		memberRow("m:hidden", "HIDDEN-MEMBER-NAME", []any{"jira:PREC"}),
+	)}}, g.rules...)
+	llm, rec := newRecLLM(t, "Partial.", "Answer [1].")
+	s := graphragServer(t, g)
+	s.llm = llm
+	out, err := s.globalSearch(callerCtx("confluence:ENG"), GlobalSearchIn{Question: "themes?"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(out)
+	texts := append([]string{string(b), out.Answer, out.Note}, rec.bodies...)
+	for _, text := range texts {
+		for _, bad := range []string{"report:secret", "Secret Title", marker, "m:hidden", "HIDDEN-MEMBER-NAME"} {
+			if strings.Contains(text, bad) {
+				t.Errorf("leak of %q in %.200s", bad, text)
+			}
+		}
+	}
+	if len(out.Reports) != 1 || out.Reports[0].ID != "report:pub" || len(rec.bodies) == 0 {
+		t.Fatalf("visible output: %s", b)
+	}
+	if len(out.Reports[0].Entities) != 1 || out.Reports[0].Entities[0].ID != "m:visible" {
+		t.Errorf("entities: %+v", out.Reports[0].Entities)
+	}
+	// the caller with the group does see it
+	out, _ = s.globalSearch(callerCtx("jira:PREC"), GlobalSearchIn{Question: "themes?"})
+	if len(out.Reports) != 2 {
+		t.Errorf("authorised caller: %d reports", len(out.Reports))
+	}
+}
+
+func TestGlobalSearchBudget(t *testing.T) {
+	var members []map[string]any
+	for i := 0; i < 10; i++ {
+		members = append(members, memberRow(fmt.Sprintf("m:%d", i), strings.Repeat("n", 500), []any{}))
+	}
+	g := globalGraph(20, members...)
+	s := graphragServer(t, g)
+	out, err := s.globalSearch(callerCtx("*"), GlobalSearchIn{Question: "q", TopK: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(out)
+	if len(b) > graphragOutputChars || !out.Truncated || len(out.Reports) == 0 || len(out.Reports) >= 20 {
+		t.Fatalf("budget: %d chars, truncated %v, %d reports", len(b), out.Truncated, len(out.Reports))
+	}
+	small, _ := s.globalSearch(callerCtx("*"), GlobalSearchIn{Question: "q", TopK: 2})
+	if small.Truncated || len(small.Reports) != 2 {
+		t.Errorf("small output: truncated %v, %d reports", small.Truncated, len(small.Reports))
+	}
+}
+
+func TestGlobalSearchEmpty(t *testing.T) {
+	s := graphragServer(t, &fakeGraph{})
+	out, err := s.globalSearch(callerCtx("*"), GlobalSearchIn{Question: "nothing"})
+	if err != nil {
+		t.Fatalf("empty result must not be an error: %v", err)
+	}
+	if !strings.Contains(out.Answer, "No community report") || len(out.Reports) != 0 || out.Reports == nil {
+		t.Errorf("empty: %+v", out)
+	}
+}
+
+func TestGlobalSearchTopKClamp(t *testing.T) {
+	llm, rec := newRecLLM(t, "Partial.", "Answer [1].")
+	s := graphragServer(t, globalGraph(30))
+	s.llm = llm
+	out, _ := s.globalSearch(callerCtx("*"), GlobalSearchIn{Question: "q", TopK: 50})
+	if len(out.Reports) != 20 || rec.maps != 20 {
+		t.Errorf("top_k 50: %d reports, %d map calls", len(out.Reports), rec.maps)
+	}
+	out, _ = s.globalSearch(callerCtx("*"), GlobalSearchIn{Question: "q"})
+	if len(out.Reports) != 8 {
+		t.Errorf("default top_k: %d", len(out.Reports))
+	}
+}
+
+func TestGlobalSearchDescription(t *testing.T) {
+	tools, err := connect(t, newMCPServer(graphragServer(t, &fakeGraph{}))).ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range tools.Tools {
+		if tool.Name == "global_search" {
+			if !strings.Contains(tool.Description, "not coding agents") {
+				t.Errorf("description: %s", tool.Description)
+			}
+			return
+		}
+	}
+	t.Error("global_search not registered")
 }
