@@ -263,6 +263,8 @@ control:
     webserverUrl: ""     # public Dagster UI URL for links in runs (DAGSTER_WEBSERVER_URL); empty = no link
   # Extra env, e.g. KG_CONTROL_ALLOW_HTTP: "1" (allow http:// source URLs) or KG_CONTROL_ALLOW_PRIVATE: "1"
   # (allow connection tests to private addresses). Both are off by default (SSRF guard).
+  # These two are also written to the ConfigMap <namePrefix>-endpoints, which the Dagster user code reads
+  # (envConfigMaps), so the scheduled sensor uses the same guard settings.
   env: {}
   resources:
     requests: { cpu: 50m, memory: 128Mi }

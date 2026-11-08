@@ -112,7 +112,11 @@ Hosts that resolve to loopback, link-local or metadata addresses are refused for
 unless `KG_CONTROL_ALLOW_PRIVATE=1`. `POST /sources/{id}/run` checks the stored git `url`, Jira/Confluence `base_url`
 and S3 `endpoint` and answers 400 `SSRF guard: ...` (no run row, no launch). The `due_sources` sensor skips such a
 source and logs a warning. Env-origin sources are checked the same way. A cluster-internal Git server needs
-`KG_CONTROL_ALLOW_PRIVATE=1` on the control API and on the Dagster user code.
+`KG_CONTROL_ALLOW_PRIVATE=1` on the control API and on the Dagster user code. In the Helm chart, set
+`control.env.KG_CONTROL_ALLOW_PRIVATE: "1"` (and `KG_CONTROL_ALLOW_HTTP` if needed): the chart writes both values to
+the ConfigMap `<name>-endpoints`, which the user code reads. Restart the user code pod after a change. The sensor
+warning names the variable to set. A ui-origin git source never gets `GIT_TOKEN`, and git does not follow redirects
+for it. DNS rebinding between the guard and the clone stays open for git.
 
 ## 6. Pipeline changes
 

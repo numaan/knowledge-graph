@@ -92,7 +92,7 @@ pod then gets `CONTROL_API_URL=http://<name>-control:8090`.
 | `control.dagster.host` | `""` | Empty: `<release>-dagster-webserver`. |
 | `control.dagster.port` | `""` | Empty: `dagster.dagsterWebserver.service.port`, else `80`. |
 | `control.dagster.webserverUrl` | `""` | Public Dagster UI URL for run links. Empty: no link. |
-| `control.env` | `{}` | Extra env, for example `KG_CONTROL_ALLOW_HTTP: "1"` or `KG_CONTROL_ALLOW_PRIVATE: "1"`. Both are off by default. |
+| `control.env` | `{}` | Extra env, for example `KG_CONTROL_ALLOW_HTTP: "1"` or `KG_CONTROL_ALLOW_PRIVATE: "1"`. Both are off by default. The chart also copies these two variables to the ConfigMap `<name>-endpoints`, so the scheduled sensor in the Dagster user code (which runs the same SSRF guard) reads them too. Restart the user code pod after a change. |
 | `control.resources` | 50m CPU, 128Mi request; 512Mi limit | Pod resources. |
 
 **Warning:** the Fernet key in the Secret `<name>-control` encrypts all source secrets. If you lose or
