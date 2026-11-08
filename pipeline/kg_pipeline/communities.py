@@ -15,6 +15,8 @@ Env: KG_COMMUNITY_RESOLUTION (1.0), KG_COMMUNITY_LEVELS (2, clamp 1 to 4), KG_CO
 KG_COMMUNITY_MAX_NODES (200000), KG_COMMUNITY_MAX_EDGES (2000000), KG_COMMUNITY_BACKEND (auto).
 """
 
+import hashlib
+import json
 import logging
 import os
 from dataclasses import dataclass, field
@@ -178,3 +180,23 @@ def detect(nodes, edges, resolution: float | None = None, levels: int | None = N
         current = {n: coarse[c] for n, c in current.items()}
         result.levels.append(current)
     return result
+
+
+def partition_key(node) -> tuple[str, ...]:
+    """ACL partition of a node: the sorted, deduplicated `acl` list; `("repo:<repo>",)` when there
+    is no acl but a `repo` (code nodes, same group as the MCP `$repos` scope); `()` (public) when
+    neither exists, when acl is empty or when it holds "*". Public and repo: partitions never merge.
+    """
+    acl = node.get("acl")
+    groups = sorted({str(g) for g in acl if g}) if isinstance(acl, (list, tuple, set)) else []
+    if "*" in groups:
+        return ()
+    if groups:
+        return tuple(groups)
+    repo = node.get("repo")
+    return (f"repo:{repo}",) if repo else ()
+
+
+def partition_hash(key: tuple[str, ...]) -> str:
+    """Short stable id of a partition key, used in community ids."""
+    return hashlib.sha256(json.dumps(list(key)).encode()).hexdigest()[:12]

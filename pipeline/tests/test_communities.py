@@ -198,3 +198,39 @@ def test_env_defaults(monkeypatch):
     assert communities.levels_default() == 4
     monkeypatch.setenv("KG_COMMUNITY_LEVELS", "0")
     assert communities.levels_default() == 1
+
+
+from kg_pipeline.communities import partition_hash, partition_key  # noqa: E402
+
+
+@pytest.mark.parametrize("node,key", [
+    ({"acl": ["jira:PREC"]}, ("jira:PREC",)),
+    ({"acl": ["confluence:ENG"]}, ("confluence:ENG",)),
+    ({"acl": ["jira:PREC", "confluence:ENG"]}, ("confluence:ENG", "jira:PREC")),
+    ({"acl": ["jira:PREC", "confluence:ENG", "jira:PREC"]}, ("confluence:ENG", "jira:PREC")),
+    ({"repo": "bookshop"}, ("repo:bookshop",)),
+    ({"repo": "bookshop", "acl": None}, ("repo:bookshop",)),
+    ({"repo": "bookshop", "acl": []}, ("repo:bookshop",)),
+    ({"repo": "bookshop", "acl": ["jira:PREC"]}, ("jira:PREC",)),
+    ({}, ()),
+    ({"repo": None, "acl": []}, ()),
+    ({"repo": ""}, ()),
+    ({"acl": ["*"]}, ()),
+    ({"acl": ["*", "jira:PREC"]}, ()),
+    ({"acl": [], "repo": None}, ()),
+])
+def test_partition_key_table(node, key):
+    assert partition_key(node) == key
+
+
+def test_partition_key_is_tuple_of_str():
+    assert isinstance(partition_key({"acl": ["b", "a"]}), tuple)
+
+
+def test_partition_hash_stable_and_distinct():
+    keys = [(), ("repo:bookshop",), ("repo:other",), ("jira:PREC",), ("confluence:ENG", "jira:PREC")]
+    hashes = [partition_hash(k) for k in keys]
+    assert len(set(hashes)) == len(keys)  # repo: and public partitions never merge
+    assert hashes == [partition_hash(k) for k in keys]
+    assert partition_hash(("a", "b")) != partition_hash(("a,b",))
+    assert all(h and ":" not in h for h in hashes)
