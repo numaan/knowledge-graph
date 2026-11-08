@@ -82,12 +82,12 @@ spec:
               containerPort: {{ $c.port }}
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /api/v1/healthz
               port: http
             periodSeconds: 10
           livenessProbe:
             httpGet:
-              path: /healthz
+              path: /api/v1/healthz
               port: http
             initialDelaySeconds: 10
             periodSeconds: 30

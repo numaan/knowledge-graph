@@ -144,3 +144,22 @@ def test_main_runs_uvicorn_on_8090(monkeypatch):
     m.main()
     assert seen["port"] == 8090 and seen["host"] == "0.0.0.0"
     assert app_mod  # module imported
+
+
+def test_admin_group_is_configurable(monkeypatch):
+    c = client(monkeypatch, KG_CONTROL_ADMIN_GROUP="ops-admins")
+    assert c.get("/api/v1/me", headers=bearer(token(groups=("kg-admins",)))).json()["is_admin"] is False
+    assert c.get("/api/v1/me", headers=bearer(token(groups=("/ops-admins",)))).json()["is_admin"] is True
+    r = c.get("/api/v1/sources", headers=bearer(token(groups=("kg-admins",))))
+    assert r.status_code == 403 and "ops-admins" in r.json()["error"]
+
+
+def test_admin_group_defaults_to_kg_admins(monkeypatch):
+    monkeypatch.delenv("KG_CONTROL_ADMIN_GROUP", raising=False)
+    c = client(monkeypatch)
+    assert c.get("/api/v1/me", headers=bearer(token())).json()["is_admin"] is True
+
+
+def test_empty_admin_group_env_uses_default(monkeypatch):
+    c = client(monkeypatch, KG_CONTROL_ADMIN_GROUP="")
+    assert c.get("/api/v1/me", headers=bearer(token())).json()["is_admin"] is True

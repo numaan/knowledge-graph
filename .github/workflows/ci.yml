@@ -137,7 +137,7 @@ jobs:
           expect 'name: kg-control'
           expect 'port: 8090'
           expect 'containerPort: 8090'
-          expect 'path: /healthz'
+          expect 'path: /api/v1/healthz'
           expect 'name: DATABASE_URL'
           expect 'name: KG_SECRET_KEY'
           expect 'KG_SECRET_KEY: "'

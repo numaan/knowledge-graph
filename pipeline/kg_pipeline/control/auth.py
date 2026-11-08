@@ -1,7 +1,8 @@
 """Keycloak JWT validation (JWKS) and the `kg-admins` group check.
 
 Environment: KG_OIDC_ISSUER (unset = local mode), KG_OIDC_AUDIENCE (checked when set),
-KG_OIDC_GROUPS_CLAIM (default `groups`, dotted paths work), KG_OIDC_JWKS_URL (optional;
+KG_OIDC_GROUPS_CLAIM (default `groups`, dotted paths work), KG_CONTROL_ADMIN_GROUP (default
+`kg-admins`), KG_OIDC_JWKS_URL (optional;
 default `<issuer>/protocol/openid-connect/certs`).
 """
 import os
@@ -22,7 +23,8 @@ class User:
 
 class Authenticator:
     def __init__(self, issuer: str = "", audience: str = "", groups_claim: str = "groups", jwks_url: str = "",
-                 key_resolver: Callable[[str], object] | None = None):
+                 key_resolver: Callable[[str], object] | None = None, admin_group: str = ADMIN_GROUP):
+        self.admin_group = admin_group or ADMIN_GROUP
         self.issuer = issuer.rstrip("/")
         self.audience = audience
         self.groups_claim = groups_claim or "groups"
@@ -34,7 +36,7 @@ class Authenticator:
     def from_env(cls, key_resolver: Callable[[str], object] | None = None) -> "Authenticator":
         return cls(os.environ.get("KG_OIDC_ISSUER", ""), os.environ.get("KG_OIDC_AUDIENCE", ""),
                    os.environ.get("KG_OIDC_GROUPS_CLAIM", "groups"), os.environ.get("KG_OIDC_JWKS_URL", ""),
-                   key_resolver)
+                   key_resolver, os.environ.get("KG_CONTROL_ADMIN_GROUP", "").strip())
 
     @property
     def local(self) -> bool:
@@ -61,7 +63,7 @@ class Authenticator:
         except Exception as e:  # signature, expiry, issuer, audience, JWKS fetch
             raise HTTPException(401, "invalid token") from e
         name = claims.get("preferred_username") or claims.get("email") or claims.get("sub") or "unknown"
-        return User(str(name), ADMIN_GROUP in _groups(claims, self.groups_claim))
+        return User(str(name), self.admin_group in _groups(claims, self.groups_claim))
 
 
 def _groups(claims: dict, path: str) -> list[str]:
@@ -84,7 +86,7 @@ def require_user(request: Request) -> User:
     return request.app.state.auth.authenticate(_bearer(request))
 
 
-def require_admin(user: User = Depends(require_user)) -> User:
+def require_admin(request: Request, user: User = Depends(require_user)) -> User:
     if not user.is_admin:
-        raise HTTPException(403, f"group {ADMIN_GROUP} is required")
+        raise HTTPException(403, f"group {request.app.state.auth.admin_group} is required")
     return user

@@ -11,6 +11,7 @@ see the [guide](GUIDE.md).
 - [6. Incidents](#6-incidents)
 - [7. Maintenance](#7-maintenance)
 - [8. Known limits](#8-known-limits)
+- [9. Admin: sources and runs](#9-admin-sources-and-runs)
 
 ## 1. Components
 
@@ -27,6 +28,7 @@ see the [guide](GUIDE.md).
 | `kg-mcp` | Deployment | 8000 | `/healthz` (checks Neo4j) | none |
 | `kg-reranker` (TEI, optional) | Deployment | 8080 | `/health` | model cache |
 | `kg-web` (optional) | Deployment | 3000 | `/healthz` | none |
+| `kg-control` (optional) | Deployment | 8090 | `/api/v1/healthz` | sources, runs, audit in PostgreSQL (database `knowledge`) |
 | `kg-keycloak` (optional, dev only) | Deployment | 8080 | `/health/ready` | realm `kg` from `files/keycloak/kg-realm.json` |
 | `kg-neo4j-backup` (optional) | CronJob | none | job status | backup files on a PVC or in S3 |
 
@@ -436,3 +438,86 @@ Also delete its `SyncState` cursor: `MATCH (s:SyncState) WHERE s.key STARTS WITH
 | The LLM judge can disagree with a human reviewer | verdicts are evidence, not proof | review `unresolved` and `contradicted` items; tune the evaluation set |
 | Jira and Confluence: Cloud REST APIs only | Data Center is not tested | use the Cloud API or add a client |
 | Neo4j Community has no role-based access | ACL is enforced in `kg-mcp` only | do not give agents direct Neo4j access |
+| Control API (admin UI): no `s3_documents` asset | A source of kind `s3` can be saved and tested, but `run` returns 501 | Use another kind until the asset exists |
+| Control API: no database uniqueness for one active run per source | Two parallel run requests can start two runs | Click Run once; cancel the second run |
+| Control API: a scheduled `runs` row stays `queued` if Dagster never creates the run | The source shows `queued` and the next scheduled run is skipped | Cancel the run in `/admin/runs` |
+| Control API: the S3 connection test is not pinned against DNS rebinding | A changing DNS answer can bypass the SSRF guard | Test only trusted hosts; keep `KG_CONTROL_ALLOW_PRIVATE` off |
+| Control API: run mode `full` does not bypass caches | Unchanged content is not rewritten; embedding and summary caches stay | Delete the embeddings or summaries (see [7.3](#73-change-the-embedding-model)) to force them |
+
+## 9. Admin: sources and runs
+
+The admin UI at `/admin` adds sources and starts runs without a redeploy. The contract is
+[admin.md](streams/admin.md).
+
+### 9.1 Enable
+
+1. Set the values and upgrade:
+
+   ```bash
+   helm upgrade kg deploy/helm/knowledge-graph -n kg -f <profile> -f values-site.yaml \
+     --set web.enabled=true --set control.enabled=true --set control.image=<registry>/kg-pipeline:0.2.4 \
+     --set control.oidc.issuer=https://sso.example.com/realms/kg --set control.oidc.audience=kg-mcp
+   ```
+
+2. Wait for the pod: `kubectl -n kg rollout status deploy/kg-control`.
+3. Restart the code server, so that it reads `DATABASE_URL` and `KG_SECRET_KEY`:
+   `kubectl -n kg rollout restart deploy/kg-dagster-user-deployments-kg-pipeline`.
+4. The control API reads `GIT_REPOSITORIES`, `JIRA_PROJECTS` and `CONFLUENCE_SPACES` and makes source rows
+   with origin `env`. An admin can edit, disable or delete them.
+
+**Caution:** without `control.oidc.issuer` the API has no login. Keep the Service internal then.
+
+### 9.2 Create the first admin
+
+1. Open the Keycloak admin console, realm `kg`.
+2. Go to Users, select the user (or create one), tab Groups > Join group > `kg-admins`.
+3. The user signs out and in again, so that the new token has the group.
+4. The nav shows **Admin**. A user outside the group sees "admin only".
+
+The web client needs a scope that carries the `groups` claim and the audience `control.oidc.audience`.
+The dev realm client `kg-web` has the scope `kg-mcp` for both. For your own identity provider, add the same
+mappers. To use another group name, set `control.oidc.adminGroup`.
+
+### 9.3 Add a source and run
+
+| Step | Action |
+|---|---|
+| 1 | Open `/admin` > **Add source**. |
+| 2 | Select the kind: `git`, `jira`, `confluence` or `s3`. Enter a name (lowercase letters, digits, `-`), the URL (`https://`) and the secret. |
+| 3 | Optional: enter a schedule as 5-field cron in UTC. Empty means manual only. |
+| 4 | Save, then click **Test**. A good test shows `ok`; an error shows the reason. |
+| 5 | Click **Run**. Mode `incremental` is the default; `full` re-reads everything (caches stay). |
+| 6 | Follow the run at `/admin/runs/<id>`. The page polls every 3 s. |
+
+### 9.4 Read a failed run
+
+1. Open `/admin/runs`, filter by status `failed`, open the run.
+2. Read the error and the log tail (200 lines; secrets are masked). Open the Dagster link for the full log.
+3. Find the cause in [6.4](#64-run-fails-in-code_snapshot) or [6.5](#65-run-fails-in-jira_issues-or-confluence_pages).
+4. Fix the source (the secret shows "set"; use Replace to enter a new value) and run again.
+
+| Message | Cause | Fix |
+|---|---|---|
+| `dagster is unreachable` | The control API cannot reach the Dagster webserver | Check `control.dagster.host` and `control.dagster.port` |
+| `source already has an active run` (409) | A run is `queued` or `running` | Wait, or cancel it |
+| `control API cannot start: KG_SECRET_KEY ...` (pod log) | The key is missing or not a Fernet key | Restore the Secret `kg-control` |
+| The test says a guard refused the host | The host is private or loopback | Use a public host, or set `KG_CONTROL_ALLOW_PRIVATE=1` for a trusted network |
+
+### 9.5 Back up
+
+| Data | Where | How |
+|---|---|---|
+| Sources, runs, audit | PostgreSQL, database `knowledge` | Include the database in the PostgreSQL backup |
+| Source secrets | Table `sources`, column `secret`, encrypted with Fernet | Same backup |
+| Fernet key | Secret `kg-control`, key `KG_SECRET_KEY` | `kubectl -n kg get secret kg-control -o jsonpath='{.data.KG_SECRET_KEY}'`; store it in your secret manager |
+
+**Caution:** the database backup is not usable for secrets without the key. If you lose the key, every
+stored secret is unreadable. Enter the secrets again in the UI (Replace). Sources and runs stay.
+
+### 9.6 Rotate credentials
+
+1. For a source made in the UI: open the source, click Replace on the secret, enter the new value, save.
+   The next run uses it. No restart is needed.
+2. For an `env` source with no stored secret: follow [7.4](#74-rotate-credentials).
+3. To change the Fernet key, set the new key in the Secret, restart `kg-control` and the code server, and
+   enter every secret again. There is no rotation tool.

@@ -69,3 +69,32 @@ Replace the Dagster example user code with your pipeline image under
   land on different nodes.
 - Resource requests are sized for about 10 million relationships and are not
   measured. Benchmark and adjust.
+
+## Admin control API (`control.*`)
+
+Off by default. It serves the admin pages of the web UI (see `docs/streams/admin.md`). It runs the
+`kg-pipeline` image and stores sources in the `knowledge` database. Set `web.enabled=true` too: the web
+pod then gets `CONTROL_API_URL=http://<name>-control:8090`.
+
+| Value | Default | Meaning |
+|---|---|---|
+| `control.enabled` | `false` | Render the control Deployment, Service and Secret. |
+| `control.image` | `""` | The `kg-pipeline` image. Required when enabled. |
+| `control.replicas` | `1` | Number of pods. |
+| `control.port` | `8090` | Port of the container and the Service. |
+| `control.secretKey.existingSecret` | `""` | Secret with the Fernet key. Empty: the chart makes `<name>-control` and keeps the key on upgrade. |
+| `control.secretKey.key` | `KG_SECRET_KEY` | Key name in that Secret. |
+| `control.oidc.issuer` | `""` | Keycloak realm URL. Empty: local mode without login. Keep the Service internal then. |
+| `control.oidc.audience` | `""` | The `aud` claim of the token. Empty: not checked. Use `kg-mcp` with the dev realm. |
+| `control.oidc.groupsClaim` | `groups` | Claim that holds the groups. |
+| `control.oidc.adminGroup` | `""` | Sets `KG_CONTROL_ADMIN_GROUP`. Empty: the API uses `kg-admins`. |
+| `control.dagster.host` | `""` | Empty: `<release>-dagster-webserver`. |
+| `control.dagster.port` | `""` | Empty: `dagster.dagsterWebserver.service.port`, else `80`. |
+| `control.dagster.webserverUrl` | `""` | Public Dagster UI URL for run links. Empty: no link. |
+| `control.env` | `{}` | Extra env, for example `KG_CONTROL_ALLOW_HTTP: "1"` or `KG_CONTROL_ALLOW_PRIVATE: "1"`. Both are off by default. |
+| `control.resources` | 50m CPU, 128Mi request; 512Mi limit | Pod resources. |
+
+**Warning:** the Fernet key in the Secret `<name>-control` encrypts all source secrets. If you lose or
+change it, the stored secrets cannot be read and you must enter them again. The Secret has
+`helm.sh/resource-policy: keep`. With `existingSecret`, also change the `KG_SECRET_KEY` env of the Dagster
+user deployment to read that Secret.
