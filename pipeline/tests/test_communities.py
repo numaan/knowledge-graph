@@ -215,8 +215,9 @@ from kg_pipeline.communities import partition_hash, partition_key  # noqa: E402
     ({}, ()),
     ({"repo": None, "acl": []}, ()),
     ({"repo": ""}, ()),
-    ({"acl": ["*"]}, ()),
-    ({"acl": ["*", "jira:PREC"]}, ()),
+    ({"acl": ["*"]}, ("*",)),
+    ({"acl": ["*", "jira:PREC"]}, ("*", "jira:PREC")),
+    ({"repo": "bookshop", "acl": ["*"]}, ("*",)),
     ({"acl": [], "repo": None}, ()),
 ])
 def test_partition_key_table(node, key):
@@ -234,3 +235,107 @@ def test_partition_hash_stable_and_distinct():
     assert hashes == [partition_hash(k) for k in keys]
     assert partition_hash(("a", "b")) != partition_hash(("a,b",))
     assert all(h and ":" not in h for h in hashes)
+
+
+from kg_pipeline.communities import EDGE_WEIGHTS, project  # noqa: E402
+
+
+def _n(id, label, **kw):
+    return {"id": id, "labels": [label], **kw}
+
+
+def _r(src, typ, dst):
+    return {"src": src, "type": typ, "dst": dst}
+
+
+def _graph():
+    nodes = [
+        _n("b:f1", "File", repo="bookshop"), _n("b:s1", "Symbol", repo="bookshop"),
+        _n("o:f1", "File", repo="other"),
+        _n("t1", "Ticket", acl=["jira:PREC"]), _n("t2", "Ticket", acl=["jira:PREC"]),
+        _n("d1", "Document", acl=["confluence:ENG"]),
+        _n("m1", "Document", acl=["jira:PREC", "confluence:ENG"]),
+        _n("c1", "DomainConcept"), _n("c2", "BusinessRule"),
+        _n("k1", "Chunk", acl=["confluence:ENG"]), _n("p1", "Person"), _n("fo", "Folder"),
+        _n("cm", "Commit", repo="bookshop"), _n("cr", "Community"), _n("rp", "CommunityReport"),
+        _n("sm", "Summary", repo="bookshop"),
+    ]
+    rels = [
+        _r("b:f1", "DEFINES", "b:s1"),
+        _r("b:f1", "IMPORTS", "o:f1"),      # crosses repos
+        _r("t1", "CHILD_OF", "t2"),
+        _r("t1", "MENTIONS", "c1"),         # crosses to public
+        _r("d1", "MENTIONS", "m1"),         # crosses acl sets
+        _r("c1", "USES_CONCEPT", "c2"),
+        _r("k1", "PART_OF", "d1"), _r("k1", "MENTIONS", "c1"),
+        _r("p1", "CALLS", "b:f1"), _r("fo", "CONTAINS", "b:f1"), _r("cm", "REFERENCES", "t1"),
+        _r("b:f1", "CALLS", "gone"),
+    ]
+    return nodes, rels
+
+
+def test_project_partitions_have_no_cross_edges_and_cover_every_member_once():
+    nodes, rels = _graph()
+    out = project(nodes, rels, [])
+    seen = [n for ns, _ in out.values() for n in ns]
+    assert sorted(seen) == sorted(["b:f1", "b:s1", "o:f1", "t1", "t2", "d1", "m1", "c1", "c2"])
+    assert len(seen) == len(set(seen))
+    assert set(out) == {("repo:bookshop",), ("repo:other",), ("jira:PREC",), ("confluence:ENG",),
+                        ("confluence:ENG", "jira:PREC"), ()}
+    for key, (ns, edges) in out.items():
+        for u, v, w in edges:
+            assert u in ns and v in ns and u < v and w > 0
+    assert out[("repo:bookshop",)][1] == [("b:f1", "b:s1", EDGE_WEIGHTS["DEFINES"])]
+    assert out[("jira:PREC",)][1] == [("t1", "t2", EDGE_WEIGHTS["CHILD_OF"])]
+    assert out[()][1] == [("c1", "c2", EDGE_WEIGHTS["USES_CONCEPT"])]
+
+
+def test_project_calls_and_reverse_calls_sum_once():
+    nodes = [_n("a", "Symbol", repo="r"), _n("b", "Symbol", repo="r")]
+    out = project(nodes, [_r("a", "CALLS", "b"), _r("b", "CALLS", "a")], [])
+    edges = out[("repo:r",)][1]
+    assert edges == [("a", "b", 2.0)]  # one entry per pair: detect() does not sum it again
+    det = detect(["a", "b"], edges, backend="fallback")
+    assert det.levels[0]["a"] == det.levels[0]["b"]
+    assert communities._clean_edges(set(), edges) == {("a", "b"): 2.0}
+
+
+def test_project_cochange_weights():
+    nodes = [_n("a", "File", repo="r"), _n("b", "File", repo="r"), _n("c", "File", repo="r")]
+    three = [["a", "b"]] * 3
+    assert project(nodes, [], three)[("repo:r",)][1] == [("a", "b", pytest.approx(0.6))]
+    six = [["a", "b", "c"]] * 3 + [["b", "a"]] * 3
+    edges = dict(((u, v), w) for u, v, w in project(nodes, [], six)[("repo:r",)][1])
+    assert edges[("a", "b")] == 1.0
+    assert edges[("a", "c")] == pytest.approx(0.6)
+    # co-change adds to a structural edge of the same pair
+    both = project(nodes, [_r("a", "CALLS", "b")], three)[("repo:r",)][1]
+    assert both == [("a", "b", pytest.approx(1.6))]
+
+
+def test_project_cochange_optional_and_ignores_foreign_ids():
+    nodes = [_n("a", "File", repo="r"), _n("b", "File", repo="s")]
+    assert project(nodes, [], None)[("repo:r",)] == (["a"], [])
+    out = project(nodes, [], [["a", "b", "zzz", "a"]])
+    assert out[("repo:r",)][1] == [] and out[("repo:s",)][1] == []
+
+
+def test_project_chunk_folds_into_owner():
+    nodes = [_n("d", "Document", acl=["x"]), _n("c", "Concept"), _n("k", "Chunk", acl=["x"])]
+    nodes[1]["labels"] = ["DomainConcept"]
+    rels = [_r("k", "PART_OF", "d"), _r("k", "MENTIONS", "c")]
+    out = project(nodes, rels, [])
+    assert out[("x",)] == (["d"], [])  # concept is public: crosses partitions, dropped
+    nodes[1]["acl"] = ["x"]
+    out = project(nodes, rels, [])
+    assert out[("x",)][1] == [("c", "d", EDGE_WEIGHTS["MENTIONS"])]
+
+
+def test_edge_weights_table():
+    assert EDGE_WEIGHTS["CALLS"] == 1.0 and EDGE_WEIGHTS["IMPORTS"] == 0.5
+    assert EDGE_WEIGHTS["DEFINES"] == EDGE_WEIGHTS["CONTAINS"] == 0.3
+    assert EDGE_WEIGHTS["MENTIONS"] == 0.7
+    assert "MODIFIES" not in EDGE_WEIGHTS  # co-change comes from the cochange rows
+    for t in ("CALLS", "IMPORTS", "EXTENDS", "IMPLEMENTS", "OVERRIDES", "USES_TYPE", "DEFINES", "CONTAINS",
+              "REALISES", "IMPLEMENTED_BY", "COVERS", "USES_CONCEPT", "MENTIONS", "PART_OF", "CHILD_OF"):
+        assert t in EDGE_WEIGHTS

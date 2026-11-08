@@ -185,12 +185,12 @@ def detect(nodes, edges, resolution: float | None = None, levels: int | None = N
 def partition_key(node) -> tuple[str, ...]:
     """ACL partition of a node: the sorted, deduplicated `acl` list; `("repo:<repo>",)` when there
     is no acl but a `repo` (code nodes, same group as the MCP `$repos` scope); `()` (public) when
-    neither exists, when acl is empty or when it holds "*". Public and repo: partitions never merge.
+    neither exists or when acl is empty. Public and repo: partitions never merge. "*" is an ordinary
+    group name (fail closed): the Go server (mcp/acl.go allowed()) treats "*" only as a caller group,
+    so a node with "*" in its acl is not public.
     """
     acl = node.get("acl")
     groups = sorted({str(g) for g in acl if g}) if isinstance(acl, (list, tuple, set)) else []
-    if "*" in groups:
-        return ()
     if groups:
         return tuple(groups)
     repo = node.get("repo")
@@ -200,3 +200,69 @@ def partition_key(node) -> tuple[str, ...]:
 def partition_hash(key: tuple[str, ...]) -> str:
     """Short stable id of a partition key, used in community ids."""
     return hashlib.sha256(json.dumps(list(key)).encode()).hexdigest()[:12]
+
+
+# Edge type to weight, the single table of the projection. Types not listed are ignored.
+# Code layer: CALLS 1.0, IMPORTS 0.5, EXTENDS / IMPLEMENTS / OVERRIDES 1.0, USES_TYPE 0.5,
+#   DEFINES / CONTAINS 0.3.
+# Domain layer: REALISES / IMPLEMENTED_BY / COVERS / USES_CONCEPT 1.0.
+# Sources: MENTIONS 0.7, PART_OF / CHILD_OF 0.5 (documents, sections, tickets).
+# MODIFIES is not listed: co-change weight is min(1, n/5) for n commits that touched both files.
+# Edge types such as REFERENCES, LINKS, IN_RELEASE, OWNS or DEPENDS_ON carry no weight in the spec.
+EDGE_WEIGHTS = {
+    "CALLS": 1.0, "IMPORTS": 0.5, "EXTENDS": 1.0, "IMPLEMENTS": 1.0, "OVERRIDES": 1.0, "USES_TYPE": 0.5,
+    "DEFINES": 0.3, "CONTAINS": 0.3,
+    "REALISES": 1.0, "IMPLEMENTED_BY": 1.0, "COVERS": 1.0, "USES_CONCEPT": 1.0,
+    "MENTIONS": 0.7, "PART_OF": 0.5, "CHILD_OF": 0.5,
+}
+COCHANGE_FULL = 5  # shared commits that give the full weight 1.0
+NOT_MEMBERS = frozenset({"Chunk", "Summary", "Folder", "Person", "Community", "CommunityReport", "Commit"})
+
+
+def project(nodes, rel_rows, cochange_rows=None) -> dict:
+    """Project the graph to one undirected weighted graph per ACL partition.
+
+    `nodes`: dicts with `id`, `labels` and optional `acl` / `repo`. `rel_rows`: dicts with `src`,
+    `type`, `dst`. `cochange_rows` (optional): one list of Code ids per commit or pull request.
+    Returns `{partition_key: (sorted member ids, [(u, v, weight)])}`. Each pair appears once with
+    u < v and the summed weight of both directions and of co-change, so `detect()` (which sums
+    repeated pairs) does not count it twice. Self-loops, unknown endpoints and edges between
+    partitions are dropped. Chunk edges fold into the owner of the chunk (its PART_OF target).
+    """
+    labels = {n["id"]: set(n.get("labels") or ()) for n in nodes}
+    members = {n["id"]: partition_key(n) for n in nodes if not labels[n["id"]] & NOT_MEMBERS}
+    owner = {r["src"]: r["dst"] for r in rel_rows
+             if r["type"] == "PART_OF" and "Chunk" in labels.get(r["src"], ())}
+
+    def fold(i):
+        return owner.get(i, i)
+
+    pairs: dict = {}
+
+    def add(a, b, w):
+        if a == b or a not in members or b not in members or members[a] != members[b]:
+            return
+        pair = (a, b) if str(a) <= str(b) else (b, a)
+        pairs[pair] = pairs.get(pair, 0.0) + w
+
+    for r in rel_rows:
+        w = EDGE_WEIGHTS.get(r["type"])
+        if w:
+            add(fold(r["src"]), fold(r["dst"]), w)
+    shared: dict = {}
+    for files in cochange_rows or ():
+        ids = sorted({f for f in files if f in members}, key=str)
+        for i, a in enumerate(ids):
+            for b in ids[i + 1:]:
+                shared[(a, b)] = shared.get((a, b), 0) + 1
+    for (a, b), n in shared.items():
+        add(a, b, min(1.0, n / COCHANGE_FULL))
+
+    out: dict = {}
+    for i, key in members.items():
+        out.setdefault(key, ([], []))[0].append(i)
+    for key, (ids, _) in out.items():
+        ids.sort(key=str)
+    for (a, b), w in sorted(pairs.items(), key=lambda p: (str(p[0][0]), str(p[0][1]))):
+        out[members[a]][1].append((a, b, w))
+    return out
