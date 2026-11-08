@@ -87,8 +87,11 @@ def test_only_enabled_due_source_without_active_run_is_requested(engine):
 
     reqs = due_sources.due_requests(NOW)
 
-    assert [r.run_key for r in reqs] == [f"src_000000000001:{MINUTE}"]
-    req = reqs[0]
+    by_key = {r.run_key: r for r in reqs}
+    assert set(by_key) == {f"src_000000000001:{MINUTE}", f"src_000000000006:{MINUTE}"}
+    s3_req = by_key[f"src_000000000006:{MINUTE}"]
+    assert s3_req.job_name == "s3_job" and s3_req.partition_key is None
+    req = by_key[f"src_000000000001:{MINUTE}"]
     assert req.job_name == "git_job"
     assert req.partition_key == "due"
     rows = {r.source_name: r for r in all_runs(engine)}
@@ -97,14 +100,15 @@ def test_only_enabled_due_source_without_active_run_is_requested(engine):
         "schedule", "queued", "schedule", "incremental", "git")
     assert req.tags == {"kg/source": "due", "kg/source_id": "src_000000000001", "kg/run_id": row.id,
                         "kg/mode": "incremental", "dagster/partition": "due"}
-    assert len(rows) == 2  # busy + due
+    assert len(rows) == 3  # busy + due + docs
 
 
-def test_jira_and_confluence_use_their_jobs_without_partition(engine):
+def test_jira_confluence_and_s3_use_their_jobs_without_partition(engine):
     add_source(engine, "src_000000000001", "jira-main", kind="jira")
     add_source(engine, "src_000000000002", "wiki", kind="confluence")
+    add_source(engine, "src_000000000003", "docs", kind="s3")
     reqs = {r.job_name: r for r in due_sources.due_requests(NOW)}
-    assert set(reqs) == {"jira_job", "confluence_job"}
+    assert set(reqs) == {"jira_job", "confluence_job", "s3_job"}
     for r in reqs.values():
         assert r.partition_key is None
         assert "dagster/partition" not in r.tags

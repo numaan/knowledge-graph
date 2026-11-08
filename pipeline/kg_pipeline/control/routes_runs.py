@@ -175,8 +175,6 @@ def make_router() -> APIRouter:
                 src = repo.get_source(conn, source_id)
                 if src is None:
                     raise HTTPException(404, "source not found")
-                if src.kind not in dagster_client.JOB_BY_KIND:
-                    raise HTTPException(501, "s3_documents asset not available yet")
                 if not src.enabled:
                     raise HTTPException(409, "source is disabled")
                 prober = getattr(request.app.state, "prober", None)
