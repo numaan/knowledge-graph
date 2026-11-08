@@ -20,7 +20,7 @@ class FakeGit:
     def __init__(self):
         self.calls = []
 
-    def mirror(self, url, archive, token=None, env_fallback=True):
+    def mirror(self, url, archive, token=None, env_fallback=True, restricted=False):
         self.calls.append(("mirror", url, token))
         return Path("/mirror")
 
@@ -398,7 +398,7 @@ def test_real_git_ui_source_without_secret_sends_no_authorization(registry_db, m
         conn.execute(update(db.sources).values(secret=None))
     real_git, cmds = _real_run(monkeypatch, tmp_path, "ui", None)
     url, branch, token = d._repo("repo-a")
-    real_git.mirror(url, d.ARCHIVE, token=token, env_fallback=False)
+    real_git.mirror(url, d.ARCHIVE, token=token, env_fallback=False, restricted=True)
     assert cmds and all(not _auth(c) for c in cmds)
     assert not any("env-tok" in str(c) for c in cmds)
 
@@ -406,7 +406,7 @@ def test_real_git_ui_source_without_secret_sends_no_authorization(registry_db, m
 def test_real_git_ui_source_with_own_token_sends_only_that_token(registry_db, monkeypatch, tmp_path):
     real_git, cmds = _real_run(monkeypatch, tmp_path, "ui", None)
     url, branch, token = d._repo("repo-a")
-    real_git.mirror(url, d.ARCHIVE, token=token, env_fallback=False)
+    real_git.mirror(url, d.ARCHIVE, token=token, env_fallback=False, restricted=True)
     assert [_auth(c) for c in cmds] == [["x-access-token:tok-A"]]
 
 
@@ -416,7 +416,7 @@ def test_real_git_env_source_sends_env_token(registry_db, monkeypatch, tmp_path)
         conn.execute(update(db.sources).values(secret=None, origin="env"))
     real_git, cmds = _real_run(monkeypatch, tmp_path, "env", None)
     url, branch, token = d._repo("repo-a")
-    real_git.mirror(url, d.ARCHIVE, token=token, env_fallback=False)
+    real_git.mirror(url, d.ARCHIVE, token=token, env_fallback=False, restricted=True)
     assert [_auth(c) for c in cmds] == [["x-access-token:env-tok"]]
 
 
@@ -446,4 +446,22 @@ def test_service_catalog_mirror_gets_no_env_token_for_ui_source(fakes, registry_
     monkeypatch.setattr(pa.catalog, "sync", lambda w, work, name: {})
     asset = pa.service_catalog_asset(d.repo_partitions, d.code_snapshot, d._RegistryRepos(), "main", Path("/a"))
     asset(dg.build_asset_context(partition_key="repo-a"))
-    assert seen == [{"token": None, "env_fallback": False}]
+    assert seen == [{"token": None, "env_fallback": False, "restricted": True}]
+
+
+def test_real_git_restricted_clone_blocks_redirects_and_other_protocols(registry_db, monkeypatch, tmp_path):
+    from kg_pipeline.sources import git as real_git
+    seen = []
+    monkeypatch.setattr(real_git.subprocess, "run", lambda cmd, **kw: seen.append((cmd, kw.get("env"))) or type("R", (), {"stdout": ""})())
+    real_git.mirror("https://h/x/r.git", tmp_path / "a", env_fallback=False, restricted=True)
+    cmd, env = seen[0]
+    assert "http.followRedirects=false" in cmd
+    assert env["GIT_ALLOW_PROTOCOL"] == "http:https"
+
+
+def test_real_git_unrestricted_clone_keeps_plain_behaviour(monkeypatch, tmp_path):
+    from kg_pipeline.sources import git as real_git
+    seen = []
+    monkeypatch.setattr(real_git.subprocess, "run", lambda cmd, **kw: seen.append((cmd, kw.get("env"))) or type("R", (), {"stdout": ""})())
+    real_git.mirror("ssh://h/x/r.git", tmp_path / "a")
+    assert "http.followRedirects=false" not in seen[0][0] and seen[0][1] is None

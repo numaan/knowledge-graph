@@ -56,13 +56,18 @@ def _full(context: dg.AssetExecutionContext) -> bool:
 
 def _repo(name: str) -> tuple[str, str, str | None]:
     """URL, branch and token of the git source with this name, read from the registry at run time."""
+    return _source(name)[:3]
+
+
+def _source(name: str) -> tuple[str, str, str | None, str]:
+    """Like _repo, with the origin of the source as fourth item."""
     for src in sources_registry.get_sources("git"):
         if src.name == name:
             branch = src.config.get("branch") or os.environ.get("GIT_BRANCH", "main")
             token = sources_registry.get_secret(src).get("token")
             if not token and src.origin == "env":  # a UI source without a secret runs without credentials
                 token = os.environ.get("GIT_TOKEN") or None
-            return src.config["url"], branch, token
+            return src.config["url"], branch, token, src.origin
     raise dg.Failure("Set GIT_REPOSITORIES (sources.git.repositories in the Helm values).")
 
 
@@ -74,7 +79,8 @@ class _RegistryRepos:
 
     def mirror_kwargs(self, name: str) -> dict:
         """Credential for git.mirror. _repo already applied the env rule, so git must not add GIT_TOKEN itself."""
-        return {"token": _repo(name)[2], "env_fallback": False}
+        _, _, token, origin = _source(name)
+        return {"token": token, "env_fallback": False, "restricted": origin != "env"}
 
 
 @contextmanager
@@ -90,8 +96,8 @@ def _writer():
 def code_snapshot(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Code layer of one repository (files, symbols, imports, calls, chunks, ODM). Writes only changes."""
     name = context.partition_key
-    url, branch, token = _repo(name)
-    mirror_path = git.mirror(url, ARCHIVE, token=token, env_fallback=False)
+    url, branch, token, origin = _source(name)
+    mirror_path = git.mirror(url, ARCHIVE, token=token, env_fallback=False, restricted=origin != "env")
     sha = git.head(mirror_path, branch)
     # Mode full: no SCIP cache, so every folder is indexed again. write_delta compares content hashes and still
     # writes only the differences.
@@ -119,9 +125,10 @@ def code_snapshot(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
 def git_history(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Commits since the last run, the files and symbols they changed, and the tickets they name."""
     name = context.partition_key
-    url, _, token = _repo(name)
+    url, _, token, origin = _source(name)
     with _writer() as w:
-        stats = history.sync(w, git.mirror(url, ARCHIVE, token=token, env_fallback=False), name, full=_full(context))
+        mirror_path = git.mirror(url, ARCHIVE, token=token, env_fallback=False, restricted=origin != "env")
+        stats = history.sync(w, mirror_path, name, full=_full(context))
     return dg.MaterializeResult(metadata={k: v for k, v in stats.items() if isinstance(v, int)})
 
 
