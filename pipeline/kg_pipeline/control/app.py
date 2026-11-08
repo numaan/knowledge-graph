@@ -8,7 +8,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from sqlalchemy.engine import Engine
 
-from . import db, routes_sources, secrets
+from . import db, routes_runs, routes_sources, secrets
 from .auth import Authenticator, User, require_user
 
 
@@ -54,6 +54,7 @@ def create_app(auth: Authenticator | None = None, engine: Engine | None = None) 
 
     if engine is not None:
         api.include_router(routes_sources.make_router())
+        api.include_router(routes_runs.make_router())
 
     app.include_router(api)
     return app

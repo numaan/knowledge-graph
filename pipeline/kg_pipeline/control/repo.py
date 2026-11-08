@@ -1,4 +1,6 @@
 """Queries and serializers for sources and runs. Serializers never return the secret."""
+import os
+
 from sqlalchemy import select, update
 from sqlalchemy.engine import Connection
 
@@ -10,11 +12,17 @@ def _iso(value):
     return value.isoformat() if value else None
 
 
+def dagster_url(dagster_run_id: str | None) -> str | None:
+    """Link to the run in the Dagster UI. Null when DAGSTER_WEBSERVER_URL is unset."""
+    base = os.environ.get("DAGSTER_WEBSERVER_URL", "").strip().rstrip("/")
+    return f"{base}/runs/{dagster_run_id}" if base and dagster_run_id else None
+
+
 def serialize_run(row) -> dict:
     return {
         "id": row.id, "source_id": row.source_id, "source_name": row.source_name, "kind": row.kind,
         "status": row.status, "trigger": row.trigger, "mode": row.mode, "dagster_run_id": row.dagster_run_id,
-        "dagster_url": None, "stats": row.stats, "error": row.error,
+        "dagster_url": dagster_url(row.dagster_run_id), "stats": row.stats, "error": row.error,
         "started_at": _iso(row.started_at), "ended_at": _iso(row.ended_at), "requested_by": row.requested_by,
     }
 
