@@ -426,3 +426,23 @@ def load_partitions(w) -> tuple[dict, dict]:
     partitions = project(kept_nodes, rows, cochange)
     stats["partitions"] = len(partitions)
     return partitions, stats
+
+
+# --- schema -----------------------------------------------------------------------------------------
+
+SCHEMA_STATEMENTS = (
+    "CREATE CONSTRAINT community_id IF NOT EXISTS FOR (n:Community) REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT community_report_id IF NOT EXISTS FOR (n:CommunityReport) REQUIRE n.id IS UNIQUE",
+    "CREATE FULLTEXT INDEX community_report_text IF NOT EXISTS FOR (n:CommunityReport) "
+    "ON EACH [n.title, n.summary]",
+)
+
+
+def ensure_schema(w, dimensions: int | None) -> None:
+    """Create the constraints and indexes of communities. Idempotent. No vector index without dimensions."""
+    for statement in SCHEMA_STATEMENTS:
+        w._run(statement)
+    if dimensions:
+        w._run("CREATE VECTOR INDEX community_report_embedding IF NOT EXISTS FOR (n:CommunityReport) "
+               f"ON n.embedding OPTIONS {{indexConfig: {{`vector.dimensions`: {int(dimensions)}, "
+               "`vector.similarity_function`: 'cosine'}}}")

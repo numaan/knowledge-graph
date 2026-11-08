@@ -518,3 +518,59 @@ def test_reuse_never_takes_the_own_id_of_another_new_community():
     new = {"community:p:0:m1": ["m1", "m2", "m3", "m4"], "community:p:0:m2": ["m2", "z"]}
     out = reuse_ids(new, old)
     assert out == {"community:p:0:m1": "community:p:0:m1", "community:p:0:m2": "community:p:0:m2"}
+
+
+# ---- T8: schema ----
+import os  # noqa: E402
+
+from kg_pipeline.communities import SCHEMA_STATEMENTS, ensure_schema  # noqa: E402
+
+
+class _SchemaWriter:
+    def __init__(self):
+        self.sent = []
+
+    def _run(self, query, **params):
+        self.sent.append(query)
+
+
+def test_ensure_schema_statements():
+    w = _SchemaWriter()
+    ensure_schema(w, 256)
+    assert w.sent and all("IF NOT EXISTS" in q for q in w.sent)
+    text = "\n".join(w.sent)
+    for label, name in (("Community", "community_id"), ("CommunityReport", "community_report_id")):
+        assert f"CREATE CONSTRAINT {name} IF NOT EXISTS FOR (n:{label}) REQUIRE n.id IS UNIQUE" in text
+    vector = next(q for q in w.sent if q.startswith("CREATE VECTOR INDEX community_report_embedding"))
+    assert "FOR (n:CommunityReport) ON n.embedding" in vector
+    assert "`vector.dimensions`: 256" in vector and "'cosine'" in vector
+    assert ("CREATE FULLTEXT INDEX community_report_text IF NOT EXISTS FOR (n:CommunityReport) "
+            "ON EACH [n.title, n.summary]") in text
+
+
+def test_ensure_schema_is_idempotent_and_skips_vector_without_dimensions():
+    a, b, c = _SchemaWriter(), _SchemaWriter(), _SchemaWriter()
+    ensure_schema(a, 256)
+    ensure_schema(b, 256)
+    assert a.sent == b.sent
+    ensure_schema(c, None)
+    assert len(c.sent) == len(a.sent) - 1
+    assert not any("VECTOR" in q for q in c.sent)
+    assert len(SCHEMA_STATEMENTS) == len(c.sent)
+
+
+@pytest.mark.skipif(not os.environ.get("NEO4J_PASSWORD"), reason="NEO4J_PASSWORD not set")
+def test_ensure_schema_live():
+    from kg_pipeline.graph.neo4j_writer import Neo4jWriter
+    with Neo4jWriter(os.environ.get("NEO4J_URI", "bolt://localhost:7687"), os.environ.get("NEO4J_USER", "neo4j"),
+                     os.environ["NEO4J_PASSWORD"]) as w:
+        ensure_schema(w, 8)
+        ensure_schema(w, 8)
+        w._run("CALL db.awaitIndexes(60)")
+        idx = {r["name"]: r["state"] for r in w._run("SHOW INDEXES YIELD name, state RETURN name, state").records}
+        assert idx["community_report_embedding"] == "ONLINE" and idx["community_report_text"] == "ONLINE"
+        cons = {r["name"] for r in w._run("SHOW CONSTRAINTS YIELD name RETURN name").records}
+        assert {"community_id", "community_report_id"} <= cons
+        w._run("CALL db.index.vector.queryNodes('community_report_embedding', 1, $v) YIELD node RETURN node",
+               v=[0.0] * 8)
+        w._run("CALL db.index.fulltext.queryNodes('community_report_text', 'x') YIELD node RETURN node")
