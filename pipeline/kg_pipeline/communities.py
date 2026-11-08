@@ -476,6 +476,25 @@ def load_existing(w) -> dict:
     return out
 
 
+_HASHES_Q = """
+MATCH (s:Summary)-[:SUMMARIZES]->(m) WHERE m.id > $after AND s.content_hash IS NOT NULL
+WITH m.id AS id, collect(s.content_hash) AS hashes
+ORDER BY id LIMIT $limit
+RETURN id, hashes"""
+
+
+def load_member_hashes(w) -> dict:
+    """`{member id: hash}` of the summaries of each node (Summary.content_hash via SUMMARIZES, keyset paged).
+    A node with several summaries gets one hash over the sorted list, so any change shows in the community hash."""
+    out: dict = {}
+    for page in _pages(w, _HASHES_Q, PAGE):
+        for r in page:
+            hs = sorted(str(h) for h in r["hashes"] or [] if h)
+            if hs:
+                out[r["id"]] = hs[0] if len(hs) == 1 else hashlib.sha256(json.dumps(hs).encode()).hexdigest()[:20]
+    return out
+
+
 def _source_of(key: tuple[str, ...]) -> str | None:
     """Source systems of a document partition: the prefixes of its acl groups (`jira:PREC` -> `jira`)."""
     if not key or (len(key) == 1 and key[0].startswith("repo:")):
@@ -606,7 +625,8 @@ def build_communities(w, resolution: float | None = None, levels: int | None = N
     partitions, load_stats = load_partitions(w)
     if not dry_run:
         ensure_schema(w, None)
-    rows, stats = build(partitions, load_existing(w), resolution, levels, seed, backend)
+    rows, stats = build(partitions, load_existing(w), resolution, levels, seed, backend,
+                        member_hashes=load_member_hashes(w))
     stats["skipped_too_large"] += load_stats.get("skipped_too_large", 0)
     for k in ("nodes", "edges"):
         if k in load_stats:

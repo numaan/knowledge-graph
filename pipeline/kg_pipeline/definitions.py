@@ -8,6 +8,9 @@ Environment (set by the Helm chart): GIT_REPOSITORIES, GIT_BRANCH, GIT_TOKEN, SO
 NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, LLM_PROVIDER, LLM_BASE_URL, LLM_MODEL, EMBEDDINGS_URL,
 EMBEDDINGS_MODEL, EMBEDDINGS_DIMENSIONS. Set DOMAIN_LLM=off to extract roles and entities only.
 Summaries: SUMMARY_LLM=off (extractive only), SUMMARY_BUDGET. Freshness: FRESHNESS_LLM=on, FRESHNESS_LLM_BUDGET.
+Communities (asset communities, then community_reports; job graphrag_job, schedule graphrag_daily, stopped by default):
+COMMUNITY_LLM=off (extractive reports only), COMMUNITY_BUDGET (LLM calls per run), KG_COMMUNITY_* (resolution,
+levels, seed, max nodes and edges, backend; see communities.py).
 Jira: JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECTS (comma-separated keys).
 Confluence: CONFLUENCE_BASE_URL, CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN, CONFLUENCE_SPACES.
 S3 (MinIO, AWS, ...): sources in the registry only (bucket, prefix, include, endpoint; secret = access_key_id and
@@ -22,6 +25,8 @@ from pathlib import Path
 
 import dagster as dg
 
+from . import communities as comm
+from . import community_reports as creports
 from . import corrections, due_sources as due, freshness, sources_registry, summaries
 from .code import links
 from .code.ingest import build_graph
@@ -275,6 +280,29 @@ def doc_freshness(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     return dg.MaterializeResult(metadata={k: v for k, v in stats.items() if isinstance(v, int)})
 
 
+@dg.asset(kinds={"neo4j"}, group_name="knowledge")
+def communities(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
+    """Leiden communities per ACL partition over the whole graph (not per repository). Writes only changes."""
+    with _writer() as w:
+        stats = comm.build_communities(w)
+    context.log.info("community stats: %s", stats)
+    return dg.MaterializeResult(metadata={
+        **{k: v for k, v in stats.items() if isinstance(v, int)},
+        "communities_by_level": dg.MetadataValue.json(stats.get("communities_by_level", {}))})
+
+
+@dg.asset(deps=[communities], kinds={"neo4j"}, group_name="knowledge")
+def community_reports(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
+    """Report of each community; only changed ones are written, LLM calls stay within COMMUNITY_BUDGET."""
+    llm = None if os.environ.get("COMMUNITY_LLM", "").strip().lower() == "off" else LLM()
+    budget = os.environ.get("COMMUNITY_BUDGET", "").strip()
+    with _writer() as w:
+        stats = creports.build_reports(w, llm=llm, emb=Embedder(), budget=int(budget) if budget else None,
+                                       cache=ARCHIVE / "cache" / "llm")
+    context.log.info("community report stats: %s", stats)
+    return dg.MaterializeResult(metadata={k: v for k, v in stats.items() if isinstance(v, int)})
+
+
 service_catalog = service_catalog_asset(repo_partitions, code_snapshot, _RegistryRepos(), BRANCH, ARCHIVE)
 people = people_asset([git_history, jira_issues, confluence_pages, github_prs, service_catalog])
 
@@ -319,6 +347,12 @@ confluence_job = dg.define_asset_job(CONFLUENCE_JOB, selection=[confluence_pages
 s3_job = dg.define_asset_job(S3_JOB, selection=[s3_documents, source_vectors])
 
 
+GRAPHRAG_JOB = "graphrag_job"
+graphrag_job = dg.define_asset_job(GRAPHRAG_JOB, selection=[communities, community_reports])
+graphrag_daily = dg.ScheduleDefinition(name="graphrag_daily", job=graphrag_job, cron_schedule="30 3 * * *",
+                                       default_status=dg.DefaultScheduleStatus.STOPPED)
+
+
 def sync_partitions(instance: dg.DagsterInstance) -> list[str]:
     """Seed the env sources into the registry (database mode) and add a partition for every git source.
 
@@ -357,5 +391,6 @@ def due_sources(context: dg.SensorEvaluationContext):
 
 from .trust_assets import TRUST, daily_reconcile  # noqa: E402  data trust: deletes, moves, duplicates
 
-defs = dg.Definitions(assets=CODE + SOURCES + TRUST, schedules=[hourly_code, sources_every_15_min, daily_reconcile],
-                      jobs=[git_job, jira_job, confluence_job, s3_job], sensors=[registry_partitions, due_sources])
+defs = dg.Definitions(assets=CODE + SOURCES + TRUST + [communities, community_reports],
+                      schedules=[hourly_code, sources_every_15_min, daily_reconcile, graphrag_daily],
+                      jobs=[git_job, jira_job, confluence_job, s3_job, graphrag_job], sensors=[registry_partitions, due_sources])
