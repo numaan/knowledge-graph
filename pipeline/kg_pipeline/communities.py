@@ -36,6 +36,7 @@ Env: KG_COMMUNITY_RESOLUTION (1.0), KG_COMMUNITY_LEVELS (2, clamp 1 to 4), KG_CO
 KG_COMMUNITY_MAX_NODES (200000), KG_COMMUNITY_MAX_EDGES (2000000), KG_COMMUNITY_BACKEND (auto).
 """
 
+import datetime as _dt
 import hashlib
 import json
 import logging
@@ -446,3 +447,170 @@ def ensure_schema(w, dimensions: int | None) -> None:
         w._run("CREATE VECTOR INDEX community_report_embedding IF NOT EXISTS FOR (n:CommunityReport) "
                f"ON n.embedding OPTIONS {{indexConfig: {{`vector.dimensions`: {int(dimensions)}, "
                "`vector.similarity_function`: 'cosine'}}}")
+
+
+# --- build and write ----------------------------------------------------------------------------------
+
+PROMPT_VERSION = "community-v1"  # part of the community content hash; T10 reports use the same value
+EXISTING_PAGE = 1000  # communities per page of load_existing
+WRITE_ROWS = 200  # community rows per write query
+WRITE_PAIRS = 5000  # relationship pairs per write query
+
+_EXISTING_Q = """
+MATCH (c:Community) WHERE c.id > $after
+WITH c ORDER BY c.id LIMIT $limit
+OPTIONAL MATCH (m)-[:IN_COMMUNITY]->(c)
+WITH c, collect(m.id) AS members
+OPTIONAL MATCH (c)-[:CHILD_OF]->(p:Community)
+RETURN c.id AS id, c.level AS level, c.content_hash AS content_hash, c.updated_at AS updated_at,
+       p.id AS parent, members ORDER BY id"""
+
+
+def load_existing(w) -> dict:
+    """Communities in the graph: `{id: {level, content_hash, updated_at, parent, members}}` (keyset paged)."""
+    out: dict = {}
+    for page in _pages(w, _EXISTING_Q, EXISTING_PAGE):
+        for r in page:
+            out[r["id"]] = {"level": r["level"], "content_hash": r["content_hash"], "updated_at": r["updated_at"],
+                            "parent": r["parent"], "members": sorted(r["members"] or [], key=str)}
+    return out
+
+
+def _source_of(key: tuple[str, ...]) -> str | None:
+    """Source systems of a document partition: the prefixes of its acl groups (`jira:PREC` -> `jira`)."""
+    if not key or (len(key) == 1 and key[0].startswith("repo:")):
+        return None
+    return ",".join(sorted({g.split(":", 1)[0] for g in key})) or None
+
+
+def build(partitions: dict, existing: dict, resolution: float | None = None, levels: int | None = None,
+          seed: int | None = None, backend: str | None = None, member_hashes: dict | None = None,
+          prompt_version: str = PROMPT_VERSION) -> tuple[list[dict], dict]:
+    """Detect communities per partition and compare them with `existing` (see `load_existing`).
+
+    Returns `(rows, stats)`. Each row has `id, level, size, members, parent, acl, repo, source, content_hash,
+    status`. `status` is `new`, `changed` (hash, level or parent differs), `unchanged`, or `stale` (an
+    existing id that no new community carries; the row only has `id`). Detection runs inside one ACL
+    partition, so a community never mixes ACL sets, and `acl` is the partition key. Old ids are reused
+    through `reuse_ids`.
+    """
+    rows: list[dict] = []
+    skipped = 0
+    by_level: dict = {}
+    kept = 0
+    for key, (ids, edges) in sorted(partitions.items()):
+        det = detect(ids, edges, resolution=resolution, levels=levels, seed=seed, backend=backend)
+        if det.skipped_too_large:
+            skipped += 1
+            continue
+        kept += 1
+        phash = partition_hash(key)
+        part_rows: list[dict] = []
+        label_to_id: list[dict] = []
+        for level, assign in enumerate(det.levels):
+            groups: dict = {}
+            for node, label in assign.items():
+                groups.setdefault(label, []).append(node)
+            label_to_id.append({label: community_id(phash, level, m) for label, m in groups.items()})
+            for label, m in groups.items():
+                m = sorted(m, key=str)
+                part_rows.append({
+                    "id": label_to_id[level][label], "level": level, "size": len(m), "members": m, "label": label,
+                    "acl": list(key), "repo": key[0][5:] if len(key) == 1 and key[0].startswith("repo:") else None,
+                    "source": _source_of(key), "partition": phash,
+                    "content_hash": content_hash(m, member_hashes, prompt_version)})
+        for r in part_rows:
+            nxt = det.child_of[r["level"]].get(r["label"]) if r["level"] < len(det.child_of) else None
+            r["parent"] = label_to_id[r["level"] + 1][nxt] if nxt is not None else None
+        rows += part_rows
+
+    old_members = {i: e["members"] for i, e in existing.items()}
+    final = reuse_ids({r["id"]: r["members"] for r in rows}, old_members)
+    for r in rows:
+        r["id"] = final[r["id"]]
+    for r in rows:
+        if r["parent"] is not None:
+            r["parent"] = final[r["parent"]]
+        del r["label"]
+        old = existing.get(r["id"])
+        if old is None:
+            r["status"] = "new"
+        elif old["content_hash"] != r["content_hash"] or old["parent"] != r["parent"] or old["level"] != r["level"]:
+            r["status"] = "changed"
+        else:
+            r["status"] = "unchanged"
+        by_level[r["level"]] = by_level.get(r["level"], 0) + 1
+    carried = {r["id"] for r in rows}
+    stale = sorted(i for i in existing if i not in carried)
+    rows += [{"id": i, "status": "stale"} for i in stale]
+    stats = {
+        "written": sum(1 for r in rows if r["status"] in ("new", "changed")),
+        "unchanged": sum(1 for r in rows if r["status"] == "unchanged"),
+        "stale_deleted": len(stale), "skipped_too_large": skipped, "partitions": kept,
+        "communities_by_level": dict(sorted(by_level.items())),
+    }
+    return rows, stats
+
+
+_UPSERT_Q = """
+UNWIND $rows AS row
+MERGE (c:Community {id: row.id})
+SET c.level = row.level, c.size = row.size, c.acl = row.acl, c.repo = row.repo, c.source = row.source,
+    c.content_hash = row.content_hash, c.updated_at = $stamp"""
+_CLEAR_MEMBERS_Q = "MATCH (m)-[r:IN_COMMUNITY]->(c:Community) WHERE c.id IN $ids DELETE r"
+_CLEAR_PARENT_Q = "MATCH (c:Community)-[r:CHILD_OF]->(:Community) WHERE c.id IN $ids DELETE r"
+_MEMBERS_Q = """
+UNWIND $pairs AS pair
+MATCH (c:Community {id: pair.c})
+MATCH (m {id: pair.m})
+MERGE (m)-[:IN_COMMUNITY]->(c)"""
+_PARENT_Q = """
+UNWIND $pairs AS pair
+MATCH (c:Community {id: pair.c})
+MATCH (q:Community {id: pair.p})
+MERGE (c)-[:CHILD_OF]->(q)"""
+_DELETE_Q = """
+MATCH (c:Community) WHERE c.id IN $ids
+OPTIONAL MATCH (r:CommunityReport)-[:REPORTS_ON]->(c)
+DETACH DELETE r, c"""
+
+
+def write(w, rows: list[dict], stamp: str | None = None) -> None:
+    """Write `new` and `changed` rows and delete `stale` ones. Rows with another status send no query.
+    IN_COMMUNITY (node to its community, one per level) and CHILD_OF of rewritten communities are replaced;
+    `updated_at` is set only here, on a rewrite. Idempotent: MERGE on the community id."""
+    todo = [r for r in rows if r["status"] in ("new", "changed")]
+    stale = [r["id"] for r in rows if r["status"] == "stale"]
+    stamp = stamp or _dt.datetime.now(_dt.timezone.utc).isoformat()
+    for i in range(0, len(stale), WRITE_ROWS):
+        w._run(_DELETE_Q, ids=stale[i:i + WRITE_ROWS])
+    for i in range(0, len(todo), WRITE_ROWS):
+        batch = todo[i:i + WRITE_ROWS]
+        ids = [r["id"] for r in batch]
+        w._run(_UPSERT_Q, rows=[{k: r[k] for k in ("id", "level", "size", "acl", "repo", "source", "content_hash")}
+                                for r in batch], stamp=stamp)
+        w._run(_CLEAR_MEMBERS_Q, ids=ids)
+        w._run(_CLEAR_PARENT_Q, ids=ids)
+    pairs = [{"c": r["id"], "m": m} for r in todo for m in r["members"]]
+    for i in range(0, len(pairs), WRITE_PAIRS):
+        w._run(_MEMBERS_Q, pairs=pairs[i:i + WRITE_PAIRS])
+    links = [{"c": r["id"], "p": r["parent"]} for r in todo if r["parent"]]
+    for i in range(0, len(links), WRITE_PAIRS):
+        w._run(_PARENT_Q, pairs=links[i:i + WRITE_PAIRS])
+
+
+def build_communities(w, resolution: float | None = None, levels: int | None = None, seed: int | None = None,
+                      backend: str | None = None, dry_run: bool = False) -> dict:
+    """Load, detect, compare and write communities. Returns the stats of `build` plus the loader's
+    `nodes` and `edges`. With `dry_run` nothing is written (and no schema statement is sent)."""
+    partitions, load_stats = load_partitions(w)
+    if not dry_run:
+        ensure_schema(w, None)
+    rows, stats = build(partitions, load_existing(w), resolution, levels, seed, backend)
+    stats["skipped_too_large"] += load_stats.get("skipped_too_large", 0)
+    for k in ("nodes", "edges"):
+        if k in load_stats:
+            stats[k] = load_stats[k]
+    if not dry_run:
+        write(w, rows)
+    return stats

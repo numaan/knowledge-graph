@@ -574,3 +574,163 @@ def test_ensure_schema_live():
         w._run("CALL db.index.vector.queryNodes('community_report_embedding', 1, $v) YIELD node RETURN node",
                v=[0.0] * 8)
         w._run("CALL db.index.fulltext.queryNodes('community_report_text', 'x') YIELD node RETURN node")
+
+
+# ---- T9: writer, build, build_communities ----
+class StoreWriter:
+    """In-memory Neo4j stand-in: interprets the Cypher of load_existing, write and the schema."""
+
+    def __init__(self):
+        self.comm = {}  # id -> props
+        self.member = set()  # (member id, community id)
+        self.child = {}  # community id -> parent id
+        self.reports = {}  # report id -> community id
+        self.queries = []
+
+    def _run(self, query, **p):
+        self.queries.append(query)
+        if "MATCH (c:Community) WHERE c.id > $after" in query:
+            ids = sorted(i for i in self.comm if i > p["after"])[:p["limit"]]
+            return _Result([{"id": i, "level": self.comm[i]["level"], "content_hash": self.comm[i]["content_hash"],
+                             "updated_at": self.comm[i]["updated_at"], "parent": self.child.get(i),
+                             "members": sorted(m for m, c in self.member if c == i)} for i in ids])
+        if "DETACH DELETE" in query:
+            for i in p["ids"]:
+                self.comm.pop(i, None)
+                self.child.pop(i, None)
+                self.member = {x for x in self.member if x[1] != i}
+                self.reports = {r: c for r, c in self.reports.items() if c != i}
+            return _Result([])
+        if "MERGE (c:Community {id: row.id})" in query:
+            for r in p["rows"]:
+                self.comm[r["id"]] = {k: r[k] for k in ("level", "size", "acl", "repo", "source", "content_hash")}
+                self.comm[r["id"]]["updated_at"] = p["stamp"]
+            return _Result([])
+        if "DELETE r" in query and "IN_COMMUNITY" in query:
+            self.member = {x for x in self.member if x[1] not in set(p["ids"])}
+            return _Result([])
+        if "DELETE r" in query and "CHILD_OF" in query:
+            for i in p["ids"]:
+                self.child.pop(i, None)
+            return _Result([])
+        if "MERGE (m)-[:IN_COMMUNITY]->(c)" in query:
+            self.member |= {(x["m"], x["c"]) for x in p["pairs"]}
+            return _Result([])
+        if "MERGE (c)-[:CHILD_OF]->(q)" in query:
+            self.child.update({x["c"]: x["p"] for x in p["pairs"]})
+            return _Result([])
+        return _Result([])  # schema statements
+
+    def writes(self):
+        return [q for q in self.queries if any(k in q for k in ("MERGE", "SET ", "DELETE", "CREATE"))]
+
+
+def _cliq(names, w=1.0):
+    return [(a, b, w) for i, a in enumerate(names) for b in names[i + 1:]]
+
+
+def _t9_parts():
+    a, b = [f"a{i}" for i in range(4)], [f"b{i}" for i in range(4)]
+    j, k = [f"j{i}" for i in range(3)], [f"k{i}" for i in range(3)]
+    return {
+        ("repo:r",): (sorted(a + b), _cliq(a) + _cliq(b) + [("a0", "b0", 0.1)]),
+        ("confluence:ENG", "jira:PREC"): (sorted(j + k), _cliq(j) + _cliq(k) + [("j0", "k0", 0.1)]),
+    }
+
+
+def _run_build(w, parts, **kw):
+    existing = communities.load_existing(w)
+    rows, stats = communities.build(parts, existing, levels=2, backend="fallback", **kw)
+    communities.write(w, rows)
+    return rows, stats
+
+
+def test_build_first_run_writes_all():
+    w = StoreWriter()
+    rows, stats = _run_build(w, _t9_parts())
+    assert stats["written"] == len(w.comm) > 0 and stats["unchanged"] == 0 and stats["stale_deleted"] == 0
+    assert stats["partitions"] == 2 and sum(stats["communities_by_level"].values()) == len(w.comm)
+    assert {c["level"] for c in w.comm.values()} == {0, 1} or {c["level"] for c in w.comm.values()} == {0}
+    for cid, par in w.child.items():
+        assert w.comm[par]["level"] == w.comm[cid]["level"] + 1
+
+
+def test_zero_change_run_sends_no_write_query():
+    w = StoreWriter()
+    _run_build(w, _t9_parts())
+    before = {i: dict(c) for i, c in w.comm.items()}
+    n = len(w.queries)
+    w.queries.clear()
+    _, stats = _run_build(w, _t9_parts())
+    assert stats["written"] == 0 and stats["unchanged"] == len(before) and stats["stale_deleted"] == 0
+    assert w.writes() == [] and n > 0
+    assert w.comm == before  # updated_at unchanged
+
+
+def test_added_member_rewrites_only_its_communities():
+    w = StoreWriter()
+    _run_build(w, _t9_parts())
+    before = {i: dict(c) for i, c in w.comm.items()}
+    parts = _t9_parts()
+    ids, edges = parts[("repo:r",)]
+    parts[("repo:r",)] = (sorted(ids + ["a9"]), edges + [("a0", "a9", 1.0)])
+    rows, stats = _run_build(w, parts, )
+    changed = [r for r in rows if r["status"] != "unchanged"]
+    assert changed and all("a9" in r["members"] for r in changed)
+    assert stats["written"] == len(changed) and stats["unchanged"] == len(before) - len(changed)
+    assert set(w.comm) == set(before)  # anchors did not move: same ids
+    for i, c in w.comm.items():
+        if i not in {r["id"] for r in changed}:
+            assert c == before[i]
+    assert ("a9", next(r["id"] for r in changed if r["level"] == 0)) in w.member
+
+
+def test_vanished_community_deleted_with_report_and_edges():
+    w = StoreWriter()
+    _run_build(w, _t9_parts())
+    gone = [i for i in w.comm if i.split(":")[3] == "b0" and w.comm[i]["level"] == 0]
+    assert gone
+    w.reports["rep1"] = gone[0]
+    w.reports["rep2"] = next(i for i in w.comm if i not in gone and w.comm[i]["level"] == 0)
+    parts = _t9_parts()
+    ids, edges = parts[("repo:r",)]
+    parts[("repo:r",)] = ([i for i in ids if not i.startswith("b")], [e for e in edges if "b" not in e[0] + e[1]])
+    _, stats = _run_build(w, parts)
+    assert stats["stale_deleted"] >= 1
+    assert gone[0] not in w.comm and "rep1" not in w.reports and "rep2" in w.reports
+    assert not any(c == gone[0] for _, c in w.member) and gone[0] not in w.child
+    assert not any(m.startswith("b") for m, _ in w.member)
+
+
+def test_community_acl_equals_partition_key_and_never_mixes():
+    w = StoreWriter()
+    parts = _t9_parts()
+    _run_build(w, parts)
+    node_key = {n: key for key, (ids, _) in parts.items() for n in ids}
+    assert w.member
+    for m, c in w.member:
+        assert w.comm[c]["acl"] == list(node_key[m])
+    for c in w.comm.values():
+        assert c["acl"] in ([list(k) for k in parts])
+    assert ["confluence:ENG", "jira:PREC"] in [c["acl"] for c in w.comm.values()]
+
+
+def test_repo_and_source_fields():
+    w = StoreWriter()
+    _run_build(w, _t9_parts())
+    for c in w.comm.values():
+        if c["acl"] == ["repo:r"]:
+            assert c["repo"] == "r" and c["source"] is None
+        else:
+            assert c["repo"] is None and c["source"] == "confluence,jira"
+
+
+def test_build_communities_runs_schema_and_returns_stats(monkeypatch):
+    w = StoreWriter()
+    monkeypatch.setattr(communities, "load_partitions", lambda _w: (_t9_parts(), {"partitions": 2, "skipped_too_large": 1}))
+    stats = communities.build_communities(w, levels=2, backend="fallback")
+    assert stats["written"] == len(w.comm) and stats["skipped_too_large"] == 1
+    assert any("CREATE CONSTRAINT community_id" in q for q in w.queries)
+    w.queries.clear()
+    assert communities.build_communities(w, levels=2, backend="fallback")["written"] == 0
+    assert all("MERGE" not in q for q in w.queries)
