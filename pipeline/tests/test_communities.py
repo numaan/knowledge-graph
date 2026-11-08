@@ -582,7 +582,7 @@ def test_ensure_schema_live():
                       "RETURN options").records[0]["options"]
         dims = int(opts["indexConfig"]["vector.dimensions"])
         w._run("CALL db.index.vector.queryNodes('community_report_embedding', 1, $v) YIELD node RETURN node",
-               v=[0.0] * dims)
+               v=[1.0] + [0.0] * (dims - 1))  # cosine needs a non-zero vector
         w._run("CALL db.index.fulltext.queryNodes('community_report_text', 'x') YIELD node RETURN node")
 
 
