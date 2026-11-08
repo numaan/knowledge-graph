@@ -438,10 +438,14 @@ Also delete its `SyncState` cursor: `MATCH (s:SyncState) WHERE s.key STARTS WITH
 | The LLM judge can disagree with a human reviewer | verdicts are evidence, not proof | review `unresolved` and `contradicted` items; tune the evaluation set |
 | Jira and Confluence: Cloud REST APIs only | Data Center is not tested | use the Cloud API or add a client |
 | Neo4j Community has no role-based access | ACL is enforced in `kg-mcp` only | do not give agents direct Neo4j access |
-| Control API (admin UI): no `s3_documents` asset | A source of kind `s3` can be saved and tested, but `run` returns 501 | Use another kind until the asset exists |
 | Control API: no database uniqueness for one active run per source | Two parallel run requests can start two runs | Click Run once; cancel the second run |
 | Control API: a scheduled `runs` row stays `queued` if Dagster never creates the run | The source shows `queued` and the next scheduled run is skipped | Cancel the run in `/admin/runs` |
 | Control API: the S3 connection test is not pinned against DNS rebinding | A changing DNS answer can bypass the SSRF guard | Test only trusted hosts; keep `KG_CONTROL_ALLOW_PRIVATE` off |
+| S3 sources: the no-redirect hook and the AWS region retry are tested on fakes only (the real botocore is not installed in the test environment) | A real server may behave in another way than the fake | Use the direct endpoint of the bucket and set `region`; test with a real server before you rely on it |
+| S3 sources: no object versions and no bucket events | Only the current object is read, and a change shows at the next run | Set a `schedule` on the source |
+| S3 sources: reconcile needs a complete listing | After a listing error nothing is removed and the run fails | Run again; check the endpoint and the credentials |
+| S3 sources: a failing source fails the asset after the other sources finish | The run shows `failed`, but the other sources are written | Read the error per source in the run, fix that source |
+| S3 sources made in the UI have no platform credentials | Without keys the access is anonymous; `AWS_*` variables are not used | Enter the keys in the secret of the source |
 | Control API: run mode `full` does not bypass caches | Unchanged content is not rewritten; embedding and summary caches stay | Delete the embeddings or summaries (see [7.3](#73-change-the-embedding-model)) to force them |
 
 ## 9. Admin: sources and runs
@@ -488,6 +492,54 @@ mappers. To use another group name, set `control.oidc.adminGroup`.
 | 4 | Save, then click **Test**. A good test shows `ok`; an error shows the reason. |
 | 5 | Click **Run**. Mode `incremental` is the default; `full` re-reads everything (caches stay). |
 | 6 | Follow the run at `/admin/runs/<id>`. The page polls every 3 s. |
+
+### 9.3.1 S3 sources
+
+An S3 source reads documents from a bucket of AWS S3, MinIO, SeaweedFS or Ceph into the graph. The asset is
+`s3_documents`, the job is `s3_job`.
+
+1. Add the source as in 9.3 with kind `s3`. Enter `bucket` (required), `prefix`, `region`, `endpoint` (for a
+   non-AWS server) and `include` (globs on the key relative to the prefix, for example `docs/*.pdf`).
+2. Enter `access_key_id` and `secret_access_key` in the secret. With no keys the access is anonymous, and the
+   platform `AWS_*` variables are not used. Use anonymous access only for a public bucket.
+3. The `endpoint` must be `https://`. For an in-cluster MinIO or SeaweedFS (a private address, often `http://`),
+   set the values on the user code and on `kg-control`, then restart both:
+
+   ```yaml
+   control:
+     env:
+       KG_CONTROL_ALLOW_PRIVATE: "1"
+       KG_CONTROL_ALLOW_HTTP: "1"    # only when the endpoint is http://
+   ```
+
+   The web form accepts `https://` only; for an `http://` endpoint call the control API directly.
+4. Click **Test**, then **Run**. The `source_vectors` asset runs after `s3_documents`.
+
+| Topic | Rule |
+|---|---|
+| Files read | The suffixes `.md .markdown .txt .pdf .docx .pptx .html .htm`. PDF, DOCX, PPTX and HTML need Docling at `DOCLING_URL`. |
+| Redirects | Redirects are never followed. For AWS (no `endpoint`) a bucket in another region answers with a redirect that carries the header `x-amz-bucket-region`. The run then rebuilds the client once with that region (it must look like `eu-west-1`) and lists again. Set `region` in the source to avoid this. For a custom endpoint a redirect is always an error, and the header is ignored. |
+| Size limit | An object over `KG_S3_MAX_BYTES` (default 52428800) is skipped and counted in `skipped`. Set the variable on the user code. |
+| Listing cap | `KG_S3_MAX_OBJECTS` (default 500000) is the largest number of matching objects of one source. A larger listing fails the run with an error that names the variable and the prefix. Nothing is written or removed. Narrow the `prefix` or the `include` globs, or raise the variable on the user code. |
+| Delete batches | Reconcile deletes in batches of 500 ids per query. A failure between two batches leaves a consistent graph, and the next run removes the rest. |
+| Change detection | The same ETag, size and last-modified: not downloaded. Downloaded with the same content hash: only the stored fields change. |
+| Mode `full` | Downloads and rewrites every object. The embedding cache stays. |
+| Reconcile | Documents of deleted keys are removed after a complete listing. Objects over the size limit are never removed. |
+| `TooManyRemovals` | A run that would remove more than half of the Documents (and more than 20) stops. Check the bucket. If the removal is right (for example after a change of the prefix), start a **Full** run of the source in the admin UI (it asks for a confirmation and removes the Documents of deleted objects without the guard), or run the CLI with `--force`. An incremental or scheduled run keeps the guard. A run started for one source (tag `kg/source`) handles that source only, and only the Full run of that source lifts its guard; the other sources are not listed or changed. A Full run without the tag (manual start in Dagster) re-reads all S3 sources and lifts no guard. A run for a source that is unknown or disabled fails with a clear message. |
+| Access | Each Document has the ACL group `docs:<source name>`. A user needs that group in `KG_ACL_MAPPING` or the token claims. Group `*` (`kg-admins`) sees all. |
+| Run stats | `listed`, `new`, `changed`, `unchanged`, `skipped`, `removed`, `bytes`, `failed` |
+
+CLI (a local operator tool; it reads `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `NEO4J_*`):
+
+```bash
+kg-s3 --bucket my-bucket --prefix docs/ --name product-docs --dry-run        # report only
+kg-s3 --bucket my-bucket --prefix docs/ --name product-docs --include 'guides/*.md'
+kg-s3 --bucket my-bucket --endpoint https://minio.example.com --name minio-docs --full
+kg-s3 --bucket my-bucket --name product-docs --force                         # accept a large removal
+```
+
+Use the same `--name` as the source in the UI, or the Documents of the two will differ. The image installs the
+extra `s3` (boto3 pinned to 1.43.110). For a local install run `pip install -e ".[s3]"` in `pipeline/`.
 
 ### 9.4 Read a failed run
 

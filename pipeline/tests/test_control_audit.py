@@ -258,7 +258,7 @@ def test_no_secret_value_in_any_response_audit_or_log(client, app, engine, caplo
         app.state.dagster.launch_error = dc.DagsterUnavailable("dagster is unreachable")
         assert call("POST", f"/sources/{sid}/run").status_code == 502
         app.state.dagster.launch_error = None
-    assert call("POST", f"/sources/{ids['s3']}/run").status_code == 501
+    assert call("POST", f"/sources/{ids['s3']}/run").status_code == 202
     assert call("GET", "/runs/run_000000000000").status_code == 404
     assert call("POST", "/runs/run_000000000000/cancel").status_code == 404
     assert call("POST", "/sources/src_000000000000/test").status_code == 404

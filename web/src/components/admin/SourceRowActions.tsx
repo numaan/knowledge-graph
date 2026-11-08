@@ -28,7 +28,7 @@ export function EnabledToggle({ id, name, enabled }: { id: string; name: string;
   );
 }
 
-export function SourceRowActions({ id, name }: { id: string; name: string }) {
+export function SourceRowActions({ id, name, kind }: { id: string; name: string; kind?: string }) {
   const router = useRouter();
   const [mode, setMode] = useState<"incremental" | "full">("incremental");
   const [confirming, setConfirming] = useState(false);
@@ -59,7 +59,9 @@ export function SourceRowActions({ id, name }: { id: string; name: string }) {
       </div>
       {confirming && (
         <div role="alertdialog" aria-label={`Confirm full run of ${name}`} className="notice">
-          <p>A full run reads all data of {name} again. It can take a long time. Continue?</p>
+          <p>A full run reads all data of {name} again. It can take a long time.
+            {kind === "s3" && " A full run of an S3 source also removes the documents of deleted objects, even when more than half of the documents and more than 20 would go."}
+            {" "}Continue?</p>
           <div className="row">
             <button type="button" className="primary" onClick={() => start("full")}>Confirm full run</button>
             <button type="button" onClick={() => setConfirming(false)}>Cancel</button>

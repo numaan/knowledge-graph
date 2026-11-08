@@ -20,7 +20,8 @@ import requests
 GIT_JOB = "git_job"
 JIRA_JOB = "jira_job"
 CONFLUENCE_JOB = "confluence_job"
-JOB_BY_KIND = {"git": GIT_JOB, "jira": JIRA_JOB, "confluence": CONFLUENCE_JOB}
+S3_JOB = "s3_job"
+JOB_BY_KIND = {"git": GIT_JOB, "jira": JIRA_JOB, "confluence": CONFLUENCE_JOB, "s3": S3_JOB}
 PARTITIONS_DEF = "repos"
 PARTITION_TAG = "dagster/partition"
 
