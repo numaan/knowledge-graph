@@ -576,8 +576,13 @@ def test_ensure_schema_live():
         assert idx["community_report_embedding"] == "ONLINE" and idx["community_report_text"] == "ONLINE"
         cons = {r["name"] for r in w._run("SHOW CONSTRAINTS YIELD name RETURN name").records}
         assert {"community_id", "community_report_id"} <= cons
+        # The index may already exist with the dimension of the embedder (the CI job builds communities first),
+        # so probe with the dimension that the server reports, not with the 8 used above.
+        opts = w._run("SHOW INDEXES YIELD name, options WHERE name = 'community_report_embedding' "
+                      "RETURN options").records[0]["options"]
+        dims = int(opts["indexConfig"]["vector.dimensions"])
         w._run("CALL db.index.vector.queryNodes('community_report_embedding', 1, $v) YIELD node RETURN node",
-               v=[0.0] * 8)
+               v=[0.0] * dims)
         w._run("CALL db.index.fulltext.queryNodes('community_report_text', 'x') YIELD node RETURN node")
 
 
