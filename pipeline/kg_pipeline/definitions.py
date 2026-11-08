@@ -295,9 +295,9 @@ def communities(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
 def community_reports(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Report of each community; only changed ones are written, LLM calls stay within COMMUNITY_BUDGET."""
     llm = None if os.environ.get("COMMUNITY_LLM", "").strip().lower() == "off" else LLM()
-    budget = os.environ.get("COMMUNITY_BUDGET", "").strip()
+    budget = creports.budget_from_env()  # None when unset or not a number: build_reports uses its default
     with _writer() as w:
-        stats = creports.build_reports(w, llm=llm, emb=Embedder(), budget=int(budget) if budget else None,
+        stats = creports.build_reports(w, llm=llm, emb=Embedder(), budget=budget,
                                        cache=ARCHIVE / "cache" / "llm")
     context.log.info("community report stats: %s", stats)
     return dg.MaterializeResult(metadata={k: v for k, v in stats.items() if isinstance(v, int)})

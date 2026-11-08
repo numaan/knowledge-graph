@@ -23,14 +23,14 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .communities import EDGE_WEIGHTS, PROMPT_VERSION, ensure_schema  # noqa: F401  (PROMPT_VERSION is re-exported)
+from .communities import EDGE_WEIGHTS, PROMPT_VERSION, _env_num, ensure_schema  # noqa: F401  (PROMPT_VERSION is re-exported)
 from .domain.extract import _cache_get, _cache_put
 from .summaries import CONTEXT_CHARS, _first_sentence, _hash
 
 log = logging.getLogger(__name__)
 
 EXTRACTIVE = "extractive"
-DEFAULT_BUDGET = int(os.environ.get("COMMUNITY_BUDGET", "100"))
+DEFAULT_BUDGET = 100      # LLM calls per run when COMMUNITY_BUDGET is not set or not a number
 LOAD_BATCH = 200          # community ids per query
 MAX_MEMBERS = 40          # members listed in the context (highest degree first)
 MAX_EDGES = 30            # relationships listed in the context (highest weight first)
@@ -38,6 +38,20 @@ MAX_SUMMARIES = 20        # member summaries in the context
 MEMBER_TEXT_CHARS = 300
 SUMMARY_CHARS = 500
 RANK_MAX = 10.0
+
+def budget_from_env() -> int | None:
+    """COMMUNITY_BUDGET as an int; None when it is not set or not a number (a bad value never raises)."""
+    raw = os.environ.get("COMMUNITY_BUDGET", "").strip()
+    if not raw:
+        return None
+    value = _env_num("COMMUNITY_BUDGET", -1, int)
+    return None if value < 0 else value  # a bad or negative value falls back to the default
+
+
+def default_budget() -> int:
+    value = budget_from_env()
+    return DEFAULT_BUDGET if value is None else value
+
 
 # Every query is scoped by `$ids` (community ids). A member is reached only through IN_COMMUNITY of such a
 # community, and the raw `text` property is not read (only `text_masked`).
@@ -342,27 +356,28 @@ def build_reports(w, llm=None, emb=None, level: int | None = None, budget: int |
     `COMMUNITY_LLM=off` gives extractive reports. Embeds changed reports when `emb` is given."""
     if os.environ.get("COMMUNITY_LLM", "").strip().lower() == "off":
         llm = None
-    budget = DEFAULT_BUDGET if budget is None else budget
+    budget = default_budget() if budget is None else budget
     ensure_schema(w, emb.dimensions if emb is not None else None)
     ids = [r["cid"] for r in w._run(_LIST_Q, level=level).records]
-    inputs = load_report_inputs(w, ids)
     existing: dict[str, dict] = {}
-    for i in range(0, len(ids), LOAD_BATCH):
-        for r in w._run(_EXISTING_Q, ids=ids[i:i + LOAD_BATCH]).records:
-            existing[r["rid"]] = {k: r[k] for k in ("content_hash", "model", "embedding_hash", "title", "summary",
-                                                    "findings", "rank", "acl", "level")}
     gen = ReportGenerator(llm, budget, cache, existing)
     rows: list[dict] = []
-    for cid in sorted(inputs):
-        d = inputs[cid]
-        com = d["community"]
-        args = (com, d["members"], d["edges"], d["summaries"])
-        res = gen(com, report_context(*args), extractive_report(*args))
-        old = existing.get(report_id(cid))
-        if old and not res["changed"] and (list(old.get("acl") or []) != com["acl"] or old.get("level") != com["level"]):
-            res["changed"] = True                      # the community moved: copy its acl and level again
-        rows.append({**res, "id": report_id(cid), "community_id": cid, "level": com["level"], "acl": com["acl"],
-                     "repo": com["repo"]})
+    for i in range(0, len(ids), LOAD_BATCH):   # members, edges and summaries of one batch at a time
+        batch = ids[i:i + LOAD_BATCH]
+        for r in w._run(_EXISTING_Q, ids=batch).records:
+            existing[r["rid"]] = {k: r[k] for k in ("content_hash", "model", "embedding_hash", "title", "summary",
+                                                    "findings", "rank", "acl", "level")}
+        inputs = load_report_inputs(w, batch)
+        for cid in sorted(inputs):
+            d = inputs[cid]
+            com = d["community"]
+            args = (com, d["members"], d["edges"], d["summaries"])
+            res = gen(com, report_context(*args), extractive_report(*args))
+            old = existing.get(report_id(cid))
+            if old and not res["changed"] and (list(old.get("acl") or []) != com["acl"] or old.get("level") != com["level"]):
+                res["changed"] = True                  # the community moved: copy its acl and level again
+            rows.append({**res, "id": report_id(cid), "community_id": cid, "level": com["level"], "acl": com["acl"],
+                         "repo": com["repo"]})
     stats = {k: gen.stats.get(k, 0) for k in ("llm_calls", "llm_cache_hits", "llm_failed", "extractive",
                                               "over_budget", "unchanged")}
     stats["total"] = len(rows)

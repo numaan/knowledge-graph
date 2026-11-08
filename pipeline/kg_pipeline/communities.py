@@ -205,6 +205,9 @@ def detect(nodes, edges, resolution: float | None = None, levels: int | None = N
     return result
 
 
+INVALID_GROUP = "__invalid__"  # sentinel group for a malformed acl: no caller holds it (fail closed)
+
+
 def partition_key(node) -> tuple[str, ...]:
     """ACL partition of a node: the sorted, deduplicated `acl` list; `("repo:<repo>",)` when there
     is no acl but a `repo` (code nodes, same group as the MCP `$repos` scope); `()` (public) when
@@ -213,9 +216,12 @@ def partition_key(node) -> tuple[str, ...]:
     so a node with "*" in its acl is not public.
     """
     acl = node.get("acl")
-    groups = sorted({str(g) for g in acl if g}) if isinstance(acl, (list, tuple, set)) else []
+    listed = isinstance(acl, (list, tuple, set)) and len(acl) > 0
+    groups = sorted({str(g) for g in acl if g}) if listed else []
     if groups:
         return tuple(groups)
+    if listed:  # a non-empty acl without a valid group (`[""]`, `[None]`) is restricted, never public
+        return (INVALID_GROUP,)
     repo = node.get("repo")
     return (f"repo:{repo}",) if repo else ()
 
@@ -348,10 +354,10 @@ RETURN n.id AS id, labels(n) AS labels, n.acl AS acl, n.repo AS repo ORDER BY id
 _COCHANGE_Q = f"""
 MATCH (c:Commit|PullRequest) WHERE c.id > $after
 WITH c ORDER BY c.id LIMIT $limit
-MATCH (c)-[:MODIFIES]->(f:Code)
+OPTIONAL MATCH (c)-[:MODIFIES]->(f:Code)
 WITH c, f ORDER BY f.id
-WITH c, collect(f.id)[..{COCHANGE_FILES}] AS files WHERE size(files) > 1
-RETURN c.id AS id, files ORDER BY id"""
+WITH c, [x IN collect(f.id) WHERE x IS NOT NULL][..{COCHANGE_FILES}] AS files
+RETURN c.id AS id, files ORDER BY id"""  # no filter after LIMIT: a page holds `limit` commits, the size filter is in Python
 
 
 def _edge_query(rel_type: str) -> str:
@@ -371,12 +377,35 @@ def _pages(w, query: str, limit: int, **params):
             return
 
 
+ANCHOR_LABELS = ("Code", "Source", "Domain", "Requirement")  # labels with an index on `id`, in lookup order
+
+
+def anchor_label(labels) -> str | None:
+    """The label that member lookups by id use (a unique constraint or an index exists for it)."""
+    return next((a for a in ANCHOR_LABELS if a in (labels or ())), None)
+
+
+def _read_edges(w, ids: list, limit_edges: int) -> list | None:
+    """Edges of all weighted types whose source is in `ids`; None when there are more than `limit_edges`."""
+    rows: list = []
+    for rel_type in EDGE_WEIGHTS:
+        query = _edge_query(rel_type)
+        for i in range(0, len(ids), EDGE_BATCH):
+            rows += [r.data() for r in w._run(query, ids=ids[i:i + EDGE_BATCH]).records]
+            if len(rows) > limit_edges:
+                return None
+    return rows
+
+
 def load_partitions(w) -> tuple[dict, dict]:
     """Read the graph from Neo4j and project it per ACL partition (see the module docstring).
 
     Returns `(partitions, stats)`. `partitions` is the output of `project()`. `stats` has `partitions`
-    (kept), `skipped_too_large`, `nodes` and `edges` read. Chunks are read only to fold their edges
-    into their owner; they do not count toward KG_COMMUNITY_MAX_NODES.
+    (kept), `skipped_too_large`, `skipped_hashes` (partition hashes of the skipped partitions: their
+    existing communities must be kept), `nodes` and `edges` read, and `labels` (member id to the label
+    for id lookups, see `anchor_label`). Chunks are read only to fold their edges into their owner; they
+    do not count toward KG_COMMUNITY_MAX_NODES. A group that holds only chunks (the chunk acl differs from
+    the acl of its owner) is read for its edges too: they fold to the owner and count where the owner lives.
     """
     skip = sorted(NOT_MEMBERS - {"Chunk"})
     groups: dict = {}
@@ -384,38 +413,33 @@ def load_partitions(w) -> tuple[dict, dict]:
         for n in page:
             groups.setdefault(partition_key(n), []).append(n)
 
-    stats = {"partitions": 0, "skipped_too_large": 0, "nodes": 0, "edges": 0}
+    stats = {"partitions": 0, "skipped_too_large": 0, "skipped_hashes": [], "nodes": 0, "edges": 0, "labels": {}}
     limit_nodes, limit_edges = max_nodes(), max_edges()
     kept_nodes: list = []
     rows: list = []
     for key, nodes in sorted(groups.items()):
         count = sum(1 for n in nodes if "Chunk" not in (n.get("labels") or ()))
-        if count == 0:
-            continue
         if count > limit_nodes:  # counted before any edge is read
             log.warning("partition %s skipped: %d nodes exceed KG_COMMUNITY_MAX_NODES=%d", list(key), count, limit_nodes)
             stats["skipped_too_large"] += 1
+            stats["skipped_hashes"].append(partition_hash(key))
             continue
-        ids = sorted(n["id"] for n in nodes)
-        part_rows: list = []
-        too_big = False
-        for rel_type in EDGE_WEIGHTS:
-            query = _edge_query(rel_type)
-            for i in range(0, len(ids), EDGE_BATCH):
-                part_rows += [r.data() for r in w._run(query, ids=ids[i:i + EDGE_BATCH]).records]
-                if len(part_rows) > limit_edges:
-                    too_big = True
-                    break
-            if too_big:
-                break
-        if too_big:
+        part_rows = _read_edges(w, sorted(n["id"] for n in nodes), limit_edges)
+        if part_rows is None:
             log.warning("partition %s skipped: more than KG_COMMUNITY_MAX_EDGES=%d edges", list(key), limit_edges)
             stats["skipped_too_large"] += 1
+            stats["skipped_hashes"].append(partition_hash(key))
             continue
         kept_nodes += nodes
         rows += part_rows
+        if count == 0:  # chunks only: no partition of its own, the edges fold to the owners
+            continue
         stats["nodes"] += count
         stats["edges"] += len(part_rows)
+        for n in nodes:
+            anchor = anchor_label(n.get("labels"))
+            if anchor:
+                stats["labels"][n["id"]] = anchor
 
     cochange: list = []
     if kept_nodes:
@@ -437,6 +461,10 @@ SCHEMA_STATEMENTS = (
     "CREATE CONSTRAINT community_report_id IF NOT EXISTS FOR (n:CommunityReport) REQUIRE n.id IS UNIQUE",
     "CREATE FULLTEXT INDEX community_report_text IF NOT EXISTS FOR (n:CommunityReport) "
     "ON EACH [n.title, n.summary]",
+    # Member lookups by id are labelled. Code and Source have a unique constraint; Domain and Requirement
+    # need an index, or every lookup scans the label. IF NOT EXISTS skips an existing constraint or index.
+    "CREATE INDEX domain_id IF NOT EXISTS FOR (n:Domain) ON (n.id)",
+    "CREATE INDEX requirement_id IF NOT EXISTS FOR (n:Requirement) ON (n.id)",
 )
 
 
@@ -505,7 +533,8 @@ def _source_of(key: tuple[str, ...]) -> str | None:
 
 def build(partitions: dict, existing: dict, resolution: float | None = None, levels: int | None = None,
           seed: int | None = None, backend: str | None = None, member_hashes: dict | None = None,
-          prompt_version: str = PROMPT_VERSION) -> tuple[list[dict], dict]:
+          prompt_version: str = PROMPT_VERSION, labels: dict | None = None,
+          skipped_hashes=None) -> tuple[list[dict], dict]:
     """Detect communities per partition and compare them with `existing` (see `load_existing`).
 
     Returns `(rows, stats)`. Each row has `id, level, size, members, parent, acl, repo, source, content_hash,
@@ -513,18 +542,26 @@ def build(partitions: dict, existing: dict, resolution: float | None = None, lev
     existing id that no new community carries; the row only has `id`). Detection runs inside one ACL
     partition, so a community never mixes ACL sets, and `acl` is the partition key. Old ids are reused
     through `reuse_ids`.
+
+    `labels` (member id to lookup label, from `load_partitions`) is carried in each row as `member_labels`;
+    without it every member is looked up as `Code`. `skipped_hashes`: partition hashes that the loader
+    skipped as too large. Partitions that `detect` skips are added. Existing communities of a skipped
+    partition are neither rewritten nor stale: an oversize run must not delete reports that cost LLM calls.
+    A community is `changed` when its stored members differ from the new ones (repairs a partial write).
     """
+    skipped_set = set(skipped_hashes or ())
     rows: list[dict] = []
     skipped = 0
     by_level: dict = {}
     kept = 0
     for key, (ids, edges) in sorted(partitions.items()):
         det = detect(ids, edges, resolution=resolution, levels=levels, seed=seed, backend=backend)
+        phash = partition_hash(key)
         if det.skipped_too_large:
             skipped += 1
+            skipped_set.add(phash)
             continue
         kept += 1
-        phash = partition_hash(key)
         part_rows: list[dict] = []
         label_to_id: list[dict] = []
         for level, assign in enumerate(det.levels):
@@ -538,6 +575,7 @@ def build(partitions: dict, existing: dict, resolution: float | None = None, lev
                     "id": label_to_id[level][label], "level": level, "size": len(m), "members": m, "label": label,
                     "acl": list(key), "repo": key[0][5:] if len(key) == 1 and key[0].startswith("repo:") else None,
                     "source": _source_of(key), "partition": phash,
+                    "member_labels": {x: (labels or {}).get(x, "Code" if labels is None else None) for x in m},
                     "content_hash": content_hash(m, member_hashes, prompt_version)})
         for r in part_rows:
             nxt = det.child_of[r["level"]].get(r["label"]) if r["level"] < len(det.child_of) else None
@@ -555,13 +593,14 @@ def build(partitions: dict, existing: dict, resolution: float | None = None, lev
         old = existing.get(r["id"])
         if old is None:
             r["status"] = "new"
-        elif old["content_hash"] != r["content_hash"] or old["parent"] != r["parent"] or old["level"] != r["level"]:
+        elif (old["content_hash"] != r["content_hash"] or old["parent"] != r["parent"] or old["level"] != r["level"]
+              or old["members"] != r["members"]):
             r["status"] = "changed"
         else:
             r["status"] = "unchanged"
         by_level[r["level"]] = by_level.get(r["level"], 0) + 1
     carried = {r["id"] for r in rows}
-    stale = sorted(i for i in existing if i not in carried)
+    stale = sorted(i for i in existing if i not in carried and _scope(i).split(":")[1] not in skipped_set)
     rows += [{"id": i, "status": "stale"} for i in stale]
     stats = {
         "written": sum(1 for r in rows if r["status"] in ("new", "changed")),
@@ -582,8 +621,8 @@ _CLEAR_PARENT_Q = "MATCH (c:Community)-[r:CHILD_OF]->(:Community) WHERE c.id IN 
 _MEMBERS_Q = """
 UNWIND $pairs AS pair
 MATCH (c:Community {id: pair.c})
-MATCH (m {id: pair.m})
-MERGE (m)-[:IN_COMMUNITY]->(c)"""
+MATCH (m:%s {id: pair.m})
+MERGE (m)-[:IN_COMMUNITY]->(c)"""  # the label is one of ANCHOR_LABELS: a lookup by id never scans all nodes
 _PARENT_Q = """
 UNWIND $pairs AS pair
 MATCH (c:Community {id: pair.c})
@@ -611,9 +650,17 @@ def write(w, rows: list[dict], stamp: str | None = None) -> None:
                                 for r in batch], stamp=stamp)
         w._run(_CLEAR_MEMBERS_Q, ids=ids)
         w._run(_CLEAR_PARENT_Q, ids=ids)
-    pairs = [{"c": r["id"], "m": m} for r in todo for m in r["members"]]
-    for i in range(0, len(pairs), WRITE_PAIRS):
-        w._run(_MEMBERS_Q, pairs=pairs[i:i + WRITE_PAIRS])
+    by_label: dict = {a: [] for a in ANCHOR_LABELS}
+    for r in todo:
+        for m in r["members"]:
+            label = (r.get("member_labels") or {}).get(m)
+            if label in by_label:
+                by_label[label].append({"c": r["id"], "m": m})
+            else:
+                log.warning("member %s of %s has no label with an id index: not linked", m, r["id"])
+    for label, pairs in by_label.items():
+        for i in range(0, len(pairs), WRITE_PAIRS):
+            w._run(_MEMBERS_Q % label, pairs=pairs[i:i + WRITE_PAIRS])
     links = [{"c": r["id"], "p": r["parent"]} for r in todo if r["parent"]]
     for i in range(0, len(links), WRITE_PAIRS):
         w._run(_PARENT_Q, pairs=links[i:i + WRITE_PAIRS])
@@ -627,7 +674,8 @@ def build_communities(w, resolution: float | None = None, levels: int | None = N
     if not dry_run:
         ensure_schema(w, None)
     rows, stats = build(partitions, load_existing(w), resolution, levels, seed, backend,
-                        member_hashes=load_member_hashes(w))
+                        member_hashes=load_member_hashes(w), labels=load_stats.get("labels"),
+                        skipped_hashes=load_stats.get("skipped_hashes"))
     stats["skipped_too_large"] += load_stats.get("skipped_too_large", 0)
     for k in ("nodes", "edges"):
         if k in load_stats:

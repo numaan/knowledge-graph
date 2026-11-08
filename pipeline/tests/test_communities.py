@@ -371,7 +371,9 @@ class LoaderWriter:
                             for n in page[:params["limit"]]])
         if "MODIFIES" in query:
             page = [c for c in self.commits if c[0] > params["after"]][:params["limit"]]
-            return _Result([{"id": cid, "files": files[:50]} for cid, files in page if len(files[:50]) > 1])
+            post_filter = "size(files) > 1" in query  # mirrors the query: a filter after LIMIT shortens the page
+            return _Result([{"id": cid, "files": files[:50]} for cid, files in page
+                            if not post_filter or len(files[:50]) > 1])
         typ = re.search(r"\[r:(\w+)\]", query).group(1)
         ids = set(params["ids"])
         return _Result([{"src": r["src"], "type": r["type"], "dst": r["dst"]}
