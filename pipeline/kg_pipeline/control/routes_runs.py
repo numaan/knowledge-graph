@@ -55,6 +55,24 @@ def _refresh(engine: Engine, client, row):
         return conn.execute(select(runs).where(runs.c.id == row.id)).one()
 
 
+def _scrub_text(text: str, token: str | None) -> str:
+    """Mask the stored secret values in a Dagster message. Without a readable secret, keep no detail."""
+    if not token:
+        return text
+    try:
+        return probe._scrub({"t": text}, secrets.decrypt(token))["t"]
+    except secrets.SecretKeyError:
+        return "dagster reported an error"
+
+
+def _stored_secret(engine: Engine, source_id: str | None) -> str | None:
+    if not source_id:
+        return None
+    with engine.connect() as conn:
+        src = repo.get_source(conn, source_id)
+    return src.secret if src is not None else None
+
+
 def _log_tail(engine: Engine, client, row) -> list[str]:
     if not row.dagster_run_id:
         return []
@@ -130,7 +148,7 @@ def make_router() -> APIRouter:
             except dagster_client.DagsterUnavailable:
                 raise HTTPException(502, "dagster is unreachable")
             except dagster_client.DagsterError as e:
-                raise HTTPException(502, str(e)[:200])
+                raise HTTPException(502, _scrub_text(str(e), _stored_secret(engine, row.source_id))[:200])
         with engine.begin() as conn:
             conn.execute(update(runs).where(runs.c.id == run_id).values(
                 status="canceled", ended_at=datetime.now(timezone.utc)))
@@ -171,7 +189,7 @@ def make_router() -> APIRouter:
         except dagster_client.DagsterUnavailable:
             error = "dagster is unreachable"
         except dagster_client.DagsterError as e:
-            error = str(e)[:200]
+            error = _scrub_text(str(e), src.secret)[:200]
         with engine.begin() as conn:
             if error:
                 conn.execute(update(runs).where(runs.c.id == run_id).values(
