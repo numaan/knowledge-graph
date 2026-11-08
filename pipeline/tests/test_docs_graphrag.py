@@ -38,3 +38,9 @@ def test_admin_trigger_is_a_follow_up():
 def test_runbook_covers_decisions_and_unverified_list():
     for word in ("graspologic-native==1.3.1", "not yet verified", "repo:<name>"):
         assert word.lower() in (RUNBOOK + GUIDE).lower(), word
+
+
+def test_runbook_states_acl_window_and_rule():
+    text = RUNBOOK.lower()
+    assert "acl window" in text
+    assert "narrow an acl, then run `graphrag_job`" in text

@@ -673,7 +673,10 @@ new run (same as [7.3](#73-change-the-embedding-model)).
 | Speed | The fallback is slower than the library: expect minutes for each million edges. |
 | No cross-repository communities | The pipeline splits by ACL partition: `repo:<name>` for code, one partition for each `acl` list of `Source` nodes. A theme that spans partitions is lost. |
 | Levels | `KG_COMMUNITY_LEVELS` (default 2, range 1 to 4). Level 0 is the finest. More levels cost more reports. |
-| ACL | A community and a report never mix ACL sets. `*` in a node `acl` is an ordinary group name. |
+| ACL | A community and a report never mix ACL sets. `*` in a node `acl` is an ordinary group name. A non-empty `acl` without a valid group (for example `[""]`) goes to the sentinel group `__invalid__`, so nobody sees it. |
+| ACL window | The text of a report comes from its members and stays in the graph until the next `graphrag_job`. When `kg-permissions` (asset `source_permissions`) narrows the ACL of a Document or Section, the old community and report keep the old ACL until `graphrag_job` runs again. In this window a caller of the old group can still read the report text. `graphrag_job` does not depend on `source_permissions`: the job selects only the two community assets, and the permission sync needs Jira and Confluence access. Dagster does not run it first. |
+| After you narrow an ACL | Run `graphrag_job` (or `kg-communities --report`) right after the permission sync that narrowed the ACL. Do not wait for `graphrag_daily`. Rule: narrow an ACL, then run `graphrag_job`. |
+| Skipped partition | The existing communities and reports of a skipped partition stay as they are. They are not deleted, but they are not updated either. |
 
 ### 10.7 Not yet verified against a live Neo4j
 
@@ -683,7 +686,7 @@ check the following. Treat a failure here as expected work, not as an incident.
 | Area | What to check |
 |---|---|
 | Loader | Node scan by keyset pages over unlabeled `MATCH (n)` (no index help, can be slow); one edge query for each type in `EDGE_WEIGHTS`; co-change query `(Commit\|PullRequest)-[:MODIFIES]->(Code)` |
-| Writer | Write of `Community` nodes, `IN_COMMUNITY` and `CHILD_OF` edges; member match `MATCH (m {id: ...})` without label; stale delete |
+| Writer | Write of `Community` nodes, `IN_COMMUNITY` and `CHILD_OF` edges; member match `MATCH (m:<Code\|Source\|Domain\|Requirement> {id: ...})` with a label (index on `Domain` and `Requirement` from `ensure_schema`); stale delete |
 | Reports | Report load (4 queries for each batch of 200), write, `REPORTS_ON` link and embedding write |
 | Schema | Constraints, full-text and vector index DDL on Community Edition (`test_ensure_schema_live`) |
 | Hash | Query of the member summary hashes (`_HASHES_Q`) |

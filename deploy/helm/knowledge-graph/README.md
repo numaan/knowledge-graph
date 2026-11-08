@@ -99,3 +99,10 @@ pod then gets `CONTROL_API_URL=http://<name>-control:8090`.
 change it, the stored secrets cannot be read and you must enter them again. The Secret has
 `helm.sh/resource-policy: keep`. With `existingSecret`, also change the `KG_SECRET_KEY` env of the Dagster
 user deployment to read that Secret.
+
+## LLM budgets
+
+| Value | Default | Meaning |
+|---|---|---|
+| `llm.summaryBudget` | `300` | Sets `SUMMARY_BUDGET`: maximum LLM calls per summaries run. The rest get extractive text. |
+| `llm.communityBudget` | `100` | Sets `COMMUNITY_BUDGET`: maximum LLM calls per community report run (`graphrag_job`). The rest get extractive text. `llm.enabled=false` sets `COMMUNITY_LLM=off` (extractive reports only). A value that is not a number falls back to 100. |
