@@ -20,7 +20,7 @@ class FakeGit:
     def __init__(self):
         self.calls = []
 
-    def mirror(self, url, archive, token=None):
+    def mirror(self, url, archive, token=None, env_fallback=True):
         self.calls.append(("mirror", url, token))
         return Path("/mirror")
 
@@ -367,3 +367,83 @@ def test_jira_and_confluence_jobs():
     for name, first in ((dc.JIRA_JOB, "jira_issues"), (dc.CONFLUENCE_JOB, "confluence_pages")):
         job = d.defs.get_job_def(name)
         assert {k.to_user_string() for k in job.asset_layer.executable_asset_keys} == {first, "source_vectors"}
+
+
+# --- N1: the real git._git must not send GIT_TOKEN for a ui source -------------------------------------------------
+
+def _captured_git(monkeypatch, tmp_path):
+    from kg_pipeline.sources import git as real_git
+    cmds = []
+    monkeypatch.setattr(real_git.subprocess, "run", lambda cmd, **kw: cmds.append(cmd) or type("R", (), {"stdout": ""})())
+    return real_git, cmds
+
+
+def _auth(cmd):
+    import base64
+    heads = [a for a in cmd if a.startswith("http.extraHeader=")]
+    return [base64.b64decode(h.rsplit(" ", 1)[1]).decode() for h in heads]
+
+
+def _real_run(monkeypatch, tmp_path, origin, secret):
+    real_git, cmds = _captured_git(monkeypatch, tmp_path)
+    monkeypatch.setattr(d, "git", real_git)
+    monkeypatch.setattr(d, "ARCHIVE", tmp_path / "arch")
+    monkeypatch.setenv("GIT_TOKEN", "env-tok")
+    return real_git, cmds
+
+
+def test_real_git_ui_source_without_secret_sends_no_authorization(registry_db, monkeypatch, tmp_path):
+    from sqlalchemy import update
+    with registry_db.begin() as conn:
+        conn.execute(update(db.sources).values(secret=None))
+    real_git, cmds = _real_run(monkeypatch, tmp_path, "ui", None)
+    url, branch, token = d._repo("repo-a")
+    real_git.mirror(url, d.ARCHIVE, token=token, env_fallback=False)
+    assert cmds and all(not _auth(c) for c in cmds)
+    assert not any("env-tok" in str(c) for c in cmds)
+
+
+def test_real_git_ui_source_with_own_token_sends_only_that_token(registry_db, monkeypatch, tmp_path):
+    real_git, cmds = _real_run(monkeypatch, tmp_path, "ui", None)
+    url, branch, token = d._repo("repo-a")
+    real_git.mirror(url, d.ARCHIVE, token=token, env_fallback=False)
+    assert [_auth(c) for c in cmds] == [["x-access-token:tok-A"]]
+
+
+def test_real_git_env_source_sends_env_token(registry_db, monkeypatch, tmp_path):
+    from sqlalchemy import update
+    with registry_db.begin() as conn:
+        conn.execute(update(db.sources).values(secret=None, origin="env"))
+    real_git, cmds = _real_run(monkeypatch, tmp_path, "env", None)
+    url, branch, token = d._repo("repo-a")
+    real_git.mirror(url, d.ARCHIVE, token=token, env_fallback=False)
+    assert [_auth(c) for c in cmds] == [["x-access-token:env-tok"]]
+
+
+def test_real_git_env_only_mode_default_still_uses_env_token(monkeypatch, tmp_path):
+    real_git, cmds = _captured_git(monkeypatch, tmp_path)
+    monkeypatch.setenv("GIT_TOKEN", "env-tok")
+    real_git.mirror("https://h/x/r.git", tmp_path / "a")
+    assert [_auth(c) for c in cmds] == [["x-access-token:env-tok"]]
+
+
+def test_service_catalog_mirror_gets_no_env_token_for_ui_source(fakes, registry_db, monkeypatch):
+    from sqlalchemy import update
+    with registry_db.begin() as conn:
+        conn.execute(update(db.sources).values(secret=None))
+    monkeypatch.setenv("GIT_TOKEN", "env-tok")
+    seen = []
+    from kg_pipeline import people_assets as pa
+    class G:
+        def mirror(self, url, archive, **kw):
+            seen.append(kw)
+            return Path("/m")
+        def head(self, *a): return "x"
+        @contextmanager
+        def checkout(self, *a): yield Path("/w")
+    monkeypatch.setattr(pa, "git", G())
+    monkeypatch.setattr(pa, "_writer", contextmanager(lambda: (yield FakeWriter())))
+    monkeypatch.setattr(pa.catalog, "sync", lambda w, work, name: {})
+    asset = pa.service_catalog_asset(d.repo_partitions, d.code_snapshot, d._RegistryRepos(), "main", Path("/a"))
+    asset(dg.build_asset_context(partition_key="repo-a"))
+    assert seen == [{"token": None, "env_fallback": False}]

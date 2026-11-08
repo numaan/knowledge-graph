@@ -72,6 +72,10 @@ class _RegistryRepos:
     def __getitem__(self, name: str) -> str:
         return _repo(name)[0]
 
+    def mirror_kwargs(self, name: str) -> dict:
+        """Credential for git.mirror. _repo already applied the env rule, so git must not add GIT_TOKEN itself."""
+        return {"token": _repo(name)[2], "env_fallback": False}
+
 
 @contextmanager
 def _writer():
@@ -87,7 +91,7 @@ def code_snapshot(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Code layer of one repository (files, symbols, imports, calls, chunks, ODM). Writes only changes."""
     name = context.partition_key
     url, branch, token = _repo(name)
-    mirror_path = git.mirror(url, ARCHIVE, token=token)
+    mirror_path = git.mirror(url, ARCHIVE, token=token, env_fallback=False)
     sha = git.head(mirror_path, branch)
     # Mode full: no SCIP cache, so every folder is indexed again. write_delta compares content hashes and still
     # writes only the differences.
@@ -117,7 +121,7 @@ def git_history(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     name = context.partition_key
     url, _, token = _repo(name)
     with _writer() as w:
-        stats = history.sync(w, git.mirror(url, ARCHIVE, token=token), name, full=_full(context))
+        stats = history.sync(w, git.mirror(url, ARCHIVE, token=token, env_fallback=False), name, full=_full(context))
     return dg.MaterializeResult(metadata={k: v for k, v in stats.items() if isinstance(v, int)})
 
 
