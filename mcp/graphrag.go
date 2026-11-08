@@ -144,7 +144,7 @@ func (s *Server) reportHits(ctx context.Context, question string, level *int, k 
 	if textErr == nil {
 		byText = ids(rows)
 	}
-	if textErr != nil && vecErr != nil {
+	if textErr != nil && (vecErr != nil || s.emb == nil) {
 		return nil, fmt.Errorf("report search: %w", textErr)
 	}
 	fused := rrf(byVector, byText)
@@ -470,13 +470,21 @@ func (s *Server) visibleLocal(ctx context.Context, rows []map[string]any) map[st
 const localNodeCols = `coalesce(n.qualname, n.name, n.title, n.key, n.path, n.id) AS name,
 	[l IN labels(n) WHERE NOT l IN ['Source', 'Code', 'Domain']][0] AS kind, coalesce(n.acl, d.acl) AS acl, coalesce(n.repo, d.repo) AS repo`
 
+// nodeByID returns a Cypher subquery that binds n to the node whose id is the variable v. Each branch
+// uses a label with an id lookup (as tools.go does), so no branch scans all nodes. The subquery imports
+// v and returns only n.
+func nodeByID(v string) string {
+	return strings.ReplaceAll(`CALL (@) { MATCH (n:Code {id: @}) RETURN n UNION MATCH (n:Domain {id: @}) RETURN n
+		UNION MATCH (n:Requirement {id: @}) RETURN n UNION MATCH (n:Source {id: @}) RETURN n }`, "@", v)
+}
+
 // fetchNodes loads nodes by id and returns the visible ones.
 func (s *Server) fetchNodes(ctx context.Context, idList []string) (map[string]localNode, error) {
 	if len(idList) == 0 {
 		return map[string]localNode{}, nil
 	}
-	rows, err := s.reader().Read(ctx, `UNWIND $ids AS id MATCH (n {id: id})
-		WHERE NOT n:Chunk AND NOT n:Community AND NOT n:CommunityReport AND ($repos IS NULL OR n.repo IS NULL OR n.repo IN $repos)
+	rows, err := s.reader().Read(ctx, `UNWIND $ids AS nid `+nodeByID("nid")+`
+			WITH n WHERE NOT n:Chunk AND NOT n:Community AND NOT n:CommunityReport AND ($repos IS NULL OR n.repo IS NULL OR n.repo IN $repos)
 		OPTIONAL MATCH (n)-[:PART_OF]->(d:Document)
 		RETURN n.id AS id, `+localNodeCols, map[string]any{"ids": idList})
 	if err != nil {
@@ -567,7 +575,7 @@ func (s *Server) hybridSeeds(ctx context.Context, question string) ([]string, er
 		}
 		return ids(rows)
 	}
-	const chunkScope = `WHERE ($repos IS NULL OR node.repo IN $repos) RETURN node.id AS id ORDER BY score DESC LIMIT 40`
+	const chunkScope = `WHERE ($repos IS NULL OR node.repo IS NULL OR node.repo IN $repos) RETURN node.id AS id ORDER BY score DESC LIMIT 40`
 	const srcScope = `WHERE (node:Ticket OR node:Section OR node:PullRequest) RETURN node.id AS id ORDER BY score DESC LIMIT 30`
 	var chunkVec, srcVec []string
 	if s.emb != nil {
@@ -645,9 +653,10 @@ func (s *Server) expandLocal(ctx context.Context, seeds []string, hops int) (loc
 	for hop := 1; hop <= hops && len(frontier) > 0; hop++ {
 		var rows []map[string]any
 		for i := 0; i < len(frontier); i += localBatch {
-			part, err := s.reader().Read(ctx, `UNWIND $ids AS id
-				CALL (id) {
-				  MATCH (n {id: id})-[r]-(b)
+			part, err := s.reader().Read(ctx, `UNWIND $ids AS seed
+				CALL (seed) {
+				  `+nodeByID("seed")+`
+				  MATCH (n)-[r]-(b)
 				  WHERE type(r) IN $types AND NOT b:Chunk AND NOT b:Community AND NOT b:CommunityReport
 				    AND ($repos IS NULL OR b.repo IS NULL OR b.repo IN $repos)
 				  OPTIONAL MATCH (b)-[:PART_OF]->(d:Document)
@@ -866,7 +875,7 @@ func trimLocal(out *LocalSearchOut, budget int) {
 func (s *Server) localSnippets(ctx context.Context, idList []string) ([]LocalSnippet, error) {
 	out := []LocalSnippet{}
 	for i := 0; i < len(idList); i += localBatch {
-		rows, err := s.reader().Read(ctx, `UNWIND $ids AS id MATCH (n) WHERE n.id = id
+		rows, err := s.reader().Read(ctx, `UNWIND $ids AS nid `+nodeByID("nid")+`
 			OPTIONAL MATCH (c:Chunk)-[:PART_OF]->(n)
 			WITH n, c ORDER BY c.id
 			WITH n, collect(c)[..`+fmt.Sprint(localSnippetPerNode)+`] AS cs
@@ -892,7 +901,7 @@ func (s *Server) localCommunities(ctx context.Context, idList []string) ([]Local
 	byID := map[string]reportRow{}
 	var firstErr error
 	for i := 0; i < len(idList); i += localBatch {
-		rows, err := s.reader().Read(ctx, `UNWIND $ids AS id MATCH (n) WHERE n.id = id
+		rows, err := s.reader().Read(ctx, `UNWIND $ids AS nid `+nodeByID("nid")+`
 			MATCH (n)-[:IN_COMMUNITY]->(:Community)<-[:REPORTS_ON]-(r:CommunityReport)
 			RETURN n.id AS node, r.id AS id, r.title AS title, r.summary AS summary, r.rank AS rank, r.level AS level,
 			       r.acl AS acl, r.repo AS repo, r.community_id AS community_id`,

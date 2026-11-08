@@ -510,7 +510,7 @@ func newLocalFake(nodes []map[string]any, edges [][2]string) *localFake {
 		lf.nodes[n["id"].(string)] = n
 	}
 	lf.fakeGraph = &fakeGraph{rules: []fakeRule{
-		{"UNWIND $ids AS id MATCH (n {id: id})", func(p map[string]any) []map[string]any {
+		{"UNWIND $ids AS nid CALL (nid)", func(p map[string]any) []map[string]any {
 			out := []map[string]any{}
 			for _, id := range p["ids"].([]string) {
 				if n, ok := lf.nodes[id]; ok {
