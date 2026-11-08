@@ -5,7 +5,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
 from sqlalchemy import delete as sql_delete, insert, update
 from sqlalchemy.engine import Engine
 
-from . import audit, repo, secrets, validate
+from . import audit, probe, repo, secrets, validate
 from .auth import User, require_admin
 from .db import new_id, sources
 
@@ -120,5 +120,22 @@ def make_router() -> APIRouter:
             conn.execute(sql_delete(sources).where(sources.c.id == source_id))
             audit.write(conn, user.name, "source.delete", source_id, {"name": row.name, "kind": row.kind})
         return Response(status_code=204)
+
+    @router.post("/sources/{source_id}/test")
+    def test(source_id: str, request: Request, user: User = Depends(require_admin),
+             engine: Engine = Depends(_engine)):
+        with engine.connect() as conn:
+            row = repo.get_source(conn, source_id)
+        if row is None:
+            raise HTTPException(404, "source not found")
+        try:
+            secret = secrets.decrypt(row.secret) if row.secret else None
+            prober = getattr(request.app.state, "prober", None) or probe.Prober()
+            result = prober.test(row.kind, row.config, secret)
+        except secrets.SecretKeyError as e:
+            result = {"ok": False, "message": str(e), "details": {}}
+        with engine.begin() as conn:
+            audit.write(conn, user.name, "source.test", source_id, {"kind": row.kind, "ok": result["ok"]})
+        return result
 
     return router
