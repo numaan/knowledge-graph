@@ -182,3 +182,158 @@ def test_sync_partitions_seeds_database(monkeypatch, tmp_path):
     d.sync_partitions(inst)
     assert seeded == [1]
     assert inst.get_dynamic_partitions("repos") == ["repo-e"]
+
+
+# ---- T10: Jira and Confluence from the registry -------------------------------------------------------------------
+
+class FakeAtlassian:
+    made = []
+
+    def __init__(self, base_url=None, email=None, token=None, fetch=None, prefix="JIRA"):
+        self.base, self.email, self.token, self.prefix = base_url, email, token, prefix
+        FakeAtlassian.made.append(self)
+
+
+@pytest.fixture
+def atl(monkeypatch):
+    for k in ("DATABASE_URL", "KG_SECRET_KEY", "JIRA_PROJECTS", "CONFLUENCE_SPACES", "JIRA_BASE_URL", "JIRA_EMAIL",
+              "JIRA_API_TOKEN", "CONFLUENCE_BASE_URL", "CONFLUENCE_EMAIL", "CONFLUENCE_API_TOKEN"):
+        monkeypatch.delenv(k, raising=False)
+    FakeAtlassian.made = []
+    calls = {"jira": [], "confluence": [], "perm_jira": [], "perm_conf": []}
+    monkeypatch.setattr(d, "Atlassian", FakeAtlassian)
+    monkeypatch.setattr(d, "_writer", contextmanager(lambda: (yield FakeWriter())))
+    monkeypatch.setattr(d.jira, "sync", lambda w, api, project, jql=None, full=False, **kw: calls["jira"].append(
+        (api.base, api.email, api.token, project, full)) or {"issues": 1})
+    monkeypatch.setattr(d.documents, "sync_confluence", lambda w, api, space, full=False: calls["confluence"].append(
+        (api.base, api.email, api.token, space, full)) or {"documents": 1})
+    monkeypatch.setattr(d.permissions, "sync_jira", lambda w, api, p: calls["perm_jira"].append(
+        (api.base, api.token, p)) or {"p": p})
+    monkeypatch.setattr(d.permissions, "sync_confluence", lambda w, api, s: calls["perm_conf"].append(
+        (api.base, api.token, s)) or {"s": s})
+    return calls
+
+
+def add_rows(engine, *rows):
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    with engine.begin() as conn:
+        for i, (kind, name, config, secret, enabled) in enumerate(rows):
+            conn.execute(insert(db.sources).values(
+                id=f"src_0000000001{i:02d}", kind=kind, name=name, config=config,
+                secret=secrets.encrypt(secret) if secret else None, schedule=None, enabled=enabled, origin="ui",
+                created_at=now, updated_at=now, created_by="t"))
+
+
+def ctx(tags=None):
+    return dg.build_asset_context(run_tags=tags or {})
+
+
+def test_jira_projects_and_credentials_from_registry(atl, registry_db):
+    add_rows(registry_db,
+             ("jira", "site1", {"base_url": "https://a.atlassian.net", "projects": ["A", "B"]},
+              {"email": "e@x", "api_token": "tk"}, True),
+             ("jira", "off", {"base_url": "https://z.atlassian.net", "projects": ["Z"]}, {"email": "e", "api_token": "z"}, False))
+    res = d.jira_issues(ctx())
+    assert atl["jira"] == [("https://a.atlassian.net", "e@x", "tk", "A", False),
+                           ("https://a.atlassian.net", "e@x", "tk", "B", False)]
+    assert "tk" not in str(res.metadata)
+
+
+def test_confluence_spaces_from_registry(atl, registry_db):
+    add_rows(registry_db, ("confluence", "wiki", {"base_url": "https://a.atlassian.net", "spaces": ["ENG"]},
+                           {"email": "e@x", "api_token": "tk"}, True))
+    d.confluence_pages(ctx())
+    assert atl["confluence"] == [("https://a.atlassian.net", "e@x", "tk", "ENG", False)]
+    assert FakeAtlassian.made[0].prefix == "CONFLUENCE"
+
+
+def test_no_sources_keeps_skipped_message(atl, registry_db):
+    assert d.jira_issues(ctx()).metadata["skipped"] == "JIRA_PROJECTS is empty"
+    assert d.confluence_pages(ctx()).metadata["skipped"] == "CONFLUENCE_SPACES is empty"
+    assert atl["jira"] == [] and atl["confluence"] == []
+
+
+def test_row_without_secret_falls_back_to_env_credentials(atl, registry_db):
+    add_rows(registry_db, ("jira", "site1", {"base_url": "https://a.atlassian.net", "projects": ["A"]}, None, True))
+    d.jira_issues(ctx())
+    api = FakeAtlassian.made[0]
+    assert api.base == "https://a.atlassian.net" and api.email is None and api.token is None  # real class reads env
+
+
+def test_real_atlassian_env_fallback(monkeypatch):
+    monkeypatch.setenv("JIRA_EMAIL", "env@x")
+    monkeypatch.setenv("JIRA_API_TOKEN", "envtk")
+    from kg_pipeline.sources.atlassian import Atlassian
+    a = Atlassian(base_url="https://a.atlassian.net", email=None, token=None)
+    assert a._auth is not None
+
+
+def test_env_only_jira_and_confluence_without_database(atl, monkeypatch):
+    monkeypatch.setenv("JIRA_PROJECTS", "P1, P2")
+    monkeypatch.setenv("JIRA_BASE_URL", "https://env.atlassian.net")
+    monkeypatch.setenv("JIRA_EMAIL", "env@x")
+    monkeypatch.setenv("JIRA_API_TOKEN", "envtk")
+    monkeypatch.setenv("CONFLUENCE_SPACES", "S1")
+    monkeypatch.setenv("CONFLUENCE_BASE_URL", "https://env.atlassian.net")
+    d.jira_issues(ctx())
+    d.confluence_pages(ctx())
+    assert [c[3] for c in atl["jira"]] == ["P1", "P2"]
+    assert atl["jira"][0][:3] == ("https://env.atlassian.net", "env@x", "envtk")
+    assert [c[3] for c in atl["confluence"]] == ["S1"]
+
+
+def test_full_mode_passes_full_flag(atl, monkeypatch):
+    monkeypatch.setenv("JIRA_PROJECTS", "P1")
+    monkeypatch.setenv("JIRA_BASE_URL", "https://h")
+    monkeypatch.setenv("CONFLUENCE_SPACES", "S1")
+    monkeypatch.setenv("CONFLUENCE_BASE_URL", "https://h")
+    for tags in ({}, {"kg/mode": "incremental"}, {"kg/mode": "full"}):
+        d.jira_issues(ctx(tags))
+        d.confluence_pages(ctx(tags))
+    assert [c[4] for c in atl["jira"]] == [False, False, True]
+    assert [c[4] for c in atl["confluence"]] == [False, False, True]
+
+
+def test_permissions_follow_registry_sources(atl, registry_db):
+    add_rows(registry_db,
+             ("jira", "site1", {"base_url": "https://a.atlassian.net", "projects": ["A"]},
+              {"email": "e", "api_token": "tk"}, True),
+             ("confluence", "wiki", {"base_url": "https://w.atlassian.net", "spaces": ["ENG"]},
+              {"email": "e", "api_token": "tk2"}, True))
+    d.source_permissions(ctx())
+    assert atl["perm_jira"] == [("https://a.atlassian.net", "tk", "A")]
+    assert atl["perm_conf"] == [("https://w.atlassian.net", "tk2", "ENG")]
+
+
+def test_confluence_full_ignores_version_cursor(monkeypatch):
+    from kg_pipeline.sources import documents as docs
+    page = {"id": "1", "title": "T", "version": {"number": 3}}
+    monkeypatch.setattr(docs, "fetch_pages", lambda api, space: iter([page]))
+    monkeypatch.setattr(docs, "_unchanged", lambda w, doc_id, version: True)
+    written = []
+    monkeypatch.setattr(docs, "_write_document", lambda w, doc, md: written.append(doc["id"]) or 1)
+    monkeypatch.setattr("kg_pipeline.sources.history.link_references", lambda w: 0)
+
+    class W:
+        def link(self, *a, **k):
+            pass
+
+        def _run(self, *a, **k):
+            class R:
+                records = [{"n": 0}]
+            return R()
+
+    class Api:
+        base = "https://h"
+
+    assert docs.sync_confluence(W(), Api(), "ENG")["unchanged"] == 1 and written == []
+    assert docs.sync_confluence(W(), Api(), "ENG", full=True)["documents"] == 1 and written == ["confluence:ENG:1"]
+
+
+def test_jira_and_confluence_jobs():
+    from kg_pipeline.control import dagster_client as dc
+    assert d.jira_job.name == dc.JIRA_JOB and d.confluence_job.name == dc.CONFLUENCE_JOB
+    for name, first in ((dc.JIRA_JOB, "jira_issues"), (dc.CONFLUENCE_JOB, "confluence_pages")):
+        job = d.defs.get_job_def(name)
+        assert {k.to_user_string() for k in job.asset_layer.executable_asset_keys} == {first, "source_vectors"}

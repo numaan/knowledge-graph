@@ -43,6 +43,8 @@ CONFLUENCE_SPACES = [s.strip() for s in os.environ.get("CONFLUENCE_SPACES", "").
 # the control package (fastapi extra) at import time.
 repo_partitions = dg.DynamicPartitionsDefinition(name="repos")
 GIT_JOB = "git_job"
+JIRA_JOB = "jira_job"
+CONFLUENCE_JOB = "confluence_job"
 MODE_TAG = "kg/mode"
 
 
@@ -149,29 +151,49 @@ def summaries_asset(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     return dg.MaterializeResult(metadata={k: v for k, v in stats.items() if isinstance(v, int)})
 
 
+def _atlassian(src: sources_registry.Source, prefix: str) -> Atlassian:
+    """Client with the credentials of a registry source. Missing values fall back to the env (prefix_*)."""
+    secret = sources_registry.get_secret(src)
+    return Atlassian(src.config.get("base_url") or None, secret.get("email"), secret.get("api_token"), prefix=prefix)
+
+
+def _targets(kind: str, key: str):
+    """(source, item) pairs: every project (jira) or space (confluence) of every enabled source, read at run time."""
+    return [(s, item) for s in sources_registry.get_sources(kind) for item in s.config.get(key) or []]
+
+
+def _label(src: sources_registry.Source, item: str) -> str:
+    return item if src.name in (sources_registry.JIRA_NAME, sources_registry.CONFLUENCE_NAME) else f"{src.name}:{item}"
+
+
 @dg.asset(kinds={"neo4j", "jira"}, group_name="sources")
 @traced_asset
 def jira_issues(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
-    """Stories, bugs, epics and releases updated since the last run, for each project in JIRA_PROJECTS."""
-    if not JIRA_PROJECTS:
+    """Stories, bugs, epics and releases updated since the last run, for each project of each enabled Jira source."""
+    targets = _targets("jira", "projects")
+    if not targets:
         return dg.MaterializeResult(metadata={"skipped": "JIRA_PROJECTS is empty"})
-    api, out = Atlassian(), {}
+    apis, out = {}, {}
     with _writer() as w:
-        for project in JIRA_PROJECTS:
-            out[project] = jira.sync(w, api, project, acceptance_field=os.environ.get("JIRA_ACCEPTANCE_FIELD"))
+        for src, project in targets:
+            api = apis.get(src.name) or apis.setdefault(src.name, _atlassian(src, "JIRA"))
+            out[_label(src, project)] = jira.sync(w, api, project, full=_full(context),
+                                                  acceptance_field=os.environ.get("JIRA_ACCEPTANCE_FIELD"))
     return dg.MaterializeResult(metadata={"projects": dg.MetadataValue.json(out)})
 
 
 @dg.asset(kinds={"neo4j", "confluence"}, group_name="sources")
 @traced_asset
 def confluence_pages(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
-    """Pages of each space in CONFLUENCE_SPACES; unchanged versions are skipped."""
-    if not CONFLUENCE_SPACES:
+    """Pages of each space of each enabled Confluence source; unchanged versions are skipped (not in mode full)."""
+    targets = _targets("confluence", "spaces")
+    if not targets:
         return dg.MaterializeResult(metadata={"skipped": "CONFLUENCE_SPACES is empty"})
-    api, out = Atlassian(prefix="CONFLUENCE"), {}
+    apis, out = {}, {}
     with _writer() as w:
-        for space in CONFLUENCE_SPACES:
-            out[space] = documents.sync_confluence(w, api, space)
+        for src, space in targets:
+            api = apis.get(src.name) or apis.setdefault(src.name, _atlassian(src, "CONFLUENCE"))
+            out[_label(src, space)] = documents.sync_confluence(w, api, space, full=_full(context))
     return dg.MaterializeResult(metadata={"spaces": dg.MetadataValue.json(out)})
 
 
@@ -202,12 +224,17 @@ def source_permissions(context: dg.AssetExecutionContext) -> dg.MaterializeResul
     """Precise ACLs from Jira permissions and security levels and Confluence restrictions (KG_ACL_DEFAULT)."""
     out = {}
     with _writer() as w:
-        if JIRA_PROJECTS:
-            api = Atlassian()
-            out["jira"] = [permissions.sync_jira(w, api, p) for p in JIRA_PROJECTS]
-        if CONFLUENCE_SPACES:
-            api = Atlassian(prefix="CONFLUENCE")
-            out["confluence"] = [permissions.sync_confluence(w, api, s) for s in CONFLUENCE_SPACES]
+        jira_targets = _targets("jira", "projects")
+        if jira_targets:
+            apis = {}
+            out["jira"] = [permissions.sync_jira(w, apis.get(s.name) or apis.setdefault(s.name, _atlassian(s, "JIRA")), p)
+                           for s, p in jira_targets]
+        conf_targets = _targets("confluence", "spaces")
+        if conf_targets:
+            apis = {}
+            out["confluence"] = [
+                permissions.sync_confluence(w, apis.get(s.name) or apis.setdefault(s.name, _atlassian(s, "CONFLUENCE")), sp)
+                for s, sp in conf_targets]
     return dg.MaterializeResult(metadata={"permissions": dg.MetadataValue.json(out)})
 
 
@@ -227,6 +254,8 @@ sources_every_15_min = dg.ScheduleDefinition(name="sources_every_15_min", target
 
 git_job = dg.define_asset_job(
     GIT_JOB, selection=[code_snapshot, git_history, domain_model, vector_index, summaries_asset])
+jira_job = dg.define_asset_job(JIRA_JOB, selection=[jira_issues, source_vectors])
+confluence_job = dg.define_asset_job(CONFLUENCE_JOB, selection=[confluence_pages, source_vectors])
 
 
 def sync_partitions(instance: dg.DagsterInstance) -> list[str]:
@@ -254,4 +283,4 @@ def registry_partitions(context: dg.SensorEvaluationContext):
 from .trust_assets import TRUST, daily_reconcile  # noqa: E402  data trust: deletes, moves, duplicates
 
 defs = dg.Definitions(assets=CODE + SOURCES + TRUST, schedules=[hourly_code, sources_every_15_min, daily_reconcile],
-                      jobs=[git_job], sensors=[registry_partitions])
+                      jobs=[git_job, jira_job, confluence_job], sensors=[registry_partitions])
