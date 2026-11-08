@@ -1,4 +1,6 @@
 """Run launch: Dagster client wrapper, status mapping, POST /sources/{id}/run with a fake client."""
+from datetime import datetime, timezone
+
 import pytest
 import requests
 from cryptography.fernet import Fernet
@@ -398,3 +400,64 @@ def test_cancel_dagster_down_gives_502_and_keeps_status(client, app):
     app.state.dagster.terminate = boom
     assert client.post(f"/api/v1/runs/{run['id']}/cancel").status_code == 502
     assert client.get(f"/api/v1/runs/{run['id']}").json()["status"] in ("queued", "running")
+
+
+# ---- FIX 1: database guard against two active runs of one source ----
+def _active_row(rid, sid):
+    return dict(id=rid, source_id=sid, source_name="n", kind="git", status="queued", trigger="manual", mode="incremental")
+
+
+def test_index_refuses_second_active_row_but_allows_final_rows(engine, app, client):
+    from sqlalchemy import insert
+    from sqlalchemy.exc import IntegrityError
+    sid = make(client, GIT)
+    with engine.begin() as conn:
+        conn.execute(insert(db.runs).values(**_active_row("run_000000000001", sid)))
+        conn.execute(insert(db.runs).values(**{**_active_row("run_000000000002", sid), "status": "succeeded"}))
+        conn.execute(insert(db.runs).values(**{**_active_row("run_000000000003", sid), "status": "failed"}))
+    with pytest.raises(IntegrityError):
+        with engine.begin() as conn:
+            conn.execute(insert(db.runs).values(**{**_active_row("run_000000000004", sid), "status": "running"}))
+
+
+def test_concurrent_start_loses_the_race_with_409(engine, app, client, monkeypatch):
+    """Both requests passed the active-run check; the index makes the second insert fail and the route answer 409."""
+    from kg_pipeline.control import routes_runs
+    sid = make(client, GIT)
+    assert client.post(f"/api/v1/sources/{sid}/run", json={}).status_code == 202
+    monkeypatch.setattr(routes_runs, "_active_run", lambda conn, source_id: None)  # the check of a racing request
+    r = client.post(f"/api/v1/sources/{sid}/run", json={})
+    assert r.status_code == 409, r.text
+    assert "active run" in r.json()["error"]
+    assert len(app.state.dagster.launched) == 1
+
+
+def test_create_all_adds_index_to_existing_database_and_is_idempotent(tmp_path):
+    from sqlalchemy import inspect, text
+    eng = create_engine(f"sqlite:///{tmp_path / 'old.db'}", future=True)
+    db.create_all(eng)
+    with eng.begin() as conn:
+        conn.execute(text(f"DROP INDEX {db.ACTIVE_RUN_INDEX.name}"))
+    assert db.ACTIVE_RUN_INDEX.name not in {i["name"] for i in inspect(eng).get_indexes("runs")}
+    db.create_all(eng)
+    db.create_all(eng)
+    assert db.ACTIVE_RUN_INDEX.name in {i["name"] for i in inspect(eng).get_indexes("runs")}
+
+
+def test_create_all_with_duplicate_active_rows_warns_and_skips_index(tmp_path, caplog):
+    from sqlalchemy import inspect, insert, text
+    eng = create_engine(f"sqlite:///{tmp_path / 'dup.db'}", future=True)
+    db.create_all(eng)
+    with eng.begin() as conn:
+        conn.execute(text(f"DROP INDEX {db.ACTIVE_RUN_INDEX.name}"))
+        conn.execute(insert(db.runs).values(**_active_row("run_000000000001", None)))  # NULL source: not counted
+        conn.execute(insert(db.runs).values(**_active_row("run_000000000002", None)))
+        conn.execute(insert(db.sources).values(
+            id="src_1", kind="git", name="s", config={}, enabled=True, origin="ui",
+            created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc)))
+        conn.execute(insert(db.runs).values(**_active_row("run_000000000003", "src_1")))
+        conn.execute(insert(db.runs).values(**_active_row("run_000000000004", "src_1")))
+    with caplog.at_level("WARNING"):
+        db.create_all(eng)
+    assert "src_1" in caplog.text
+    assert db.ACTIVE_RUN_INDEX.name not in {i["name"] for i in inspect(eng).get_indexes("runs")}

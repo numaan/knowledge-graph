@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from sqlalchemy import insert, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import Engine
 
 from . import audit, dagster_client, probe, repo, secrets
@@ -24,6 +25,11 @@ def get_dagster(request: Request) -> dagster_client.DagsterClient:
 
 FINAL = ("succeeded", "failed", "canceled")
 DEFAULT_LIMIT, MAX_LIMIT, LOG_LINES = 50, 200, 200
+
+
+def _active_run(conn, source_id: str):
+    return conn.execute(select(runs.c.id).where(
+        runs.c.source_id == source_id, runs.c.status.in_(dagster_client.ACTIVE))).first()
 
 
 def _refresh(engine: Engine, client, row):
@@ -164,22 +170,25 @@ def make_router() -> APIRouter:
         mode = body.get("mode", "incremental")
         if mode not in ("incremental", "full"):
             raise HTTPException(400, "mode must be incremental or full")
-        with engine.begin() as conn:
-            src = repo.get_source(conn, source_id)
-            if src is None:
-                raise HTTPException(404, "source not found")
-            if src.kind not in dagster_client.JOB_BY_KIND:
-                raise HTTPException(501, "s3_documents asset not available yet")
-            if not src.enabled:
-                raise HTTPException(409, "source is disabled")
-            active = conn.execute(select(runs.c.id).where(
-                runs.c.source_id == source_id, runs.c.status.in_(dagster_client.ACTIVE))).first()
-            if active:
-                raise HTTPException(409, f"source already has an active run ({active.id})")
-            run_id = new_id("run")
-            conn.execute(insert(runs).values(
-                id=run_id, source_id=source_id, source_name=src.name, kind=src.kind, status="queued",
-                trigger="manual", mode=mode, requested_by=user.name))
+        try:
+            with engine.begin() as conn:
+                src = repo.get_source(conn, source_id)
+                if src is None:
+                    raise HTTPException(404, "source not found")
+                if src.kind not in dagster_client.JOB_BY_KIND:
+                    raise HTTPException(501, "s3_documents asset not available yet")
+                if not src.enabled:
+                    raise HTTPException(409, "source is disabled")
+                active = _active_run(conn, source_id)
+                if active:
+                    raise HTTPException(409, f"source already has an active run ({active.id})")
+                run_id = new_id("run")
+                conn.execute(insert(runs).values(
+                    id=run_id, source_id=source_id, source_name=src.name, kind=src.kind, status="queued",
+                    trigger="manual", mode=mode, requested_by=user.name))
+        except IntegrityError:
+            # a racing request inserted its active row first (unique index on the active runs of a source)
+            raise HTTPException(409, "source already has an active run") from None
         tags = dagster_client.launch_tags(src.kind, src.name, source_id, run_id, mode)
         error = None
         try:

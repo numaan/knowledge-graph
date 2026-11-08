@@ -1,9 +1,13 @@
 """Metadata tables (SQLAlchemy Core). PostgreSQL in production, SQLite in tests."""
+import logging
 import os
 import uuid
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, ForeignKey, MetaData, String, Table, Text, create_engine
+from sqlalchemy import (JSON, Boolean, Column, DateTime, ForeignKey, Index, MetaData, String, Table, Text, create_engine,
+                        func, inspect, select)
 from sqlalchemy.engine import Engine
+
+log = logging.getLogger(__name__)
 
 metadata = MetaData()
 
@@ -39,6 +43,11 @@ runs = Table(
     Column("requested_by", String, nullable=True),
 )
 
+# At most one active run for each source. The route and the sensor check first; this index closes the race.
+ACTIVE_RUN_INDEX = Index(
+    "uq_runs_one_active_per_source", runs.c.source_id, unique=True,
+    sqlite_where=runs.c.status.in_(("queued", "running")), postgresql_where=runs.c.status.in_(("queued", "running")))
+
 audit = Table(
     "audit", metadata,
     Column("id", String, primary_key=True),
@@ -63,5 +72,17 @@ def get_engine(url: str | None = None) -> Engine:
 
 
 def create_all(engine: Engine) -> None:
-    """Idempotent."""
+    """Idempotent. Also upgrades a database that was created before the active-run index."""
     metadata.create_all(engine)
+    insp = inspect(engine)
+    if ACTIVE_RUN_INDEX.name in {i["name"] for i in insp.get_indexes("runs")}:
+        return
+    with engine.connect() as conn:
+        dup = conn.execute(select(runs.c.source_id).where(
+            runs.c.source_id.is_not(None), runs.c.status.in_(("queued", "running")))
+            .group_by(runs.c.source_id).having(func.count() > 1)).first()
+    if dup is not None:
+        log.warning("runs has several active rows for source %s; the unique active-run index is not created. "
+                    "Cancel the extra runs and restart.", dup.source_id)
+        return
+    ACTIVE_RUN_INDEX.create(engine, checkfirst=True)
