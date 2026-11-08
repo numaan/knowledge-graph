@@ -401,10 +401,10 @@ func TestToolSchemas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tools.Tools) != 20 {
-		t.Errorf("want 16 read tools + 3 write-back tools + ask, got %d", len(tools.Tools))
+	if len(tools.Tools) != 22 {
+		t.Errorf("want 16 read tools + 3 write-back tools + ask + 2 GraphRAG tools, got %d", len(tools.Tools))
 	}
-	unpaged := map[string]bool{"ask": true, "report_wrong_fact": true, "record_decision": true, "suggest_link": true}
+	unpaged := map[string]bool{"ask": true, "global_search": true, "local_search": true, "report_wrong_fact": true, "record_decision": true, "suggest_link": true}
 	for _, tool := range tools.Tools {
 		b, _ := json.Marshal(tool.InputSchema)
 		paged := strings.Contains(string(b), `"max_chars"`) && strings.Contains(string(b), `"cursor"`)

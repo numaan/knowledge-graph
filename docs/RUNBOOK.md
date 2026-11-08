@@ -12,6 +12,7 @@ see the [guide](GUIDE.md).
 - [7. Maintenance](#7-maintenance)
 - [8. Known limits](#8-known-limits)
 - [9. Admin: sources and runs](#9-admin-sources-and-runs)
+- [10. GraphRAG communities](#10-graphrag-communities)
 
 ## 1. Components
 
@@ -192,13 +193,14 @@ delete the embeddings and the vector indexes, then embed again (see [7.3](#73-ch
 
 ### 4.1 Schedules
 
-All schedules are off after install. Turn them on in the Dagster UI (Overview > Schedules):
+All schedules are off after install. `graphrag_daily` is also stopped by default and you turn it on by hand (see [10](#10-graphrag-communities)). Turn them on in the Dagster UI (Overview > Schedules):
 
 | Schedule | Cron | Assets |
 |---|---|---|
 | `hourly_code` | `0 * * * *` | `code_snapshot` (with links), `git_history`, `domain_model`, `vector_index`, `summaries`, `service_catalog` (one run per repository) |
 | `sources_every_15_min` | `*/15 * * * *` | `jira_issues`, `confluence_pages`, `source_permissions`, `github_prs`, `source_vectors`, `doc_freshness`, `people` |
 | `daily_reconcile` | `0 3 * * *` | `source_reconcile` (deletes and moves), `document_duplicates` |
+| `graphrag_daily` | `30 3 * * *` | `communities`, `community_reports` (job `graphrag_job`; see [10](#10-graphrag-communities)) |
 
 Every asset applies the approved corrections after its writes.
 
@@ -573,3 +575,123 @@ stored secret is unreadable. Enter the secrets again in the UI (Replace). Source
 2. For an `env` source with no stored secret: follow [7.4](#74-rotate-credentials).
 3. To change the Fernet key, set the new key in the Secret, restart `kg-control` and the code server, and
    enter every secret again. There is no rotation tool.
+
+## 10. GraphRAG communities
+
+GraphRAG finds communities in the graph and writes a report for each one. The tools `global_search` and
+`local_search` read them. For the concepts and the settings, see [guide 3.8.1](GUIDE.md#381-graphrag-communities).
+The design record of the Leiden library is [graphrag-communities.md](streams/graphrag-communities.md).
+
+### 10.1 Schedule and run
+
+`graphrag_daily` (`30 3 * * *`) runs the job `graphrag_job` with the assets `communities` and
+`community_reports`. The schedule is stopped by default, because the first run can take long and can call the LLM.
+
+1. Run the job once by hand: Dagster UI > Jobs > `graphrag_job` > Launchpad > Launch run.
+2. Read the run. Check the counts in the log (communities for each level, reports written, LLM calls).
+3. Turn on `graphrag_daily` in Overview > Schedules when the first run is correct.
+
+To run from a pipeline pod instead:
+
+```bash
+kubectl -n kg exec deploy/kg-dagster-user-deployments-kg-pipeline -- kg-communities --dry-run
+kubectl -n kg exec deploy/kg-dagster-user-deployments-kg-pipeline -- kg-communities --report
+```
+
+`--dry-run` detects and compares only. It does not write, call the LLM or call the embedder.
+
+An admin UI button for this job is a follow-up. Today only the Dagster UI, the schedule and `kg-communities` start it.
+
+Set these variables in the environment of the code server (defaults in the [guide](GUIDE.md#381-graphrag-communities)):
+
+| Variable | Default |
+|---|---|
+| `KG_COMMUNITY_RESOLUTION` | `1.0` |
+| `KG_COMMUNITY_LEVELS` | `2` |
+| `KG_COMMUNITY_SEED` | `42` |
+| `KG_COMMUNITY_MAX_NODES` | `200000` |
+| `KG_COMMUNITY_MAX_EDGES` | `2000000` |
+| `KG_COMMUNITY_BACKEND` | `auto` |
+| `COMMUNITY_LLM` | on (`off` for extractive reports) |
+| `COMMUNITY_BUDGET` | `100` |
+
+### 10.2 Rebuild
+
+A run is incremental. It keeps the id of a community when more than half of the members stay the same,
+and it generates a report again only when the members, the member summaries or the prompt changed.
+Communities that no longer exist, and their reports, are deleted.
+
+To rebuild all communities after you change `KG_COMMUNITY_RESOLUTION`, `KG_COMMUNITY_LEVELS` or `KG_COMMUNITY_BACKEND`:
+
+1. Run `kg-communities --dry-run` and read `communities_by_level`, `written`, `unchanged` and `stale_deleted`.
+2. Run `kg-communities --report`. Changed communities get new reports, and old ones are deleted.
+3. To force every report again, delete them:
+   `MATCH (r:CommunityReport) DETACH DELETE r`, then run again. The LLM cache makes this cheap for unchanged input.
+
+### 10.3 Cost and cache
+
+| Item | Value |
+|---|---|
+| LLM calls for each run | at most `COMMUNITY_BUDGET` (default 100); the rest of the reports are extractive |
+| LLM off | `COMMUNITY_LLM=off` or `kg-communities --no-llm` gives extractive reports only |
+| Cache | `$SOURCE_ARCHIVE_PATH/cache/llm` in Dagster (`LLM_CACHE_DIR` or `.kg-cache/llm` for the CLI); a rerun with the same input costs no LLM call |
+| Embeddings | one vector for each changed report, index `community_report_embedding` |
+| `global_search` | one LLM call for each report that it reads (`top_k`, default 8) and one for the answer |
+
+A change of the prompt version (`PROMPT_VERSION` in `communities.py`) makes every report stale.
+
+### 10.4 Leiden library
+
+The extra `graphrag` pins `graspologic-native==1.3.1` (MIT). Install it with `pip install 'kg-pipeline[graphrag]'`.
+`networkx` has no usable Leiden without a GPL backend, and `python-igraph` and `leidenalg` are GPL, so
+they are not used. Without the extra, `KG_COMMUNITY_BACKEND=auto` uses a pure-Python seeded Louvain
+variant in `leiden_fallback.py`. `KG_COMMUNITY_BACKEND=library` fails with an error that names the extra.
+The two backends give different partitions. Keep one backend for a stable result. The pinned version is the
+only one tested. The library was measured in a scratch environment, but `detect()` has not run with it yet; the first CI run is its first run in the pipeline.
+
+### 10.5 Index and schema check
+
+The first run creates two uniqueness constraints (`community_id`, `community_report_id`), the full-text
+index `community_report_text` and, when the embedder is set, the vector index `community_report_embedding`.
+Check them after the first run:
+
+```cypher
+SHOW CONSTRAINTS YIELD name WHERE name STARTS WITH 'community' RETURN name;
+SHOW INDEXES YIELD name, type, state WHERE name STARTS WITH 'community' RETURN name, type, state;
+```
+
+Expect all of them `ONLINE`. If a statement fails on your Neo4j edition, create a plain index instead and
+report it. A change of `EMBEDDINGS_DIMENSIONS` needs `DROP INDEX community_report_embedding IF EXISTS` and a
+new run (same as [7.3](#73-change-the-embedding-model)).
+
+### 10.6 Memory and limits
+
+| Topic | Rule |
+|---|---|
+| Memory | The projection of a partition is in memory, about 100 bytes for each edge in CPython. The defaults (200000 nodes, 2000000 edges) can need 300 MB or more. Set the memory limit of the Dagster run pod above that. |
+| Large partition | A partition above `KG_COMMUNITY_MAX_NODES` or `KG_COMMUNITY_MAX_EDGES` is skipped, not cut. The log shows `partition ... skipped`, and `skipped_too_large` counts them. Raise the limit and the pod memory, or accept no community for that partition. |
+| Speed | The fallback is slower than the library: expect minutes for each million edges. |
+| No cross-repository communities | The pipeline splits by ACL partition: `repo:<name>` for code, one partition for each `acl` list of `Source` nodes. A theme that spans partitions is lost. |
+| Levels | `KG_COMMUNITY_LEVELS` (default 2, range 1 to 4). Level 0 is the finest. More levels cost more reports. |
+| ACL | A community and a report never mix ACL sets. `*` in a node `acl` is an ordinary group name. A non-empty `acl` without a valid group (for example `[""]`) goes to the sentinel group `__invalid__`, so nobody sees it. |
+| ACL window | The text of a report comes from its members and stays in the graph until the next `graphrag_job`. When `kg-permissions` (asset `source_permissions`) narrows the ACL of a Document or Section, the old community and report keep the old ACL until `graphrag_job` runs again. In this window a caller of the old group can still read the report text. `graphrag_job` does not depend on `source_permissions`: the job selects only the two community assets, and the permission sync needs Jira and Confluence access. Dagster does not run it first. |
+| After you narrow an ACL | Run `graphrag_job` (or `kg-communities --report`) right after the permission sync that narrowed the ACL. Do not wait for `graphrag_daily`. Rule: narrow an ACL, then run `graphrag_job`. |
+| Skipped partition | The existing communities and reports of a skipped partition stay as they are. They are not deleted, but they are not updated either. |
+
+### 10.7 Not yet verified against a live Neo4j
+
+The Cypher of this feature ran on fakes only. The first CI integration run and the first kind test must
+check the following. Treat a failure here as expected work, not as an incident.
+
+| Area | What to check |
+|---|---|
+| Loader | Node scan by keyset pages over unlabeled `MATCH (n)` (no index help, can be slow); one edge query for each type in `EDGE_WEIGHTS`; co-change query `(Commit\|PullRequest)-[:MODIFIES]->(Code)` |
+| Writer | Write of `Community` nodes, `IN_COMMUNITY` and `CHILD_OF` edges; member match `MATCH (m:<Code\|Source\|Domain\|Requirement> {id: ...})` with a label (index on `Domain` and `Requirement` from `ensure_schema`); stale delete |
+| Reports | Report load (4 queries for each batch of 200), write, `REPORTS_ON` link and embedding write |
+| Schema | Constraints, full-text and vector index DDL on Community Edition (`test_ensure_schema_live`) |
+| Hash | Query of the member summary hashes (`_HASHES_Q`) |
+| Expansion | The Cypher of `local_search`: `CALL (id) {...}` scope syntax and unlabeled `MATCH (n {id: id})`; seed retrieval with the report and chunk indexes |
+| Tools | `global_search` and `local_search` with a real LLM; the evaluation gates in `ci.yml` are provisional |
+
+If one of them fails, read the error of the run, fix the statement and run again. Nothing here changes data
+outside the `Community` and `CommunityReport` nodes.

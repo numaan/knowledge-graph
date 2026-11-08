@@ -17,6 +17,8 @@ type Server struct {
 	gov                         // per-user access, audit and write-back; see access.go
 	rerank      *Reranker       // optional cross-encoder after RRF; nil is off (rerank.go)
 	llm         *ChatLLM        // optional chat model for ask; nil turns ask off (ask.go)
+
+	graphOverride graphReader // test seam for the GraphRAG tools; nil uses graph (graphrag.go)
 }
 
 func (s *Server) repo(r string) string {
@@ -143,6 +145,7 @@ func (s *Server) register(m *mcp.Server) {
 	s.registerContracts(m)
 	s.registerWriteback(m)
 	s.registerAsk(m)
+	s.registerGraphRAG(m)
 	addTool(m, &mcp.Tool{Name: "search_graph", Description: "Find code for a question in natural language. " +
 		"Hybrid search (vectors + full text + domain concepts) over code chunks, then graph expansion: each result has the " +
 		"symbol, its domain concepts, business rules, callers, callees, related tests and a code excerpt. Start here."},

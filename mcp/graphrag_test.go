@@ -1,0 +1,929 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+)
+
+// fakeGraph answers a query with the first rule whose substring the Cypher contains.
+type fakeRule struct {
+	sub  string
+	rows func(p map[string]any) []map[string]any
+}
+
+type fakeGraph struct {
+	mu    sync.Mutex
+	rules []fakeRule
+	seen  []string
+	args  []map[string]any
+}
+
+func (f *fakeGraph) Read(_ context.Context, cypher string, params map[string]any) ([]map[string]any, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.seen = append(f.seen, cypher)
+	f.args = append(f.args, params)
+	for _, r := range f.rules {
+		if strings.Contains(cypher, r.sub) {
+			return r.rows(params), nil
+		}
+	}
+	return []map[string]any{}, nil
+}
+
+func fixed(rows ...map[string]any) func(map[string]any) []map[string]any {
+	return func(map[string]any) []map[string]any { return rows }
+}
+
+func idRows(ids ...string) []map[string]any {
+	out := []map[string]any{}
+	for _, id := range ids {
+		out = append(out, map[string]any{"id": id})
+	}
+	return out
+}
+
+func report(id string, level int, acl []any, repo string) map[string]any {
+	return map[string]any{"id": id, "title": "Title " + id, "summary": "Summary " + id, "findings": []any{"f1 " + id},
+		"rank": 7.5, "level": int64(level), "acl": acl, "repo": repo, "community_id": "community:" + id}
+}
+
+// reportGraph returns a fake with the given vector and full text order and report rows by id.
+func reportGraph(vector, text []string, reports ...map[string]any) *fakeGraph {
+	byID := map[string]map[string]any{}
+	for _, r := range reports {
+		byID[r["id"].(string)] = r
+	}
+	return &fakeGraph{rules: []fakeRule{
+		{"community_report_embedding", fixed(idRows(vector...)...)},
+		{"community_report_text", fixed(idRows(text...)...)},
+		{"MATCH (r:CommunityReport {id: id})", func(p map[string]any) []map[string]any {
+			out := []map[string]any{}
+			for _, id := range p["ids"].([]string) {
+				if r, ok := byID[id]; ok {
+					out = append(out, r)
+				}
+			}
+			return out
+		}},
+	}}
+}
+
+func testEmbedder(t *testing.T) *Embedder {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"embedding": []float64{0.1, 0.2}}}})
+	}))
+	t.Cleanup(srv.Close)
+	return NewEmbedder(srv.URL, "m", "")
+}
+
+func graphragServer(t *testing.T, g graphReader) *Server {
+	t.Helper()
+	return &Server{graphOverride: g, emb: testEmbedder(t), groups: map[string]bool{"*": true}}
+}
+
+func callerCtx(groups ...string) context.Context {
+	m := map[string]bool{}
+	for _, g := range groups {
+		m[g] = true
+	}
+	return withAccess(context.Background(), &Access{User: "t", Groups: m, Via: "token"})
+}
+
+func reportIDs(rows []reportRow) []string {
+	out := []string{}
+	for _, r := range rows {
+		out = append(out, r.ID)
+	}
+	return out
+}
+
+func equal(a, b []string) bool {
+	return strings.Join(a, "|") == strings.Join(b, "|")
+}
+
+func TestReaderOverride(t *testing.T) {
+	g := &fakeGraph{}
+	if (&Server{graphOverride: g}).reader() != graphReader(g) {
+		t.Fatal("reader() must return the override")
+	}
+}
+
+func TestReportHitsACL(t *testing.T) {
+	restricted := report("report:r", 0, []any{"jira:PREC"}, "")
+	public := report("report:p", 0, []any{}, "")
+	g := reportGraph([]string{"report:r", "report:p"}, []string{"report:p", "report:r"}, restricted, public)
+	s := graphragServer(t, g)
+	cases := []struct {
+		name   string
+		groups []string
+		want   []string
+	}{
+		{"other group drops restricted", []string{"confluence:ENG"}, []string{"report:p"}},
+		{"matching group keeps both", []string{"jira:PREC"}, []string{"report:p", "report:r"}},
+		{"star keeps both", []string{"*"}, []string{"report:p", "report:r"}},
+		{"no groups keeps public only", nil, []string{"report:p"}},
+	}
+	for _, c := range cases {
+		got, err := s.reportHits(callerCtx(c.groups...), "question", nil, 8)
+		if err != nil {
+			t.Fatal(c.name, err)
+		}
+		if !equal(reportIDs(got), c.want) {
+			t.Errorf("%s: got %v want %v", c.name, reportIDs(got), c.want)
+		}
+	}
+}
+
+func TestReportHitsRepoScope(t *testing.T) {
+	mine := report("report:mine", 0, []any{}, "precept")
+	other := report("report:other", 0, []any{}, "bookshop")
+	g := reportGraph([]string{"report:other", "report:mine"}, []string{"report:mine"}, mine, other)
+	s := graphragServer(t, g)
+	got, _ := s.reportHits(callerCtx("repo:precept"), "q", nil, 8)
+	if !equal(reportIDs(got), []string{"report:mine"}) {
+		t.Fatalf("repo scope: %v", reportIDs(got))
+	}
+	got, _ = s.reportHits(callerCtx("*"), "q", nil, 8)
+	if len(got) != 2 {
+		t.Fatalf("star sees both repos: %v", reportIDs(got))
+	}
+	// the Cypher carries the repo scope too
+	joined := strings.Join(g.seen, "\n")
+	if !strings.Contains(joined, "$repos IS NULL") {
+		t.Error("report queries must carry the $repos scope")
+	}
+}
+
+func TestReportHitsLevel(t *testing.T) {
+	l0 := report("report:l0", 0, []any{}, "")
+	l1 := report("report:l1", 1, []any{}, "")
+	g := reportGraph([]string{"report:l0", "report:l1"}, []string{"report:l1"}, l0, l1)
+	s := graphragServer(t, g)
+	one := 1
+	got, _ := s.reportHits(callerCtx("*"), "q", &one, 8)
+	if !equal(reportIDs(got), []string{"report:l1"}) {
+		t.Fatalf("level filter: %v", reportIDs(got))
+	}
+	got, _ = s.reportHits(callerCtx("*"), "q", nil, 8)
+	if len(got) != 2 {
+		t.Fatalf("no level: %v", reportIDs(got))
+	}
+}
+
+func TestReportHitsFusionOrderAndCut(t *testing.T) {
+	a, b, c := report("report:a", 0, []any{}, ""), report("report:b", 0, []any{}, ""), report("report:c", 0, []any{}, "")
+	// a is in both lists, c is first in vector only, b is second in text only: order a, c, b
+	g := reportGraph([]string{"report:c", "report:a"}, []string{"report:a", "report:b"}, a, b, c)
+	s := graphragServer(t, g)
+	got, err := s.reportHits(callerCtx("*"), "q", nil, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equal(reportIDs(got), []string{"report:a", "report:c", "report:b"}) {
+		t.Fatalf("fused order: %v", reportIDs(got))
+	}
+	got, _ = s.reportHits(callerCtx("*"), "q", nil, 2)
+	if !equal(reportIDs(got), []string{"report:a", "report:c"}) {
+		t.Fatalf("cut to k: %v", reportIDs(got))
+	}
+	if got[0].Title != "Title report:a" || got[0].Rank != 7.5 || got[0].Level != 0 || len(got[0].Findings) != 1 {
+		t.Errorf("row fields: %+v", got[0])
+	}
+}
+
+// A narrow caller must still get k reports when the top hits are hidden: the filter runs after the fetch.
+func TestReportHitsFilterBeforeCut(t *testing.T) {
+	var rows []map[string]any
+	var order []string
+	for _, id := range []string{"h1", "h2", "h3", "p1"} {
+		acl := []any{"jira:PREC"}
+		if id == "p1" {
+			acl = []any{}
+		}
+		rows = append(rows, report("report:"+id, 0, acl, ""))
+		order = append(order, "report:"+id)
+	}
+	s := graphragServer(t, reportGraph(order, nil, rows...))
+	got, _ := s.reportHits(callerCtx("confluence:ENG"), "q", nil, 1)
+	if !equal(reportIDs(got), []string{"report:p1"}) {
+		t.Fatalf("got %v", reportIDs(got))
+	}
+}
+
+func TestReportMembersOnlyVisible(t *testing.T) {
+	member := func(id, name string, acl []any, repo string) map[string]any {
+		return map[string]any{"id": id, "name": name, "kind": "Ticket", "acl": acl, "repo": repo,
+			"report_acl": []any{}, "report_repo": ""}
+	}
+	g := &fakeGraph{rules: []fakeRule{{"REPORTS_ON", fixed(
+		member("m:public", "Public member", []any{}, ""),
+		member("m:hidden", "SECRET-NAME-91", []any{"jira:PREC"}, ""),
+		member("m:othrepo", "OTHER-REPO-NAME", []any{}, "bookshop"),
+		member("m:mine", "Mine", []any{}, "precept"),
+	)}}}
+	s := graphragServer(t, g)
+	got, err := s.reportMembers(callerCtx("repo:precept"), "report:r", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(got)
+	out := string(b)
+	for _, bad := range []string{"m:hidden", "SECRET-NAME-91", "m:othrepo", "OTHER-REPO-NAME"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("hidden node leaked %q in %s", bad, out)
+		}
+	}
+	if len(got) != 2 || got[0].ID != "m:public" || got[1].ID != "m:mine" {
+		t.Fatalf("members: %s", out)
+	}
+	all, _ := s.reportMembers(callerCtx("*"), "report:r", 2)
+	if len(all) != 2 {
+		t.Errorf("limit: %d", len(all))
+	}
+}
+
+func TestReportMembersHiddenReport(t *testing.T) {
+	g := &fakeGraph{rules: []fakeRule{{"REPORTS_ON", fixed(map[string]any{"id": "m:1", "name": "N", "acl": []any{},
+		"repo": "", "report_acl": []any{"jira:PREC"}, "report_repo": ""})}}}
+	s := graphragServer(t, g)
+	got, _ := s.reportMembers(callerCtx("confluence:ENG"), "report:r", 10)
+	if len(got) != 0 {
+		t.Fatalf("members of a hidden report: %v", got)
+	}
+}
+
+func TestTrimToBudget(t *testing.T) {
+	items := []string{strings.Repeat("a", 10000), strings.Repeat("b", 10000), strings.Repeat("c", 10000)}
+	kept, truncated := trimToBudget(items, graphragOutputChars, func(s string) int { return len(s) })
+	if len(kept) != 2 || !truncated {
+		t.Fatalf("kept %d truncated %v", len(kept), truncated)
+	}
+	kept, truncated = trimToBudget(items[:2], graphragOutputChars, func(s string) int { return len(s) })
+	if len(kept) != 2 || truncated {
+		t.Fatalf("within budget: kept %d truncated %v", len(kept), truncated)
+	}
+	// an item that alone exceeds the budget is dropped; callers cut long text with excerpt first
+	kept, truncated = trimToBudget([]string{strings.Repeat("x", 30000)}, graphragOutputChars, func(s string) int { return len(s) })
+	if len(kept) != 0 || !truncated {
+		t.Fatalf("one oversized item: kept %d truncated %v", len(kept), truncated)
+	}
+	if graphragOutputChars != 24000 || graphragExcerptChars != 400 {
+		t.Error("constants")
+	}
+}
+
+func TestExcerpt(t *testing.T) {
+	if got := excerpt(strings.Repeat("é", 500), graphragExcerptChars); len([]rune(got)) > graphragExcerptChars+1 {
+		t.Errorf("excerpt too long: %d", len([]rune(got)))
+	}
+	if excerpt("short", 400) != "short" {
+		t.Error("short text must stay")
+	}
+}
+
+// ---- global_search ----
+
+// recLLM is a chat endpoint that records every request body and answers by the system prompt.
+type recLLM struct {
+	mu     sync.Mutex
+	bodies []string
+	maps   int
+	reduce int
+}
+
+func newRecLLM(t *testing.T, mapReply, reduceReply string) (*ChatLLM, *recLLM) {
+	t.Helper()
+	rec := &recLLM{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var in struct {
+			Messages []struct{ Role, Content string }
+		}
+		json.Unmarshal(raw, &in)
+		rec.mu.Lock()
+		rec.bodies = append(rec.bodies, string(raw))
+		reply := reduceReply
+		if strings.HasPrefix(in.Messages[0].Content, "You read one community report") {
+			rec.maps++
+			reply = mapReply
+		} else {
+			rec.reduce++
+		}
+		rec.mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"role": "assistant", "content": reply}}}})
+	}))
+	t.Cleanup(srv.Close)
+	return NewChatLLM(srv.URL, "m", ""), rec
+}
+
+func memberRow(id, name string, acl []any) map[string]any {
+	return map[string]any{"id": id, "name": name, "kind": "Ticket", "acl": acl, "repo": "", "report_acl": []any{}, "report_repo": ""}
+}
+
+// globalGraph is a report graph with n public reports r1..rn and the given members for every report.
+func globalGraph(n int, members ...map[string]any) *fakeGraph {
+	var order []string
+	var reps []map[string]any
+	for i := 1; i <= n; i++ {
+		id := fmt.Sprintf("report:r%d", i)
+		order = append(order, id)
+		reps = append(reps, report(id, 0, []any{}, ""))
+	}
+	g := reportGraph(order, nil, reps...)
+	g.rules = append([]fakeRule{{"REPORTS_ON", fixed(members...)}}, g.rules...)
+	return g
+}
+
+func TestGlobalSearchNoLLM(t *testing.T) {
+	g := globalGraph(3, memberRow("m:1", "Member One", []any{}))
+	s := graphragServer(t, g)
+	cs := connect(t, newMCPServer(s)) // registered without an LLM
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "global_search", Arguments: map[string]any{"question": "themes?"}})
+	if err != nil || res.IsError {
+		t.Fatalf("call: %v %+v", err, res)
+	}
+	var out GlobalSearchOut
+	b, _ := json.Marshal(res.StructuredContent)
+	json.Unmarshal(b, &out)
+	if len(out.Reports) != 3 || out.Note == "" || out.Answer != "" || len(out.Citations) != 0 {
+		t.Fatalf("no llm: %s", b)
+	}
+	r := out.Reports[0]
+	if r.ID != "report:r1" || r.Title == "" || r.Summary == "" || len(r.Entities) != 1 || r.Entities[0].ID != "m:1" {
+		t.Errorf("report fields: %+v", r)
+	}
+}
+
+func TestGlobalSearchMapReduce(t *testing.T) {
+	llm, rec := newRecLLM(t, "Partial finding.", "Theme A [1] and theme B [2][9].")
+	g := globalGraph(5, memberRow("m:1", "Member One", []any{}))
+	s := graphragServer(t, g)
+	s.llm = llm
+	out, err := s.globalSearch(callerCtx("*"), GlobalSearchIn{Question: "themes?", TopK: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.maps != 3 || rec.reduce != 1 {
+		t.Fatalf("calls: %d map, %d reduce", rec.maps, rec.reduce)
+	}
+	if len(out.Reports) != 3 || len(out.Citations) != 2 {
+		t.Fatalf("out: %+v", out)
+	}
+	if out.Citations[0].ID != "report:r1" || out.Citations[1].ID != "report:r2" || out.Citations[0].Entities[0].ID != "m:1" {
+		t.Errorf("citations: %+v", out.Citations)
+	}
+	if len(out.InvalidCitations) != 1 || out.InvalidCitations[0] != 9 || strings.Contains(out.Answer, "[9]") || !strings.Contains(out.Answer, "[2]") {
+		t.Errorf("invalid citations: %v answer %q", out.InvalidCitations, out.Answer)
+	}
+}
+
+// A caller without the group must not get the restricted report anywhere: not in the output and not in
+// any prompt sent to the LLM. Members the caller cannot see are absent too.
+func TestGlobalSearchACLLeak(t *testing.T) {
+	const marker = "ZX-MARKER-7731"
+	restricted := report("report:secret", 0, []any{"jira:PREC"}, "")
+	restricted["title"] = "Secret Title " + marker
+	restricted["summary"] = "text with " + marker
+	restricted["findings"] = []any{marker}
+	public := report("report:pub", 0, []any{}, "")
+	g := reportGraph([]string{"report:secret", "report:pub"}, []string{"report:secret", "report:pub"}, restricted, public)
+	g.rules = append([]fakeRule{{"REPORTS_ON", fixed(
+		memberRow("m:visible", "Visible Name", []any{}),
+		memberRow("m:hidden", "HIDDEN-MEMBER-NAME", []any{"jira:PREC"}),
+	)}}, g.rules...)
+	llm, rec := newRecLLM(t, "Partial.", "Answer [1].")
+	s := graphragServer(t, g)
+	s.llm = llm
+	out, err := s.globalSearch(callerCtx("confluence:ENG"), GlobalSearchIn{Question: "themes?"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(out)
+	texts := append([]string{string(b), out.Answer, out.Note}, rec.bodies...)
+	for _, text := range texts {
+		for _, bad := range []string{"report:secret", "Secret Title", marker, "m:hidden", "HIDDEN-MEMBER-NAME"} {
+			if strings.Contains(text, bad) {
+				t.Errorf("leak of %q in %.200s", bad, text)
+			}
+		}
+	}
+	if len(out.Reports) != 1 || out.Reports[0].ID != "report:pub" || len(rec.bodies) == 0 {
+		t.Fatalf("visible output: %s", b)
+	}
+	if len(out.Reports[0].Entities) != 1 || out.Reports[0].Entities[0].ID != "m:visible" {
+		t.Errorf("entities: %+v", out.Reports[0].Entities)
+	}
+	// the caller with the group does see it
+	out, _ = s.globalSearch(callerCtx("jira:PREC"), GlobalSearchIn{Question: "themes?"})
+	if len(out.Reports) != 2 {
+		t.Errorf("authorised caller: %d reports", len(out.Reports))
+	}
+}
+
+func TestGlobalSearchBudget(t *testing.T) {
+	var members []map[string]any
+	for i := 0; i < 10; i++ {
+		members = append(members, memberRow(fmt.Sprintf("m:%d", i), strings.Repeat("n", 500), []any{}))
+	}
+	g := globalGraph(20, members...)
+	s := graphragServer(t, g)
+	out, err := s.globalSearch(callerCtx("*"), GlobalSearchIn{Question: "q", TopK: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(out)
+	if len(b) > graphragOutputChars || !out.Truncated || len(out.Reports) == 0 || len(out.Reports) >= 20 {
+		t.Fatalf("budget: %d chars, truncated %v, %d reports", len(b), out.Truncated, len(out.Reports))
+	}
+	small, _ := s.globalSearch(callerCtx("*"), GlobalSearchIn{Question: "q", TopK: 2})
+	if small.Truncated || len(small.Reports) != 2 {
+		t.Errorf("small output: truncated %v, %d reports", small.Truncated, len(small.Reports))
+	}
+}
+
+func TestGlobalSearchEmpty(t *testing.T) {
+	s := graphragServer(t, &fakeGraph{})
+	out, err := s.globalSearch(callerCtx("*"), GlobalSearchIn{Question: "nothing"})
+	if err != nil {
+		t.Fatalf("empty result must not be an error: %v", err)
+	}
+	if !strings.Contains(out.Answer, "No community report") || len(out.Reports) != 0 || out.Reports == nil {
+		t.Errorf("empty: %+v", out)
+	}
+}
+
+func TestGlobalSearchTopKClamp(t *testing.T) {
+	llm, rec := newRecLLM(t, "Partial.", "Answer [1].")
+	s := graphragServer(t, globalGraph(30))
+	s.llm = llm
+	out, _ := s.globalSearch(callerCtx("*"), GlobalSearchIn{Question: "q", TopK: 50})
+	if len(out.Reports) != 20 || rec.maps != 20 {
+		t.Errorf("top_k 50: %d reports, %d map calls", len(out.Reports), rec.maps)
+	}
+	out, _ = s.globalSearch(callerCtx("*"), GlobalSearchIn{Question: "q"})
+	if len(out.Reports) != 8 {
+		t.Errorf("default top_k: %d", len(out.Reports))
+	}
+}
+
+func TestGlobalSearchDescription(t *testing.T) {
+	tools, err := connect(t, newMCPServer(graphragServer(t, &fakeGraph{}))).ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range tools.Tools {
+		if tool.Name == "global_search" {
+			if !strings.Contains(tool.Description, "not coding agents") {
+				t.Errorf("description: %s", tool.Description)
+			}
+			return
+		}
+	}
+	t.Error("global_search not registered")
+}
+
+// ---- local_search helpers --------------------------------------------------------------------------
+
+func nodeRow(id string, acl []any, repo string) map[string]any {
+	return map[string]any{"id": id, "name": "name " + id, "kind": "Function", "acl": acl, "repo": repo}
+}
+
+// localFake answers node lookup by id and neighbour rows from an edge list (edges are CALLS, a -> b).
+type localFake struct {
+	*fakeGraph
+	nodes map[string]map[string]any
+}
+
+func newLocalFake(nodes []map[string]any, edges [][2]string) *localFake {
+	lf := &localFake{nodes: map[string]map[string]any{}}
+	for _, n := range nodes {
+		lf.nodes[n["id"].(string)] = n
+	}
+	lf.fakeGraph = &fakeGraph{rules: []fakeRule{
+		{"UNWIND $ids AS nid CALL (nid)", func(p map[string]any) []map[string]any {
+			out := []map[string]any{}
+			for _, id := range p["ids"].([]string) {
+				if n, ok := lf.nodes[id]; ok {
+					out = append(out, n)
+				}
+			}
+			return out
+		}},
+		{"-[r]-(b)", func(p map[string]any) []map[string]any {
+			out := []map[string]any{}
+			for _, id := range p["ids"].([]string) {
+				for _, e := range edges {
+					for dir := 0; dir < 2; dir++ {
+						if e[dir] != id {
+							continue
+						}
+						n, ok := lf.nodes[e[1-dir]]
+						if !ok {
+							continue
+						}
+						row := map[string]any{"a": id, "type": "CALLS", "out": dir == 0}
+						for k, v := range n {
+							row[k] = v
+						}
+						out = append(out, row)
+					}
+				}
+			}
+			return out
+		}},
+		{"n.qualname = $ref", func(p map[string]any) []map[string]any {
+			out := []map[string]any{}
+			for _, n := range lf.nodes {
+				if n["name"] == p["ref"] {
+					out = append(out, n)
+				}
+			}
+			return out
+		}},
+	}}
+	return lf
+}
+
+// starNodes builds a hub with `leaves` neighbours; each neighbour has `kids` further neighbours.
+func starNodes(leaves, kids int) ([]map[string]any, [][2]string) {
+	nodes := []map[string]any{nodeRow("hub", nil, "")}
+	var edges [][2]string
+	for i := 0; i < leaves; i++ {
+		leaf := fmt.Sprintf("n%03d", i)
+		nodes = append(nodes, nodeRow(leaf, nil, ""))
+		edges = append(edges, [2]string{"hub", leaf})
+		for j := 0; j < kids; j++ {
+			kid := fmt.Sprintf("k%03d_%02d", i, j)
+			nodes = append(nodes, nodeRow(kid, nil, ""))
+			edges = append(edges, [2]string{leaf, kid})
+		}
+	}
+	return nodes, edges
+}
+
+func nodeIDs(g localSubgraph) map[string]bool {
+	out := map[string]bool{}
+	for _, n := range g.Nodes {
+		out[n.ID] = true
+	}
+	return out
+}
+
+func TestLocalConstants(t *testing.T) {
+	if localHopCap != 15 || localNodeCap != 60 || localCommunityCap != 5 || localDefaultTokens != 4000 {
+		t.Fatal("local_search constants changed")
+	}
+	for in, want := range map[int]int{0: 4000, 100: 500, 500: 500, 9000: 9000, 99999: 16000} {
+		if got := localTokens(in); got != want {
+			t.Errorf("localTokens(%d) = %d, want %d", in, got, want)
+		}
+	}
+}
+
+func TestLocalSeedsByID(t *testing.T) {
+	lf := newLocalFake([]map[string]any{nodeRow("a", nil, ""), nodeRow("b", nil, "")}, nil)
+	s := graphragServer(t, lf)
+	got, err := s.localSeeds(context.Background(), "q", []string{"b", "a", "b"})
+	if err != nil || !equal(got, []string{"b", "a"}) {
+		t.Fatalf("got %v %v", got, err)
+	}
+	// a name resolves when exactly one node has it; an unknown reference fails closed
+	got, err = s.localSeeds(context.Background(), "q", []string{"name a"})
+	if err != nil || !equal(got, []string{"a"}) {
+		t.Fatalf("by name: %v %v", got, err)
+	}
+	if _, err = s.localSeeds(context.Background(), "q", []string{"nope"}); err == nil {
+		t.Fatal("want an error when no seed resolves")
+	}
+}
+
+func TestLocalSeedsHidden(t *testing.T) {
+	lf := newLocalFake([]map[string]any{nodeRow("secret", []any{"jira:PREC"}, ""), nodeRow("open", nil, "")}, nil)
+	s := graphragServer(t, lf)
+	got, err := s.localSeeds(callerCtx("confluence:ENG"), "q", []string{"secret", "open"})
+	if err != nil || !equal(got, []string{"open"}) {
+		t.Fatalf("got %v %v", got, err)
+	}
+	_, err = s.localSeeds(callerCtx("confluence:ENG"), "q", []string{"secret"})
+	if err == nil || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("a hidden seed must look like a missing one: %v", err)
+	}
+}
+
+func TestLocalSeedsHybrid(t *testing.T) {
+	lf := newLocalFake([]map[string]any{nodeRow("sym1", nil, ""), nodeRow("sym2", nil, ""),
+		nodeRow("tick", []any{"jira:PREC"}, ""), nodeRow("sec", nil, "")}, nil)
+	lf.rules = append([]fakeRule{
+		{"chunk_embedding", fixed(idRows("c1")...)},
+		{"chunk_text", fixed(idRows("c2", "c1")...)},
+		{"source_embedding", fixed(idRows("tick", "sec")...)},
+		{"source_text", fixed(idRows("sec")...)},
+		{"MATCH (c:Chunk {id: id})-[:PART_OF]->(o)", func(p map[string]any) []map[string]any {
+			m := map[string]string{"c1": "sym1", "c2": "sym2"}
+			out := []map[string]any{}
+			for _, id := range p["ids"].([]string) {
+				out = append(out, map[string]any{"id": id, "owner": m[id]})
+			}
+			return out
+		}},
+	}, lf.rules...)
+	s := graphragServer(t, lf)
+	got, err := s.localSeeds(callerCtx("confluence:ENG"), "how does it work", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := map[string]bool{}
+	for _, id := range got {
+		set[id] = true
+	}
+	if !set["sym1"] || !set["sym2"] || !set["sec"] || set["tick"] || len(got) > localSeedCap {
+		t.Fatalf("hybrid seeds: %v", got)
+	}
+}
+
+func TestExpandLocalStarCaps(t *testing.T) {
+	nodes, edges := starNodes(200, 20)
+	s := graphragServer(t, newLocalFake(nodes, edges))
+	g, err := s.expandLocal(context.Background(), []string{"hub"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(g.Nodes) != 1+localHopCap || len(g.Rels) != localHopCap || !g.Truncated {
+		t.Fatalf("hop cap: %d nodes %d rels truncated=%v", len(g.Nodes), len(g.Rels), g.Truncated)
+	}
+	g, err = s.expandLocal(context.Background(), []string{"hub"}, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(g.Nodes) != localNodeCap || !g.Truncated {
+		t.Fatalf("node cap: %d nodes truncated=%v", len(g.Nodes), g.Truncated)
+	}
+	have := nodeIDs(g)
+	for _, r := range g.Rels {
+		if !have[r.From] || !have[r.To] {
+			t.Errorf("relation %v touches a node that is not returned", r)
+		}
+	}
+}
+
+func TestExpandLocalHopsClamp(t *testing.T) {
+	// chain a - b - c - d - e
+	var nodes []map[string]any
+	for _, id := range []string{"a", "b", "c", "d", "e"} {
+		nodes = append(nodes, nodeRow(id, nil, ""))
+	}
+	s := graphragServer(t, newLocalFake(nodes, [][2]string{{"a", "b"}, {"b", "c"}, {"c", "d"}, {"d", "e"}}))
+	for hops, want := range map[int]int{0: 3, 1: 2, 2: 3, 3: 4, 9: 4, -4: 2} {
+		g, err := s.expandLocal(context.Background(), []string{"a"}, hops)
+		if err != nil || len(g.Nodes) != want {
+			t.Errorf("hops %d: %d nodes (want %d) %v", hops, len(g.Nodes), want, err)
+		}
+	}
+}
+
+func TestExpandLocalHidden(t *testing.T) {
+	nodes := []map[string]any{nodeRow("a", nil, ""), nodeRow("b", nil, ""), nodeRow("secret", []any{"jira:PREC"}, ""),
+		nodeRow("beyond", nil, "")}
+	// the only path to "beyond" runs through the hidden node
+	edges := [][2]string{{"a", "b"}, {"a", "secret"}, {"secret", "beyond"}, {"b", "secret"}}
+	s := graphragServer(t, newLocalFake(nodes, edges))
+	g, err := s.expandLocal(callerCtx("confluence:ENG"), []string{"a"}, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	have := nodeIDs(g)
+	if !have["a"] || !have["b"] || have["secret"] || have["beyond"] {
+		t.Fatalf("nodes: %v", have)
+	}
+	out, _ := json.Marshal(g)
+	if strings.Contains(string(out), "secret") {
+		t.Fatalf("hidden node leaks: %s", out)
+	}
+	if len(g.Rels) != 1 || g.Rels[0].From != "a" || g.Rels[0].To != "b" {
+		t.Fatalf("rels: %v", g.Rels)
+	}
+	// a caller with the group sees all
+	g, _ = s.expandLocal(callerCtx("jira:PREC"), []string{"a"}, 3)
+	if !nodeIDs(g)["secret"] || !nodeIDs(g)["beyond"] {
+		t.Fatalf("authorised caller: %v", nodeIDs(g))
+	}
+}
+
+func TestExpandLocalRepoScope(t *testing.T) {
+	nodes := []map[string]any{nodeRow("a", nil, "precept"), nodeRow("mine", nil, "precept"), nodeRow("other", nil, "bookshop")}
+	s := graphragServer(t, newLocalFake(nodes, [][2]string{{"a", "mine"}, {"a", "other"}}))
+	g, err := s.expandLocal(callerCtx("repo:precept"), []string{"a"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	have := nodeIDs(g)
+	if !have["a"] || !have["mine"] || have["other"] || len(g.Rels) != 1 {
+		t.Fatalf("repo scope: %v %v", have, g.Rels)
+	}
+	// a seed outside the scope is dropped
+	g, _ = s.expandLocal(callerCtx("repo:precept"), []string{"other"}, 1)
+	if len(g.Nodes) != 0 || len(g.Rels) != 0 {
+		t.Fatalf("hidden seed expanded: %v", g)
+	}
+}
+
+// ---- local_search tool ------------------------------------------------------------------------------
+
+// localToolGraph adds snippet and community rows to a local fake. Snippets exist for every node id asked
+// for, so the test shows that the code only asks for visible ids.
+func localToolGraph(nodes []map[string]any, edges [][2]string, reports map[string][]map[string]any) *localFake {
+	lf := newLocalFake(nodes, edges)
+	lf.rules = append([]fakeRule{
+		{"c.text_masked", func(p map[string]any) []map[string]any {
+			out := []map[string]any{}
+			for _, id := range p["ids"].([]string) {
+				out = append(out, map[string]any{"node": id, "id": "chunk:" + id, "text": "text of " + id})
+			}
+			return out
+		}},
+		{"IN_COMMUNITY", func(p map[string]any) []map[string]any {
+			out := []map[string]any{}
+			for _, id := range p["ids"].([]string) {
+				for _, r := range reports[id] {
+					row := map[string]any{"node": id}
+					for k, v := range r {
+						row[k] = v
+					}
+					out = append(out, row)
+				}
+			}
+			return out
+		}},
+	}, lf.rules...)
+	return lf
+}
+
+func localCall(t *testing.T, s *Server, args map[string]any) (LocalSearchOut, string) {
+	t.Helper()
+	res, err := connect(t, newMCPServer(s)).CallTool(callerCtx("*"), &mcp.CallToolParams{Name: "local_search", Arguments: args})
+	if err != nil || res.IsError {
+		t.Fatalf("call: %v %+v", err, res)
+	}
+	b, _ := json.Marshal(res.StructuredContent)
+	var out LocalSearchOut
+	json.Unmarshal(b, &out)
+	return out, string(b)
+}
+
+func TestLocalSearchStructured(t *testing.T) {
+	nodes := []map[string]any{nodeRow("a", nil, ""), nodeRow("b", nil, ""), nodeRow("c", nil, "")}
+	reps := map[string][]map[string]any{"a": {report("report:one", 0, []any{}, "")}, "b": {report("report:one", 0, []any{}, "")}}
+	s := graphragServer(t, localToolGraph(nodes, [][2]string{{"a", "b"}, {"a", "c"}}, reps))
+	out, raw := localCall(t, s, map[string]any{"question": "how?", "seeds": []any{"a"}})
+	if len(out.Entities) != 3 || len(out.Relations) != 2 || len(out.Snippets) != 3 || len(out.Communities) != 1 || out.Truncated {
+		t.Fatalf("lists: %s", raw)
+	}
+	cites := map[string]bool{}
+	var all []string
+	for _, e := range out.Entities {
+		all = append(all, e.Cite)
+	}
+	for _, e := range out.Relations {
+		all = append(all, e.Cite)
+	}
+	for _, e := range out.Snippets {
+		all = append(all, e.Cite)
+	}
+	for _, e := range out.Communities {
+		all = append(all, e.Cite)
+	}
+	for _, c := range all {
+		if c == "" || cites[c] {
+			t.Errorf("citation id %q empty or repeated", c)
+		}
+		cites[c] = true
+	}
+	if out.Communities[0].ID != "report:one" || out.Communities[0].Title != "Title report:one" || out.Snippets[0].Text == "" {
+		t.Errorf("items: %s", raw)
+	}
+	if s.llm != nil {
+		t.Fatal("test server must have no LLM")
+	}
+}
+
+func TestLocalSearchTokenBudget(t *testing.T) {
+	nodes, edges := starNodes(15, 0)
+	s := graphragServer(t, localToolGraph(nodes, edges, nil))
+	full, _ := localCall(t, s, map[string]any{"question": "q", "seeds": []any{"hub"}, "hops": 1, "token_budget": 16000})
+	if full.Truncated || len(full.Entities) != 16 {
+		t.Fatalf("full: truncated %v, %d entities", full.Truncated, len(full.Entities))
+	}
+	out, raw := localCall(t, s, map[string]any{"question": "q", "seeds": []any{"hub"}, "hops": 1, "token_budget": 500})
+	if !out.Truncated || len(out.Omitted) == 0 {
+		t.Fatalf("budget 500: %s", raw)
+	}
+	if len(raw) > 500*4+600 {
+		t.Errorf("output of %d chars is far over the budget", len(raw))
+	}
+	have := map[string]bool{}
+	for _, e := range out.Entities {
+		have[e.ID] = true
+	}
+	for _, r := range out.Relations {
+		if !have[r.From] || !have[r.To] {
+			t.Errorf("relation %v touches an entity that was cut", r)
+		}
+	}
+}
+
+func TestLocalSearchACLLeak(t *testing.T) {
+	const marker = "ZX-LOCAL-4412"
+	secretReport := report("report:secret", 0, []any{"jira:PREC"}, "")
+	secretReport["title"] = "Secret " + marker
+	nodes := []map[string]any{nodeRow("a", nil, ""), nodeRow("b", nil, ""), nodeRow("secret", []any{"jira:PREC"}, "")}
+	nodes[2]["name"] = "name " + marker
+	reps := map[string][]map[string]any{"a": {report("report:pub", 0, []any{}, ""), secretReport}, "b": {secretReport}}
+	lf := localToolGraph(nodes, [][2]string{{"a", "b"}, {"a", "secret"}, {"b", "secret"}}, reps)
+	s := graphragServer(t, lf)
+	out, err := s.localSearch(callerCtx("confluence:ENG"), LocalSearchIn{Question: "q", Seeds: []string{"a"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(out)
+	for _, bad := range []string{"secret", marker, "Secret"} {
+		if strings.Contains(string(b), bad) {
+			t.Errorf("leak of %q in %s", bad, b)
+		}
+	}
+	// no snippet query asks for the hidden node
+	for i, q := range lf.seen {
+		if ids, ok := lf.args[i]["ids"].([]string); ok && strings.Contains(q, "c.text_masked") {
+			for _, id := range ids {
+				if id == "secret" {
+					t.Errorf("snippet query asked for the hidden node")
+				}
+			}
+		}
+	}
+	if len(out.Entities) != 2 || len(out.Relations) != 1 || len(out.Snippets) != 2 || len(out.Communities) != 1 || out.Communities[0].ID != "report:pub" {
+		t.Fatalf("visible output: %s", b)
+	}
+	out, _ = s.localSearch(callerCtx("jira:PREC"), LocalSearchIn{Question: "q", Seeds: []string{"a"}})
+	if len(out.Entities) != 3 || len(out.Relations) != 3 || len(out.Communities) != 2 {
+		t.Errorf("authorised caller: %+v", out)
+	}
+}
+
+func TestLocalSearchCommunityCap(t *testing.T) {
+	var reps []map[string]any
+	for i := 0; i < 8; i++ {
+		reps = append(reps, report(fmt.Sprintf("report:%d", i), 0, []any{}, ""))
+	}
+	s := graphragServer(t, localToolGraph([]map[string]any{nodeRow("a", nil, "")}, nil, map[string][]map[string]any{"a": reps}))
+	out, err := s.localSearch(callerCtx("*"), LocalSearchIn{Seeds: []string{"a"}})
+	if err != nil || len(out.Communities) != localCommunityCap {
+		t.Fatalf("communities: %d %v", len(out.Communities), err)
+	}
+}
+
+func TestLocalSearchNoResult(t *testing.T) {
+	s := graphragServer(t, &fakeGraph{})
+	out, err := s.localSearch(callerCtx("*"), LocalSearchIn{Question: "nothing here"})
+	if err != nil {
+		t.Fatalf("no result must not be an error: %v", err)
+	}
+	if !strings.Contains(out.Note, "No ") || out.Entities == nil || len(out.Entities) != 0 || out.Relations == nil || out.Snippets == nil || out.Communities == nil {
+		t.Errorf("empty: %+v", out)
+	}
+	if _, err = s.localSearch(callerCtx("*"), LocalSearchIn{}); err == nil {
+		t.Error("no question and no seeds must be an error")
+	}
+}
+
+func TestToolsWithoutLLM(t *testing.T) {
+	tools, err := connect(t, newMCPServer(graphragServer(t, &fakeGraph{}))).ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]string{}
+	for _, tool := range tools.Tools {
+		names[tool.Name] = tool.Description
+	}
+	if len(tools.Tools) != 21 {
+		t.Errorf("want 21 tools without an LLM, got %d", len(tools.Tools))
+	}
+	for _, n := range []string{"global_search", "local_search"} {
+		d, ok := names[n]
+		if !ok {
+			t.Errorf("%s not registered", n)
+		}
+		if !strings.Contains(d, "not coding agents") {
+			t.Errorf("%s description: %s", n, d)
+		}
+	}
+}

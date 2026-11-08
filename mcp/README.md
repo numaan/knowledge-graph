@@ -24,7 +24,13 @@ agent ──MCP──> kg-mcp ──bolt (read tx, 15 s, 500 rows)──> Neo4j
 | `get_context_for_ticket` | Start work on a Jira ticket: text, epic, links, release, commits, code, requirements. | `key` |
 | `search_knowledge` | Find tickets and document or wiki sections. | `query`, `kind`, `k` |
 | `get_change_history` | See who changed a symbol or file, when and why. | `symbol`, `limit` |
+| `global_search` | Answer a broad question ("what are the main themes of X?") from the GraphRAG community reports. Map-reduce with numbered citations; without an LLM it returns the ranked reports. | `question`, `level` (0 is finest; empty: all), `top_k` (1-20, default 8) |
+| `local_search` | Read the area around an entity: seeds, relations up to `hops`, text snippets and the reports of their communities. Citations `E1`, `R1`, `S1`, `C1`. | `question`, `seeds` (max 5 ids or exact names), `hops` (1-3, default 2), `token_budget` (500-16000, default 4000) |
 | `read_cypher` | Anything else, in read-only Cypher. Off when `KG_ACL_GROUPS` is not `*`. | `query`, `params` |
+
+`global_search` and `local_search` read the communities that `kg-communities --report` writes (see the
+[guide](../docs/GUIDE.md#381-graphrag-communities)). They are always on, show only what the caller may
+see, and return an empty result with a `note` when no community exists.
 
 A name that matches more than one symbol returns an error with the candidate ids, so the agent can
 call again with one id.
