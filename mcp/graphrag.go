@@ -396,3 +396,308 @@ func (s *Server) globalReduce(ctx context.Context, q string, rows []reportRow, o
 	}
 	return cited
 }
+
+// ---- local_search helpers --------------------------------------------------------------------------
+
+const (
+	localHopCap        = 15              // new neighbours taken from one node in one hop
+	localNodeCap       = 60              // nodes in one result, seeds included
+	localCommunityCap  = 5               // community report titles in one result
+	localDefaultTokens = 4000            // default output budget, in tokens (chars / 4)
+	localSeedCap       = 5               // seeds expanded per call
+	localBatch         = 15              // nodes expanded per query: rows per query stay below the 500-row limit of Graph.Read
+	localPerNode       = 2 * localHopCap // rows fetched per node, spare for hidden neighbours
+)
+
+// localTokens clamps a token budget to 500..16000; 0 means the default.
+func localTokens(n int) int { return clamp(n, 500, 16000, localDefaultTokens) }
+
+// localEdgeTypes are the relations local_search follows: code, domain and cross-source links. Chunks and
+// community nodes are not entities and are left out.
+var localEdgeTypes = []string{"CALLS", "IMPORTS", "DEFINES", "CONTAINS", "EXTENDS", "IMPLEMENTS", "USES_TYPE", "REALISES",
+	"IMPLEMENTED_BY", "VALIDATED_BY", "COVERS", "REFERENCES", "LINKS", "IMPLEMENTED_IN", "DEPENDS_ON", "CALLS_HTTP", "TESTS",
+	"PUBLISHES", "SUBSCRIBES", "DESCRIBES", "USES_SCHEMA", "MAPS_TO", "READS", "WRITES"}
+
+// localNode is a visible entity in a local result.
+type localNode struct {
+	ID   string `json:"id"`
+	Name string `json:"name,omitempty"`
+	Kind string `json:"kind,omitempty"`
+	Hop  int    `json:"hop"`
+}
+
+// localRel is a typed relation between two nodes that are both in the result.
+type localRel struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+	Type string `json:"type"`
+}
+
+// localSubgraph is the expansion around the seeds. Truncated is set when a cap dropped a neighbour.
+type localSubgraph struct {
+	Nodes     []localNode `json:"nodes"`
+	Rels      []localRel  `json:"relations"`
+	Truncated bool        `json:"truncated,omitempty"`
+}
+
+// visibleLocal keeps the nodes of the rows the caller may see. Visibility is decided here, in Go, for
+// every row: the scope of the node (acl, or the acl and repo of its document) must pass visibleScope.
+// A node with any row the caller cannot see is dropped (fail closed).
+func (s *Server) visibleLocal(ctx context.Context, rows []map[string]any) map[string]localNode {
+	out := map[string]localNode{}
+	hidden := map[string]bool{}
+	for _, r := range rows {
+		id := asString(r["id"])
+		if id == "" {
+			continue
+		}
+		if !s.visibleScope(ctx, r["acl"], asString(r["repo"])) {
+			hidden[id] = true
+			continue
+		}
+		if _, ok := out[id]; !ok {
+			out[id] = localNode{ID: id, Name: excerpt(asString(r["name"]), globalNameChars), Kind: asString(r["kind"])}
+		}
+	}
+	for id := range hidden {
+		delete(out, id)
+	}
+	return out
+}
+
+const localNodeCols = `coalesce(n.qualname, n.name, n.title, n.key, n.path, n.id) AS name,
+	[l IN labels(n) WHERE NOT l IN ['Source', 'Code', 'Domain']][0] AS kind, coalesce(n.acl, d.acl) AS acl, coalesce(n.repo, d.repo) AS repo`
+
+// fetchNodes loads nodes by id and returns the visible ones.
+func (s *Server) fetchNodes(ctx context.Context, idList []string) (map[string]localNode, error) {
+	if len(idList) == 0 {
+		return map[string]localNode{}, nil
+	}
+	rows, err := s.reader().Read(ctx, `UNWIND $ids AS id MATCH (n {id: id})
+		WHERE NOT n:Chunk AND NOT n:Community AND NOT n:CommunityReport AND ($repos IS NULL OR n.repo IS NULL OR n.repo IN $repos)
+		OPTIONAL MATCH (n)-[:PART_OF]->(d:Document)
+		RETURN n.id AS id, `+localNodeCols, map[string]any{"ids": idList})
+	if err != nil {
+		return nil, err
+	}
+	return s.visibleLocal(ctx, rows), nil
+}
+
+// localSeeds returns the ids of the visible nodes to expand from, at most localSeedCap. Given seeds are
+// resolved as ids first, then as an exact qualified or short name that matches one visible node. Without
+// seeds the question runs a hybrid search (chunks, tickets, sections, pull requests; vector and full
+// text, fused with RRF). A seed that is missing and a seed that is hidden give the same error.
+func (s *Server) localSeeds(ctx context.Context, question string, seeds []string) ([]string, error) {
+	if len(seeds) > 0 {
+		return s.explicitSeeds(ctx, seeds)
+	}
+	ids, err := s.hybridSeeds(ctx, question)
+	if err != nil {
+		return nil, err
+	}
+	nodes, err := s.fetchNodes(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := []string{}
+	for _, id := range ids {
+		if _, ok := nodes[id]; ok {
+			out = append(out, id)
+			if len(out) == localSeedCap {
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+func (s *Server) explicitSeeds(ctx context.Context, seeds []string) ([]string, error) {
+	refs := []string{}
+	seen := map[string]bool{}
+	for _, r := range seeds {
+		if r = strings.TrimSpace(r); r != "" && !seen[r] {
+			seen[r] = true
+			refs = append(refs, r)
+		}
+	}
+	if len(refs) > localSeedCap {
+		refs = refs[:localSeedCap]
+	}
+	byID, err := s.fetchNodes(ctx, refs)
+	if err != nil {
+		return nil, err
+	}
+	out := []string{}
+	for _, ref := range refs {
+		if _, ok := byID[ref]; ok {
+			out = append(out, ref)
+			continue
+		}
+		rows, err := s.reader().Read(ctx, `MATCH (n:Symbol) WHERE (n.qualname = $ref OR n.name = $ref) AND ($repos IS NULL OR n.repo IN $repos)
+			OPTIONAL MATCH (n)-[:PART_OF]->(d:Document)
+			RETURN n.id AS id, `+localNodeCols+` ORDER BY n.qualname = $ref DESC, n.path LIMIT 11`, map[string]any{"ref": ref})
+		if err != nil {
+			return nil, err
+		}
+		if found := s.visibleLocal(ctx, rows); len(found) == 1 {
+			for id := range found {
+				out = append(out, id)
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no visible node found for the seeds; use search_graph or find_symbol to find node ids")
+	}
+	return out, nil
+}
+
+// hybridSeeds ranks candidate node ids for a question. The caller still filters them by visibility.
+func (s *Server) hybridSeeds(ctx context.Context, question string) ([]string, error) {
+	g := s.reader()
+	p := map[string]any{"q": lucene(question)}
+	failed, queries := 0, 0
+	run := func(cypher string) []string {
+		queries++
+		rows, err := g.Read(ctx, cypher, p)
+		if err != nil {
+			failed++
+			return nil
+		}
+		return ids(rows)
+	}
+	const chunkScope = `WHERE ($repos IS NULL OR node.repo IN $repos) RETURN node.id AS id ORDER BY score DESC LIMIT 40`
+	const srcScope = `WHERE (node:Ticket OR node:Section OR node:PullRequest) RETURN node.id AS id ORDER BY score DESC LIMIT 30`
+	var chunkVec, srcVec []string
+	if s.emb != nil {
+		if vec, err := s.emb.Query(ctx, question); err == nil {
+			p["v"] = vec
+			chunkVec = run(`CALL db.index.vector.queryNodes('chunk_embedding', 80, $v) YIELD node, score ` + chunkScope)
+			srcVec = run(`CALL db.index.vector.queryNodes('source_embedding', 60, $v) YIELD node, score ` + srcScope)
+		}
+	}
+	chunkText := run(`CALL db.index.fulltext.queryNodes('chunk_text', $q, {limit: 80}) YIELD node, score ` + chunkScope)
+	srcText := run(`CALL db.index.fulltext.queryNodes('source_text', $q, {limit: 60}) YIELD node, score ` + srcScope)
+	if failed == queries {
+		return nil, fmt.Errorf("seed search failed")
+	}
+	// chunks stand for the symbol or file they belong to
+	chunks := rrf(chunkVec, chunkText)
+	if len(chunks) > reportFetch {
+		chunks = chunks[:reportFetch]
+	}
+	var owners []string
+	if len(chunks) > 0 {
+		chunkIDs := make([]string, len(chunks))
+		for i, c := range chunks {
+			chunkIDs[i] = c.ID
+		}
+		rows, err := g.Read(ctx, `UNWIND $ids AS id MATCH (c:Chunk {id: id})-[:PART_OF]->(o) RETURN c.id AS id, o.id AS owner`,
+			map[string]any{"ids": chunkIDs})
+		if err != nil {
+			return nil, err
+		}
+		ownerOf := map[string]string{}
+		for _, r := range rows {
+			ownerOf[asString(r["id"])] = asString(r["owner"])
+		}
+		seen := map[string]bool{}
+		for _, id := range chunkIDs {
+			if o := ownerOf[id]; o != "" && !seen[o] {
+				seen[o] = true
+				owners = append(owners, o)
+			}
+		}
+	}
+	fused := rrf(owners, srcVec, srcText)
+	if len(fused) > 3*localSeedCap {
+		fused = fused[:3*localSeedCap]
+	}
+	out := make([]string, len(fused))
+	for i, f := range fused {
+		out[i] = f.ID
+	}
+	return out, nil
+}
+
+// expandLocal walks the graph from the seeds for hops steps (1..3, default 2). It takes at most
+// localHopCap new neighbours from each node in each hop and stops at localNodeCap nodes. Every seed and
+// every neighbour is checked with visibleScope; a hidden node is skipped, so it cannot be reached and
+// no relation to it is returned. A relation is returned only when both of its nodes are in the result.
+func (s *Server) expandLocal(ctx context.Context, seeds []string, hops int) (localSubgraph, error) {
+	g := localSubgraph{Nodes: []localNode{}, Rels: []localRel{}}
+	hops = clamp(hops, 1, 3, 2)
+	known, err := s.fetchNodes(ctx, seeds)
+	if err != nil {
+		return g, err
+	}
+	index := map[string]bool{}
+	var frontier []string
+	for _, id := range seeds {
+		if n, ok := known[id]; ok && !index[id] && len(g.Nodes) < localNodeCap {
+			index[id] = true
+			g.Nodes = append(g.Nodes, n)
+			frontier = append(frontier, id)
+		}
+	}
+	relSeen := map[localRel]bool{}
+	for hop := 1; hop <= hops && len(frontier) > 0; hop++ {
+		var rows []map[string]any
+		for i := 0; i < len(frontier); i += localBatch {
+			part, err := s.reader().Read(ctx, `UNWIND $ids AS id
+				CALL (id) {
+				  MATCH (n {id: id})-[r]-(b)
+				  WHERE type(r) IN $types AND NOT b:Chunk AND NOT b:Community AND NOT b:CommunityReport
+				    AND ($repos IS NULL OR b.repo IS NULL OR b.repo IN $repos)
+				  OPTIONAL MATCH (b)-[:PART_OF]->(d:Document)
+				  RETURN n.id AS a, b.id AS id, coalesce(b.qualname, b.name, b.title, b.key, b.path, b.id) AS name,
+				         [l IN labels(b) WHERE NOT l IN ['Source', 'Code', 'Domain']][0] AS kind,
+				         coalesce(b.acl, d.acl) AS acl, coalesce(b.repo, d.repo) AS repo,
+				         type(r) AS type, startNode(r) = n AS out
+				  ORDER BY b.id LIMIT $per
+				}
+				RETURN a, id, name, kind, acl, repo, type, out`,
+				map[string]any{"ids": frontier[i:min(i+localBatch, len(frontier))], "types": localEdgeTypes, "per": localPerNode})
+			if err != nil {
+				return g, err
+			}
+			rows = append(rows, part...)
+		}
+		visible := s.visibleLocal(ctx, rows)
+		byA := map[string][]map[string]any{}
+		for _, r := range rows {
+			byA[asString(r["a"])] = append(byA[asString(r["a"])], r)
+		}
+		var next []string
+		for _, a := range frontier {
+			added := 0
+			for _, r := range byA[a] {
+				id := asString(r["id"])
+				n, ok := visible[id]
+				if !ok || id == a {
+					continue
+				}
+				if !index[id] {
+					if added == localHopCap || len(g.Nodes) == localNodeCap {
+						g.Truncated = true
+						continue
+					}
+					added++
+					n.Hop = hop
+					index[id] = true
+					g.Nodes = append(g.Nodes, n)
+					next = append(next, id)
+				}
+				rel := localRel{From: a, To: id, Type: asString(r["type"])}
+				if out, isBool := r["out"].(bool); isBool && !out {
+					rel.From, rel.To = id, a
+				}
+				if !relSeen[rel] {
+					relSeen[rel] = true
+					g.Rels = append(g.Rels, rel)
+				}
+			}
+		}
+		frontier = next
+	}
+	return g, nil
+}

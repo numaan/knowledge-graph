@@ -491,3 +491,248 @@ func TestGlobalSearchDescription(t *testing.T) {
 	}
 	t.Error("global_search not registered")
 }
+
+// ---- local_search helpers --------------------------------------------------------------------------
+
+func nodeRow(id string, acl []any, repo string) map[string]any {
+	return map[string]any{"id": id, "name": "name " + id, "kind": "Function", "acl": acl, "repo": repo}
+}
+
+// localFake answers node lookup by id and neighbour rows from an edge list (edges are CALLS, a -> b).
+type localFake struct {
+	*fakeGraph
+	nodes map[string]map[string]any
+}
+
+func newLocalFake(nodes []map[string]any, edges [][2]string) *localFake {
+	lf := &localFake{nodes: map[string]map[string]any{}}
+	for _, n := range nodes {
+		lf.nodes[n["id"].(string)] = n
+	}
+	lf.fakeGraph = &fakeGraph{rules: []fakeRule{
+		{"UNWIND $ids AS id MATCH (n {id: id})", func(p map[string]any) []map[string]any {
+			out := []map[string]any{}
+			for _, id := range p["ids"].([]string) {
+				if n, ok := lf.nodes[id]; ok {
+					out = append(out, n)
+				}
+			}
+			return out
+		}},
+		{"-[r]-(b)", func(p map[string]any) []map[string]any {
+			out := []map[string]any{}
+			for _, id := range p["ids"].([]string) {
+				for _, e := range edges {
+					for dir := 0; dir < 2; dir++ {
+						if e[dir] != id {
+							continue
+						}
+						n, ok := lf.nodes[e[1-dir]]
+						if !ok {
+							continue
+						}
+						row := map[string]any{"a": id, "type": "CALLS", "out": dir == 0}
+						for k, v := range n {
+							row[k] = v
+						}
+						out = append(out, row)
+					}
+				}
+			}
+			return out
+		}},
+		{"n.qualname = $ref", func(p map[string]any) []map[string]any {
+			out := []map[string]any{}
+			for _, n := range lf.nodes {
+				if n["name"] == p["ref"] {
+					out = append(out, n)
+				}
+			}
+			return out
+		}},
+	}}
+	return lf
+}
+
+// starNodes builds a hub with `leaves` neighbours; each neighbour has `kids` further neighbours.
+func starNodes(leaves, kids int) ([]map[string]any, [][2]string) {
+	nodes := []map[string]any{nodeRow("hub", nil, "")}
+	var edges [][2]string
+	for i := 0; i < leaves; i++ {
+		leaf := fmt.Sprintf("n%03d", i)
+		nodes = append(nodes, nodeRow(leaf, nil, ""))
+		edges = append(edges, [2]string{"hub", leaf})
+		for j := 0; j < kids; j++ {
+			kid := fmt.Sprintf("k%03d_%02d", i, j)
+			nodes = append(nodes, nodeRow(kid, nil, ""))
+			edges = append(edges, [2]string{leaf, kid})
+		}
+	}
+	return nodes, edges
+}
+
+func nodeIDs(g localSubgraph) map[string]bool {
+	out := map[string]bool{}
+	for _, n := range g.Nodes {
+		out[n.ID] = true
+	}
+	return out
+}
+
+func TestLocalConstants(t *testing.T) {
+	if localHopCap != 15 || localNodeCap != 60 || localCommunityCap != 5 || localDefaultTokens != 4000 {
+		t.Fatal("local_search constants changed")
+	}
+	for in, want := range map[int]int{0: 4000, 100: 500, 500: 500, 9000: 9000, 99999: 16000} {
+		if got := localTokens(in); got != want {
+			t.Errorf("localTokens(%d) = %d, want %d", in, got, want)
+		}
+	}
+}
+
+func TestLocalSeedsByID(t *testing.T) {
+	lf := newLocalFake([]map[string]any{nodeRow("a", nil, ""), nodeRow("b", nil, "")}, nil)
+	s := graphragServer(t, lf)
+	got, err := s.localSeeds(context.Background(), "q", []string{"b", "a", "b"})
+	if err != nil || !equal(got, []string{"b", "a"}) {
+		t.Fatalf("got %v %v", got, err)
+	}
+	// a name resolves when exactly one node has it; an unknown reference fails closed
+	got, err = s.localSeeds(context.Background(), "q", []string{"name a"})
+	if err != nil || !equal(got, []string{"a"}) {
+		t.Fatalf("by name: %v %v", got, err)
+	}
+	if _, err = s.localSeeds(context.Background(), "q", []string{"nope"}); err == nil {
+		t.Fatal("want an error when no seed resolves")
+	}
+}
+
+func TestLocalSeedsHidden(t *testing.T) {
+	lf := newLocalFake([]map[string]any{nodeRow("secret", []any{"jira:PREC"}, ""), nodeRow("open", nil, "")}, nil)
+	s := graphragServer(t, lf)
+	got, err := s.localSeeds(callerCtx("confluence:ENG"), "q", []string{"secret", "open"})
+	if err != nil || !equal(got, []string{"open"}) {
+		t.Fatalf("got %v %v", got, err)
+	}
+	_, err = s.localSeeds(callerCtx("confluence:ENG"), "q", []string{"secret"})
+	if err == nil || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("a hidden seed must look like a missing one: %v", err)
+	}
+}
+
+func TestLocalSeedsHybrid(t *testing.T) {
+	lf := newLocalFake([]map[string]any{nodeRow("sym1", nil, ""), nodeRow("sym2", nil, ""),
+		nodeRow("tick", []any{"jira:PREC"}, ""), nodeRow("sec", nil, "")}, nil)
+	lf.rules = append([]fakeRule{
+		{"chunk_embedding", fixed(idRows("c1")...)},
+		{"chunk_text", fixed(idRows("c2", "c1")...)},
+		{"source_embedding", fixed(idRows("tick", "sec")...)},
+		{"source_text", fixed(idRows("sec")...)},
+		{"MATCH (c:Chunk {id: id})-[:PART_OF]->(o)", func(p map[string]any) []map[string]any {
+			m := map[string]string{"c1": "sym1", "c2": "sym2"}
+			out := []map[string]any{}
+			for _, id := range p["ids"].([]string) {
+				out = append(out, map[string]any{"id": id, "owner": m[id]})
+			}
+			return out
+		}},
+	}, lf.rules...)
+	s := graphragServer(t, lf)
+	got, err := s.localSeeds(callerCtx("confluence:ENG"), "how does it work", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := map[string]bool{}
+	for _, id := range got {
+		set[id] = true
+	}
+	if !set["sym1"] || !set["sym2"] || !set["sec"] || set["tick"] || len(got) > localSeedCap {
+		t.Fatalf("hybrid seeds: %v", got)
+	}
+}
+
+func TestExpandLocalStarCaps(t *testing.T) {
+	nodes, edges := starNodes(200, 20)
+	s := graphragServer(t, newLocalFake(nodes, edges))
+	g, err := s.expandLocal(context.Background(), []string{"hub"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(g.Nodes) != 1+localHopCap || len(g.Rels) != localHopCap || !g.Truncated {
+		t.Fatalf("hop cap: %d nodes %d rels truncated=%v", len(g.Nodes), len(g.Rels), g.Truncated)
+	}
+	g, err = s.expandLocal(context.Background(), []string{"hub"}, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(g.Nodes) != localNodeCap || !g.Truncated {
+		t.Fatalf("node cap: %d nodes truncated=%v", len(g.Nodes), g.Truncated)
+	}
+	have := nodeIDs(g)
+	for _, r := range g.Rels {
+		if !have[r.From] || !have[r.To] {
+			t.Errorf("relation %v touches a node that is not returned", r)
+		}
+	}
+}
+
+func TestExpandLocalHopsClamp(t *testing.T) {
+	// chain a - b - c - d - e
+	var nodes []map[string]any
+	for _, id := range []string{"a", "b", "c", "d", "e"} {
+		nodes = append(nodes, nodeRow(id, nil, ""))
+	}
+	s := graphragServer(t, newLocalFake(nodes, [][2]string{{"a", "b"}, {"b", "c"}, {"c", "d"}, {"d", "e"}}))
+	for hops, want := range map[int]int{0: 3, 1: 2, 2: 3, 3: 4, 9: 4, -4: 2} {
+		g, err := s.expandLocal(context.Background(), []string{"a"}, hops)
+		if err != nil || len(g.Nodes) != want {
+			t.Errorf("hops %d: %d nodes (want %d) %v", hops, len(g.Nodes), want, err)
+		}
+	}
+}
+
+func TestExpandLocalHidden(t *testing.T) {
+	nodes := []map[string]any{nodeRow("a", nil, ""), nodeRow("b", nil, ""), nodeRow("secret", []any{"jira:PREC"}, ""),
+		nodeRow("beyond", nil, "")}
+	// the only path to "beyond" runs through the hidden node
+	edges := [][2]string{{"a", "b"}, {"a", "secret"}, {"secret", "beyond"}, {"b", "secret"}}
+	s := graphragServer(t, newLocalFake(nodes, edges))
+	g, err := s.expandLocal(callerCtx("confluence:ENG"), []string{"a"}, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	have := nodeIDs(g)
+	if !have["a"] || !have["b"] || have["secret"] || have["beyond"] {
+		t.Fatalf("nodes: %v", have)
+	}
+	out, _ := json.Marshal(g)
+	if strings.Contains(string(out), "secret") {
+		t.Fatalf("hidden node leaks: %s", out)
+	}
+	if len(g.Rels) != 1 || g.Rels[0].From != "a" || g.Rels[0].To != "b" {
+		t.Fatalf("rels: %v", g.Rels)
+	}
+	// a caller with the group sees all
+	g, _ = s.expandLocal(callerCtx("jira:PREC"), []string{"a"}, 3)
+	if !nodeIDs(g)["secret"] || !nodeIDs(g)["beyond"] {
+		t.Fatalf("authorised caller: %v", nodeIDs(g))
+	}
+}
+
+func TestExpandLocalRepoScope(t *testing.T) {
+	nodes := []map[string]any{nodeRow("a", nil, "precept"), nodeRow("mine", nil, "precept"), nodeRow("other", nil, "bookshop")}
+	s := graphragServer(t, newLocalFake(nodes, [][2]string{{"a", "mine"}, {"a", "other"}}))
+	g, err := s.expandLocal(callerCtx("repo:precept"), []string{"a"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	have := nodeIDs(g)
+	if !have["a"] || !have["mine"] || have["other"] || len(g.Rels) != 1 {
+		t.Fatalf("repo scope: %v %v", have, g.Rels)
+	}
+	// a seed outside the scope is dropped
+	g, _ = s.expandLocal(callerCtx("repo:precept"), []string{"other"}, 1)
+	if len(g.Nodes) != 0 || len(g.Rels) != 0 {
+		t.Fatalf("hidden seed expanded: %v", g)
+	}
+}
