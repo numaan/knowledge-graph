@@ -658,7 +658,7 @@ signs people in through Keycloak and sends their token to the REST layer. See [w
 | `EMBEDDINGS_URL`, `EMBEDDINGS_MODEL`, `EMBEDDINGS_DIMENSIONS`, `EMBEDDINGS_API_KEY` | embed, search, MCP | `http://localhost:8080`, `Qwen/Qwen3-Embedding-0.6B`, `1024` |
 | `LLM_PROVIDER`, `LLM_BASE_URL`, `LLM_MODEL`, `LLM_CONTEXT_TOKENS`, `LLM_CACHE_DIR` | domain, verify | `ollama`, `http://localhost:11434` |
 | `DOCLING_URL` | docs, verify | `http://localhost:5001` |
-| `KG_S3_MAX_BYTES`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | `kg-s3` (the keys are for the CLI only) | 52428800 (50 MiB), none |
+| `KG_S3_MAX_BYTES`, `KG_S3_MAX_OBJECTS`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | S3 sources, `kg-s3` (the keys are for the CLI only) | 52428800 (50 MiB), 500000, none, none |
 | `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`, `JIRA_ACCEPTANCE_FIELD`, `JIRA_PROJECTS` | Jira | none |
 | `CONFLUENCE_BASE_URL`, `CONFLUENCE_EMAIL`, `CONFLUENCE_API_TOKEN`, `CONFLUENCE_SPACES` | Confluence | none |
 | `ATLASSIAN_EMAIL`, `ATLASSIAN_API_TOKEN` | Jira and Confluence fallback | none |

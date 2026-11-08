@@ -50,7 +50,7 @@ class MemWriter:
             return Res([])
         if "DETACH DELETE s, d" in q:
             gone = [i for i, d in self.docs.items() if d.get("collection") == p["name"] and d.get("source") == "s3"
-                    and i not in p["ids"]]
+                    and i in p["ids"]]
             for i in gone:
                 del self.docs[i]
                 self.sections = {k: v for k, v in self.sections.items() if not k.startswith(i + "#")}
@@ -254,3 +254,87 @@ def test_sync_reconciles_after_a_complete_listing_and_counts_removed():
     seed(w, "s", ["docs/old.md"])
     stats = s3.sync(w, Client([obj("docs/a.md")]), "s", CFG)
     assert stats["removed"] == 1 and set(w.docs) == {"s3:s:docs/a.md"}
+
+
+# ---- scale: batched deletes and listing cap -----------------------------------------------------------------------
+def test_reconcile_deletes_in_constant_size_batches(monkeypatch):
+    monkeypatch.setattr(s3, "DELETE_BATCH", 10)
+    w = MemWriter()
+    seed(w, "s", [f"docs/{i}.md" for i in range(45)])
+    listing = s3.Listing([s3.S3Object(f"docs/{i}.md", 1, "e", "m") for i in range(40)], [], True)
+    assert s3.reconcile(w, "s", listing) == 5
+    deletes = [p for q, p in w.queries if "DETACH DELETE" in q]
+    assert len(w.docs) == 40 and all(len(p["ids"]) <= 10 for p in deletes)
+    big = s3.Listing([], [], True)
+    w2 = MemWriter()
+    seed(w2, "s", [f"docs/{i}.md" for i in range(45)])
+    assert s3.reconcile(w2, "s", big, force=True) == 45 and not w2.docs
+    assert max(len(p["ids"]) for q, p in w2.queries if "DETACH DELETE" in q) <= 10
+
+
+def test_reconcile_guard_runs_before_any_batch_is_deleted(monkeypatch):
+    monkeypatch.setattr(s3, "DELETE_BATCH", 5)
+    w = MemWriter()
+    seed(w, "s", [f"docs/{i}.md" for i in range(30)])
+    with pytest.raises(reconcile.TooManyRemovals):
+        s3.reconcile(w, "s", s3.Listing([], [], True))
+    assert len(w.docs) == 30 and not [q for q, _ in w.queries if "DETACH DELETE" in q]
+
+
+def test_reconcile_partial_failure_is_finished_by_the_next_run(monkeypatch):
+    monkeypatch.setattr(s3, "DELETE_BATCH", 5)
+    w = MemWriter()
+    seed(w, "s", [f"docs/{i}.md" for i in range(30)] + ["docs/keep.md"])
+    listing = s3.Listing([s3.S3Object("docs/keep.md", 1, "e", "m")], [], True)
+    real, calls = w._run, []
+
+    def flaky(q, **p):
+        if "DETACH DELETE" in q:
+            calls.append(1)
+            if len(calls) == 2:
+                raise RuntimeError("connection lost")
+        return real(q, **p)
+    w._run = flaky
+    with pytest.raises(RuntimeError):
+        s3.reconcile(w, "s", listing, force=True)
+    assert 0 < len(w.docs) < 31
+    w._run = real
+    s3.reconcile(w, "s", listing, force=True)
+    assert set(w.docs) == {"s3:s:docs/keep.md"}
+
+
+def page_client(n, per_page=1000):
+    class C:
+        def list_objects_v2(self, **kw):
+            start = int(kw.get("ContinuationToken", 0))
+            end = min(start + per_page, n)
+            out = {"Contents": [obj(f"docs/{i}.md") for i in range(start, end)], "IsTruncated": end < n}
+            if end < n:
+                out["NextContinuationToken"] = str(end)
+            return out
+    return C()
+
+
+def test_listing_over_the_cap_raises_a_clear_error(monkeypatch):
+    monkeypatch.setenv("KG_S3_MAX_OBJECTS", "2500")
+    with pytest.raises(RuntimeError) as e:
+        s3.list_objects(page_client(5000), "b", "docs/", [])
+    assert "KG_S3_MAX_OBJECTS" in str(e.value) and "docs/" in str(e.value)
+    assert len(s3.list_objects(page_client(2500), "b", "docs/", []).objects) == 2500
+
+
+def test_listing_over_the_cap_writes_and_removes_nothing(monkeypatch):
+    monkeypatch.setenv("KG_S3_MAX_OBJECTS", "5")
+    w = MemWriter()
+    seed(w, "s", ["docs/old.md"])
+    with pytest.raises(RuntimeError):
+        s3.sync(w, page_client(50, 10), "s", CFG)
+    assert set(w.docs) == {"s3:s:docs/old.md"} and not w.writes
+    assert not [q for q, _ in w.queries if "DETACH DELETE" in q]
+
+
+def test_max_objects_default_and_bad_value(monkeypatch):
+    monkeypatch.delenv("KG_S3_MAX_OBJECTS", raising=False)
+    assert s3.max_objects() == 500000
+    monkeypatch.setenv("KG_S3_MAX_OBJECTS", "abc")
+    assert s3.max_objects() == 500000

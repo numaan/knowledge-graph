@@ -26,6 +26,8 @@ from .documents import SUFFIXES, _write_document
 log = logging.getLogger("kg_pipeline.s3")
 
 DEFAULT_MAX_BYTES = 50 * 1024 * 1024
+DEFAULT_MAX_OBJECTS = 500_000
+DELETE_BATCH = 500  # ids per delete query: no query parameter grows with the size of the bucket
 MAX_OBJECT_BYTES = DEFAULT_MAX_BYTES
 CONNECT_TIMEOUT = 10
 READ_TIMEOUT = 60
@@ -43,6 +45,14 @@ def max_bytes() -> int:
         return int(raw) if raw else DEFAULT_MAX_BYTES
     except ValueError:
         return DEFAULT_MAX_BYTES
+
+
+def max_objects() -> int:
+    raw = os.environ.get("KG_S3_MAX_OBJECTS")
+    try:
+        return int(raw) if raw else DEFAULT_MAX_OBJECTS
+    except ValueError:
+        return DEFAULT_MAX_OBJECTS
 
 
 def new_stats() -> dict:
@@ -121,6 +131,7 @@ class Listing:
 def list_objects(client, bucket: str, prefix: str, include: list[str], limit: int | None = None) -> Listing:
     """List the matching objects of a bucket. Any listing error raises: a partial listing is never returned."""
     limit = max_bytes() if limit is None else limit
+    cap = max_objects()
     out = Listing()
     token = None
     while True:
@@ -138,6 +149,10 @@ def list_objects(client, bucket: str, prefix: str, include: list[str], limit: in
                 continue
             rec = S3Object(key, int(o.get("Size") or 0), o.get("ETag") or "", str(o.get("LastModified") or ""))
             (out.too_large if rec.size > limit else out.objects).append(rec)
+            if len(out.objects) + len(out.too_large) > cap:
+                raise RuntimeError(f"S3 listing of bucket {bucket} with prefix {prefix!r} has more than {cap} "
+                                   f"matching objects (KG_S3_MAX_OBJECTS); narrow the prefix or the include globs "
+                                   f"of the source, or raise KG_S3_MAX_OBJECTS. Nothing was written or removed.")
         if not page.get("IsTruncated"):
             out.complete = True
             return out
@@ -171,14 +186,19 @@ def reconcile(w, name: str, listing: Listing, force: bool = False, stored: dict 
     if not listing.complete:
         return 0
     stored = _stored(w, name) if stored is None else stored
-    present = [f"s3:{name}:{o.key}" for o in listing.objects + listing.too_large]
-    gone = set(stored) - set(present)
+    present = {f"s3:{name}:{o.key}" for o in listing.objects + listing.too_large}
+    gone = sorted(set(stored) - present)
+    del present
     if not gone:
         return 0
-    _guard(len(gone), len(stored), f"S3 source {name}", force)
-    return w._run("MATCH (d:Document {collection: $name, source: 's3'}) WHERE NOT d.id IN $ids "
-                  "OPTIONAL MATCH (s:Section)-[:PART_OF]->(d) DETACH DELETE s, d RETURN count(DISTINCT d) AS n",
-                  name=name, ids=present).records[0]["n"]
+    _guard(len(gone), len(stored), f"S3 source {name}", force)   # before any deletion, from the stored total
+    removed = 0
+    # Batches: a failure between two batches leaves a consistent graph; the next run finds the rest as gone.
+    for i in range(0, len(gone), DELETE_BATCH):
+        removed += w._run("MATCH (d:Document {collection: $name, source: 's3'}) WHERE d.id IN $ids "
+                          "OPTIONAL MATCH (s:Section)-[:PART_OF]->(d) DETACH DELETE s, d RETURN count(DISTINCT d) AS n",
+                          name=name, ids=gone[i:i + DELETE_BATCH]).records[0]["n"]
+    return removed
 
 
 def sync(w, client, name: str, config: dict, full: bool = False, force: bool = False, read=None) -> dict:

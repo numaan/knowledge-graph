@@ -519,6 +519,8 @@ An S3 source reads documents from a bucket of AWS S3, MinIO, SeaweedFS or Ceph i
 |---|---|
 | Files read | The suffixes `.md .markdown .txt .pdf .docx .pptx .html .htm`. PDF, DOCX, PPTX and HTML need Docling at `DOCLING_URL`. |
 | Size limit | An object over `KG_S3_MAX_BYTES` (default 52428800) is skipped and counted in `skipped`. Set the variable on the user code. |
+| Listing cap | `KG_S3_MAX_OBJECTS` (default 500000) is the largest number of matching objects of one source. A larger listing fails the run with an error that names the variable and the prefix. Nothing is written or removed. Narrow the `prefix` or the `include` globs, or raise the variable on the user code. |
+| Delete batches | Reconcile deletes in batches of 500 ids per query. A failure between two batches leaves a consistent graph, and the next run removes the rest. |
 | Change detection | The same ETag, size and last-modified: not downloaded. Downloaded with the same content hash: only the stored fields change. |
 | Mode `full` | Downloads and rewrites every object. The embedding cache stays. |
 | Reconcile | Documents of deleted keys are removed after a complete listing. Objects over the size limit are never removed. |
