@@ -453,3 +453,68 @@ def test_extra_semantic_edge_weights():
         assert t not in EDGE_WEIGHTS
     nodes = [_n("t1", "Ticket", acl=["j"]), _n("t2", "Ticket", acl=["j"])]
     assert project(nodes, [_r("t1", "LINKS", "t2")], [])[("j",)][1] == [("t1", "t2", 0.5)]
+
+
+from kg_pipeline.communities import community_id, content_hash, reuse_ids  # noqa: E402
+
+
+def test_community_id_uses_smallest_member_in_any_order():
+    a = community_id("abc", 1, ["m3", "m1", "m2"])
+    assert a == "community:abc:1:m1"
+    assert a == community_id("abc", 1, ["m2", "m3", "m1"])
+    assert community_id("abc", 0, ["m1"]) != a
+
+
+def test_content_hash_order_free_and_sensitive():
+    base = content_hash(["a", "b"], {"a": "h1", "b": "h2"}, "community-v1")
+    assert base == content_hash(["b", "a"], {"b": "h2", "a": "h1"}, "community-v1")
+    assert base != content_hash(["a", "b", "c"], {"a": "h1", "b": "h2"}, "community-v1")  # member added
+    assert base != content_hash(["a", "b"], {"a": "h1", "b": "CHANGED"}, "community-v1")  # summary changed
+    assert base != content_hash(["a", "b"], {"a": "h1", "b": "h2"}, "community-v2")  # prompt changed
+    assert base != content_hash(["a", "b"], {"a": "h1"}, "community-v1")  # hash absent vs present
+
+
+def test_content_hash_ignores_edge_weights_by_signature():
+    import inspect
+    assert list(inspect.signature(content_hash).parameters) == ["members", "member_hashes", "prompt_version"]
+
+
+def test_member_added_keeps_id_when_anchor_unchanged_hash_changes():
+    old = ["m1", "m2", "m3"]
+    new = old + ["m9"]
+    assert community_id("p", 0, old) == community_id("p", 0, new)
+    assert content_hash(old, {}, "v") != content_hash(new, {}, "v")
+
+
+def test_smaller_member_changes_id_unless_reused():
+    old = {"community:p:0:m2": ["m2", "m3", "m4", "m5"]}
+    new = {"community:p:0:m1": ["m1", "m2", "m3", "m4", "m5"]}
+    assert community_id("p", 0, new["community:p:0:m1"]) != "community:p:0:m2"
+    assert reuse_ids(new, old) == {"community:p:0:m1": "community:p:0:m2"}
+
+
+def test_reuse_needs_overlap_above_half():
+    old = {"community:p:0:m1": ["m1", "m2", "m3", "m4"]}
+    exactly_half = {"community:p:0:a": ["m1", "m2", "x1", "x2"]}  # 2/4 = 0.5, not above
+    assert reuse_ids(exactly_half, old) == {"community:p:0:a": "community:p:0:a"}
+    above = {"community:p:0:a": ["m1", "m2", "m3", "x1"]}  # 3/4
+    assert reuse_ids(above, old) == {"community:p:0:a": "community:p:0:m1"}
+
+
+def test_reuse_is_one_to_one_same_level_and_partition():
+    old = {"community:p:0:m1": ["m1", "m2", "m3", "m4"],
+           "community:p:1:m1": ["m1", "m2", "m3", "m4"],
+           "community:q:0:m1": ["m1", "m2", "m3", "m4"]}
+    new = {"community:p:0:b1": ["m1", "m2", "m3", "m4", "n"],
+           "community:p:0:b2": ["m1", "m2", "m3"]}
+    out = reuse_ids(new, old)
+    assert out["community:p:0:b1"] == "community:p:0:m1"  # best overlap wins the old id
+    assert out["community:p:0:b2"] == "community:p:0:b2"  # old id already taken
+    assert len(set(out.values())) == 2
+
+
+def test_reuse_never_takes_the_own_id_of_another_new_community():
+    old = {"community:p:0:m2": ["m2", "m3", "m4"]}
+    new = {"community:p:0:m1": ["m1", "m2", "m3", "m4"], "community:p:0:m2": ["m2", "z"]}
+    out = reuse_ids(new, old)
+    assert out == {"community:p:0:m1": "community:p:0:m1", "community:p:0:m2": "community:p:0:m2"}

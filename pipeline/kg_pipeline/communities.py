@@ -21,6 +21,17 @@ the adjacency of one partition costs about 100 bytes per edge (dict of dicts), s
 2 000 000 edges needs a few hundred MB; nodes cost a few hundred bytes each. Partitions are skipped,
 never truncated.
 
+Community id rule: `community:<partition-hash>:<level>:<anchor>`, where the anchor is the smallest member
+id (string order). The same members give the same id in any order, and adding a member keeps the id unless
+the new member is smaller. Because Leiden can shift membership, `reuse_ids(new, old)` lets a new community
+keep the old id of the same partition and level when the member overlap (shared / larger set) is above 0.5;
+the best overlap wins, one old id goes to one new community, and an old id is never given to a new
+community when another new community already has it as its own id. Otherwise the old community and its
+report are removed as stale. `content_hash(members, member_hashes, prompt_version)` follows `summaries._hash`
+(sha256 of JSON, first 20 hex chars): it covers sorted member ids, the member content hashes (summary
+`content_hash`, `embedding_hash`) and the prompt version. Edge weights are not an input, so weights alone
+never rewrite a community.
+
 Env: KG_COMMUNITY_RESOLUTION (1.0), KG_COMMUNITY_LEVELS (2, clamp 1 to 4), KG_COMMUNITY_SEED (42),
 KG_COMMUNITY_MAX_NODES (200000), KG_COMMUNITY_MAX_EDGES (2000000), KG_COMMUNITY_BACKEND (auto).
 """
@@ -210,6 +221,50 @@ def partition_key(node) -> tuple[str, ...]:
 def partition_hash(key: tuple[str, ...]) -> str:
     """Short stable id of a partition key, used in community ids."""
     return hashlib.sha256(json.dumps(list(key)).encode()).hexdigest()[:12]
+
+
+def community_id(phash: str, level: int, members) -> str:
+    """`community:<partition-hash>:<level>:<smallest member id>`."""
+    return f"community:{phash}:{level}:{min(str(m) for m in members)}"
+
+
+def content_hash(members, member_hashes: dict | None, prompt_version: str) -> str:
+    """Hash of the sorted member ids, their content hashes (where known) and the prompt version.
+    Same convention as `summaries._hash`. Edge weights are not an input."""
+    ids = sorted(str(m) for m in members)
+    hashes = member_hashes or {}
+    parts = [prompt_version, ids, [hashes.get(m) or "" for m in ids]]
+    return hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()[:20]
+
+
+def _scope(cid: str) -> str:
+    """`community:<partition-hash>:<level>` of an id (the anchor may contain colons)."""
+    return ":".join(cid.split(":", 3)[:3])
+
+
+def reuse_ids(new: dict, old: dict) -> dict:
+    """Map each new community id to the id it should carry. `new` and `old` map id -> member ids.
+    A new community takes an old id of the same partition and level when the overlap
+    (shared members / size of the larger set) is above 0.5. Best overlap first, one to one."""
+    out = {nid: nid for nid in new}
+    cands = []
+    for nid, nm in new.items():
+        ns = set(nm)
+        for oid, om in old.items():
+            if oid == nid or _scope(oid) != _scope(nid) or oid in new:
+                continue
+            os_ = set(om)
+            ov = len(ns & os_) / max(len(ns), len(os_), 1)
+            if ov > 0.5:
+                cands.append((-ov, nid, oid))
+    taken_old, done_new = set(), set()
+    for _, nid, oid in sorted(cands):
+        if nid in done_new or oid in taken_old:
+            continue
+        out[nid] = oid
+        done_new.add(nid)
+        taken_old.add(oid)
+    return out
 
 
 # Edge type to weight, the single table of the projection. Types not listed are ignored.
