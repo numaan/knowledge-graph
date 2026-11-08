@@ -465,3 +465,80 @@ def test_real_git_unrestricted_clone_keeps_plain_behaviour(monkeypatch, tmp_path
     monkeypatch.setattr(real_git.subprocess, "run", lambda cmd, **kw: seen.append((cmd, kw.get("env"))) or type("R", (), {"stdout": ""})())
     real_git.mirror("ssh://h/x/r.git", tmp_path / "a")
     assert "http.followRedirects=false" not in seen[0][0] and seen[0][1] is None
+
+
+# ---- T3: s3_documents asset and s3_job --------------------------------------------------------------------------
+
+@pytest.fixture
+def s3fx(monkeypatch):
+    from kg_pipeline.sources import s3 as s3mod
+    for k in ("DATABASE_URL", "KG_SECRET_KEY"):
+        monkeypatch.delenv(k, raising=False)
+    calls = {"client": [], "sync": [], "guard": []}
+    monkeypatch.setattr(d, "_writer", contextmanager(lambda: (yield FakeWriter())))
+    monkeypatch.setattr(d.s3, "build_client", lambda cfg, secret, ui_origin=False: calls["client"].append(
+        (cfg["bucket"], secret, ui_origin)) or cfg["bucket"])
+
+    def sync(w, client, name, cfg, full=False, **kw):
+        calls["sync"].append((name, client, full))
+        if name == "bad":
+            raise RuntimeError("listing failed")
+        return {**s3mod.new_stats(), "listed": 2, "new": 1, "unchanged": 1, "bytes": 5, "failed": 0}
+    monkeypatch.setattr(d.s3, "sync", sync)
+    monkeypatch.setattr(d.probe, "guard_source", lambda kind, cfg: calls["guard"].append((kind, cfg["bucket"])))
+    return calls
+
+
+def test_s3_documents_runs_every_enabled_source_with_its_own_secret(s3fx, registry_db):
+    add_rows(registry_db,
+             ("s3", "one", {"bucket": "b1", "endpoint": "https://m"}, {"access_key_id": "k1", "secret_access_key": "s1"}, True),
+             ("s3", "two", {"bucket": "b2"}, None, True),
+             ("s3", "off", {"bucket": "b3"}, {"access_key_id": "k3", "secret_access_key": "s3"}, False))
+    res = d.s3_documents(ctx({"kg/mode": "full"}))
+    assert s3fx["client"] == [("b1", {"access_key_id": "k1", "secret_access_key": "s1"}, True), ("b2", {}, True)]
+    assert s3fx["sync"] == [("one", "b1", True), ("two", "b2", True)]   # secretless ui source: anonymous, full flag passed
+    assert s3fx["guard"] == [("s3", "b1"), ("s3", "b2")]
+    assert (res.metadata["listed"], res.metadata["new"], res.metadata["bytes"]) == (4, 2, 10)
+    assert set(res.metadata["sources"].value) == {"one", "two"}
+    assert "s1" not in str(res.metadata)
+
+
+def test_s3_documents_env_origin_is_not_ui_origin(s3fx, registry_db):
+    add_rows(registry_db, ("s3", "e", {"bucket": "b"}, None, True), origin="env")
+    d.s3_documents(ctx())
+    assert s3fx["client"][0][2] is False
+
+
+def test_s3_documents_without_sources_is_skipped(s3fx, registry_db):
+    res = d.s3_documents(ctx())
+    assert "skipped" in res.metadata and s3fx["sync"] == []
+
+
+def test_s3_documents_blocked_endpoint_and_failed_source_fail_after_the_others_ran(s3fx, registry_db, monkeypatch):
+    add_rows(registry_db, ("s3", "bad", {"bucket": "b1"}, None, True), ("s3", "good", {"bucket": "b2"}, None, True))
+    with pytest.raises(dg.Failure, match="bad"):
+        d.s3_documents(ctx())
+    assert [c[0] for c in s3fx["sync"]] == ["bad", "good"]
+
+
+def test_s3_documents_blocked_endpoint_is_not_synced(s3fx, registry_db, monkeypatch):
+    add_rows(registry_db, ("s3", "zz", {"bucket": "b9", "endpoint": "https://10.0.0.1"}, None, True))
+    from kg_pipeline.control import probe
+    monkeypatch.setattr(d.probe, "guard_source", lambda kind, cfg: (_ for _ in ()).throw(probe.Blocked("private")))
+    with pytest.raises(dg.Failure):
+        d.s3_documents(ctx())
+    assert s3fx["sync"] == []
+
+
+def test_s3_job_and_sensor():
+    from kg_pipeline.control import dagster_client as dc
+    assert d.s3_job.name == dc.S3_JOB == "s3_job"
+    job = d.defs.get_job_def(dc.S3_JOB)
+    assert {k.to_user_string() for k in job.asset_layer.executable_asset_keys} == {"s3_documents", "source_vectors"}
+    assert d.s3_job.name in {j.name for j in d.defs.jobs}
+    sensor = d.defs.get_repository_def().get_sensor_def("due_sources")
+    assert dc.S3_JOB in {t.job_name for t in sensor.targets}
+
+
+def test_s3_documents_is_a_sources_asset():
+    assert d.s3_documents.key.to_user_string() == "s3_documents" and d.s3_documents in d.SOURCES

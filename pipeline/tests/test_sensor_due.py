@@ -205,6 +205,18 @@ def test_sync_sets_dagster_run_id_status_and_stats(engine):
     assert row.stats == {"code_snapshot": {"nodes": 5, "commit": "abc"}, "x": {"data": {"a": 1}}}
 
 
+def test_sync_stores_the_s3_documents_counters(engine):
+    add_source(engine, "src_000000000001", "due")
+    add_run(engine, "src_000000000001", "due", "queued", rid="run_aaaaaaaaaaaa")
+    inst = FakeInstance([drun("dag-1", "SUCCESS", "run_aaaaaaaaaaaa")],
+                        [mat(["s3_documents"], listed=4, new=2, changed=1, unchanged=1, skipped=0, removed=0, bytes=10,
+                             sources={"one": {"listed": 4}})])
+    due_sources.sync_runs(inst)
+    assert all_runs(engine)[0].stats["s3_documents"] == {
+        "listed": 4, "new": 2, "changed": 1, "unchanged": 1, "skipped": 0, "removed": 0, "bytes": 10,
+        "sources": {"one": {"listed": 4}}}
+
+
 def test_sync_ignores_unknown_and_final_runs(engine):
     add_run(engine, None, "gone", "succeeded", rid="run_bbbbbbbbbbbb")
     add_run(engine, None, "nofind", "queued", rid="run_cccccccccccc")

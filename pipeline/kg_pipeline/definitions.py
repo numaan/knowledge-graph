@@ -1,7 +1,7 @@
 """Dagster code location for the knowledge graph pipeline.
 
 Assets per repository: code_snapshot -> git_history, domain_model -> vector_index, summaries.
-Source assets: jira_issues, confluence_pages -> source_vectors, doc_freshness.
+Source assets: jira_issues, confluence_pages, s3_documents -> source_vectors, doc_freshness.
 Every asset applies the approved corrections (corrections.py) after its writes.
 
 Environment (set by the Helm chart): GIT_REPOSITORIES, GIT_BRANCH, GIT_TOKEN, SOURCE_ARCHIVE_PATH,
@@ -10,6 +10,8 @@ EMBEDDINGS_MODEL, EMBEDDINGS_DIMENSIONS. Set DOMAIN_LLM=off to extract roles and
 Summaries: SUMMARY_LLM=off (extractive only), SUMMARY_BUDGET. Freshness: FRESHNESS_LLM=on, FRESHNESS_LLM_BUDGET.
 Jira: JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECTS (comma-separated keys).
 Confluence: CONFLUENCE_BASE_URL, CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN, CONFLUENCE_SPACES.
+S3 (MinIO, AWS, ...): sources in the registry only (bucket, prefix, include, endpoint; secret = access_key_id and
+secret_access_key; none = anonymous); KG_S3_MAX_BYTES. Needs the `s3` extra (boto3).
 GitHub, catalog and people: see people_assets.py (github_prs, service_catalog, people).
 """
 
@@ -23,11 +25,12 @@ import dagster as dg
 from . import corrections, due_sources as due, freshness, sources_registry, summaries
 from .code import links
 from .code.ingest import build_graph
+from .control import probe
 from .domain.extract import extract
 from .graph.neo4j_writer import Neo4jWriter
 from .models import LLM, Embedder
 from .people_assets import github_prs, people_asset, service_catalog_asset
-from .sources import documents, git, history, jira, permissions
+from .sources import documents, git, history, jira, permissions, s3
 from .sources.atlassian import Atlassian
 from .telemetry import traced_asset
 from .vectors import embed_repo, embed_sources
@@ -46,6 +49,7 @@ repo_partitions = dg.DynamicPartitionsDefinition(name="repos")
 GIT_JOB = "git_job"
 JIRA_JOB = "jira_job"
 CONFLUENCE_JOB = "confluence_job"
+S3_JOB = "s3_job"
 MODE_TAG = "kg/mode"
 
 
@@ -212,7 +216,34 @@ def confluence_pages(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     return dg.MaterializeResult(metadata={"spaces": dg.MetadataValue.json(out)})
 
 
-@dg.asset(deps=[jira_issues, confluence_pages, github_prs], kinds={"neo4j"}, group_name="sources")
+@dg.asset(kinds={"neo4j", "s3"}, group_name="sources")
+@traced_asset
+def s3_documents(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
+    """Documents of each enabled S3 source (bucket + prefix): new and changed objects, and removal of deleted keys."""
+    sources = sources_registry.get_sources("s3")
+    if not sources:
+        return dg.MaterializeResult(metadata={"skipped": "no enabled s3 source"})
+    out, errors, total = {}, {}, s3.new_stats()
+    with _writer() as w:
+        for src in sources:
+            try:
+                probe.guard_source("s3", src.config)   # SSRF guard, as in POST /run
+                # A ui source never uses the platform credentials: without a secret the client is anonymous.
+                client = s3.build_client(src.config, sources_registry.get_secret(src), ui_origin=src.origin != "env")
+                out[src.name] = s3.sync(w, client, src.name, src.config, full=_full(context))
+            except Exception as e:   # the other sources still run; the asset fails at the end
+                context.log.error("s3 source %s failed: %s: %s", src.name, type(e).__name__, e)
+                errors[src.name] = f"{type(e).__name__}: {e}"
+    for stats in out.values():
+        for k in total:
+            total[k] += stats.get(k, 0)
+    meta = {**total, "failed": sum(s.get("failed", 0) for s in out.values()), "sources": dg.MetadataValue.json(out)}
+    if errors:
+        raise dg.Failure(f"s3 sources failed: {'; '.join(f'{n}: {m}' for n, m in errors.items())}", metadata=meta)
+    return dg.MaterializeResult(metadata=meta)
+
+
+@dg.asset(deps=[jira_issues, confluence_pages, github_prs, s3_documents], kinds={"neo4j"}, group_name="sources")
 @traced_asset
 def source_vectors(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     """Embeddings for changed tickets and document sections."""
@@ -254,7 +285,7 @@ def source_permissions(context: dg.AssetExecutionContext) -> dg.MaterializeResul
 
 
 CODE = [code_snapshot, git_history, domain_model, vector_index, summaries_asset, service_catalog]
-SOURCES = [jira_issues, confluence_pages, source_permissions, github_prs, source_vectors, doc_freshness, people]
+SOURCES = [jira_issues, confluence_pages, s3_documents, source_permissions, github_prs, source_vectors, doc_freshness, people]
 
 
 # Incremental runs are cheap (only changes are written), so code runs every hour, sources every 15 minutes.
@@ -271,6 +302,7 @@ git_job = dg.define_asset_job(
     GIT_JOB, selection=[code_snapshot, git_history, domain_model, vector_index, summaries_asset])
 jira_job = dg.define_asset_job(JIRA_JOB, selection=[jira_issues, source_vectors])
 confluence_job = dg.define_asset_job(CONFLUENCE_JOB, selection=[confluence_pages, source_vectors])
+s3_job = dg.define_asset_job(S3_JOB, selection=[s3_documents, source_vectors])
 
 
 def sync_partitions(instance: dg.DagsterInstance) -> list[str]:
@@ -300,7 +332,7 @@ def _now() -> datetime:
 
 
 @dg.sensor(name="due_sources", minimum_interval_seconds=60, default_status=dg.DefaultSensorStatus.RUNNING,
-           jobs=[git_job, jira_job, confluence_job])
+           jobs=[git_job, jira_job, confluence_job, s3_job])
 def due_sources(context: dg.SensorEvaluationContext):
     """Launch the job of each enabled source whose cron schedule (UTC) is due, as the control API would."""
     if not os.environ.get("DATABASE_URL", "").strip():
@@ -312,4 +344,4 @@ def due_sources(context: dg.SensorEvaluationContext):
 from .trust_assets import TRUST, daily_reconcile  # noqa: E402  data trust: deletes, moves, duplicates
 
 defs = dg.Definitions(assets=CODE + SOURCES + TRUST, schedules=[hourly_code, sources_every_15_min, daily_reconcile],
-                      jobs=[git_job, jira_job, confluence_job], sensors=[registry_partitions, due_sources])
+                      jobs=[git_job, jira_job, confluence_job, s3_job], sensors=[registry_partitions, due_sources])
