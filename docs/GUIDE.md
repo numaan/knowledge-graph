@@ -300,6 +300,82 @@ kg-summaries --repo my-repo --no-llm         # extractive text only
 The command writes one `:Summary` for each file, folder, repository and capability. A summary is
 generated again only when its input changed. See [knowledge.md](streams/knowledge.md).
 
+### 3.8.1 GraphRAG communities
+
+GraphRAG groups the graph into communities (themes) and writes one short report for each community.
+Agents use the reports to answer broad questions such as "what are the main parts of the payment
+domain?" with `global_search`, and to read the area around one entity with `local_search`.
+
+```bash
+kg-communities --dry-run                      # detect and compare only; writes nothing
+kg-communities --report                       # detect, write, then build the reports
+kg-communities --report --no-llm --level 0    # extractive reports for level 0 (no LLM)
+```
+
+The command reads the whole graph, so it is not per repository. Dagster runs it as the assets
+`communities` and `community_reports` in `graphrag_job` (schedule `graphrag_daily`, off by default;
+see the [runbook](RUNBOOK.md#10-graphrag-communities)).
+
+How it works:
+
+1. The pipeline projects the graph into weighted edges (calls, imports, co-changed files, links
+   between tickets, documents and code). It sums the weights of an undirected pair into one edge.
+2. It splits the graph by ACL partition (see below) and finds communities in each partition. Level 0
+   is the finest level. Each higher level groups the level below, so levels nest.
+3. It writes `:Community` nodes, `IN_COMMUNITY` edges for every level, and `CHILD_OF` edges.
+4. It builds one `:CommunityReport` for each community: title, summary, findings and a rank from 0 to 10.
+   An LLM writes the report within `COMMUNITY_BUDGET` calls. Other reports are extractive (no LLM).
+5. A report is generated again only when the members, the member summaries or the prompt changed.
+
+Settings (also in the table in [section 7](#environment-variables)):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `KG_COMMUNITY_RESOLUTION` | `1.0` | Higher gives more and smaller communities. `--resolution` overrides it. |
+| `KG_COMMUNITY_LEVELS` | `2` | Number of levels, 1 to 4. |
+| `KG_COMMUNITY_SEED` | `42` | Seed. The same graph and seed give the same communities. |
+| `KG_COMMUNITY_MAX_NODES` | `200000` | A partition with more nodes is skipped (not cut). |
+| `KG_COMMUNITY_MAX_EDGES` | `2000000` | A partition with more edges is skipped. |
+| `KG_COMMUNITY_BACKEND` | `auto` | `library` needs the extra `graphrag` (`pip install 'kg-pipeline[graphrag]'`); `fallback` uses the pure-Python Louvain; `auto` uses the library when it is installed. |
+| `COMMUNITY_LLM` | on | `off` gives extractive reports only. |
+| `COMMUNITY_BUDGET` | `100` | Maximum LLM calls for reports in one run. `--budget` overrides it. |
+
+To tune the resolution, run `kg-communities --dry-run --resolution 0.5` and compare
+`communities_by_level` in the JSON output. Communities of 5 to 50 members read best.
+
+**ACL partitioning.** The pipeline never mixes two ACL sets in one community or report:
+
+- Code nodes have no `acl`. Their partition is the repository, group `repo:<name>`.
+- `Source` nodes (tickets, documents, pages) form one partition for each distinct `acl` list, for example `jira:PREC`.
+- A node without any scope is public. `*` in a node `acl` is an ordinary group name, not "public".
+- Edges between two partitions are dropped. A community report that you can see never names a node that you cannot see.
+
+**How agents use the tools.**
+
+| Question | Tool | Parameters |
+|---|---|---|
+| Broad: "what are the main themes of X?" | `global_search` | `question`; `level` (0 is finest, empty searches all levels); `top_k` (1 to 20, default 8) |
+| Narrow: about an entity or a small area | `local_search` | `question` or `seeds` (node ids or exact names, max 5); `hops` (1 to 3, default 2); `token_budget` (500 to 16000, default 4000) |
+
+`global_search` ranks the community reports by meaning, asks the LLM about each report (map step)
+and combines the results with numbered citations (reduce step). Without an LLM, or when the LLM
+fails, it returns the ranked reports and a `note`. `local_search` finds seed nodes, adds the nodes
+within `hops` relations (15 new neighbours for each node and hop, 60 nodes in total), and returns
+entities, relations, text snippets and the reports of their communities. Its citations are `E1`
+(entity), `R1` (relation), `S1` (snippet) and `C1` (community). Both tools show only what the
+caller may see. Use `search_graph` for a question about code, and `ask` for one answer in prose.
+
+Known limits:
+
+- There are no communities across repositories or across ACL partitions, so a theme that spans
+  repositories is lost.
+- The fallback is a Louvain variant, not a full Leiden. Partitions differ between backends.
+- A partition above `KG_COMMUNITY_MAX_NODES` or `KG_COMMUNITY_MAX_EDGES` has no community.
+- Community reports are as good as the member summaries and the LLM. Extractive reports are plain.
+- `global_search` and `local_search` have not been measured against a live LLM yet.
+- The admin UI has no button for GraphRAG runs. A trigger in the admin UI is a follow-up; use the
+  Dagster UI or `kg-communities`.
+
 ### 3.9 Pull requests, service catalog and people
 
 ```bash
@@ -479,11 +555,14 @@ For a cluster, register the HTTP endpoint: `claude mcp add kg --transport http h
 | `find_experts` | find people who know some code or a topic | `{"node": "src/cart.py"}` |
 | `get_owners` | find the owning team and service | `{"node": "cart"}` |
 | `ask` | get an answer in prose with numbered citations (needs an LLM) | `{"question": "why are scenarios not kept in local storage?"}` |
+| `global_search` | answer a broad question from community reports (see [3.8.1](#381-graphrag-communities)) | `{"question": "what are the main themes of the payment domain?", "level": 1}` |
+| `local_search` | read the area around an entity: relations, snippets, communities | `{"seeds": ["create_invitation"], "hops": 2}` |
 | `report_wrong_fact` | report a wrong node or edge (write-back) | `{"node_id": "...", "reason": "..."}` |
 | `record_decision` | record a design or business decision (write-back) | `{"text": "...", "links": ["..."]}` |
 | `suggest_link` | suggest a missing edge (write-back) | `{"src": "...", "edge_type": "IMPLEMENTS", "dst": "...", "reason": "..."}` |
 
-The server has 16 read tools, 3 write-back tools and `ask`:
+The server has 16 read tools, 3 write-back tools, `ask` and the 2 GraphRAG tools `global_search`
+and `local_search`. The GraphRAG tools return little until `kg-communities --report` has run.
 
 - `ask` is on only when `LLM_BASE_URL` and `LLM_MODEL` are set. `KG_ASK=off` removes it.
 - `KG_WRITEBACK=off` removes the 3 write-back tools.
@@ -639,6 +718,7 @@ signs people in through Keycloak and sends their token to the REST layer. See [w
 | `kg-eval` | evaluation set (search, impact, requirements, answers) |
 | `kg-links` | relink HTTP calls, tests and topics across repositories |
 | `kg-summaries` | file, module, repository and domain summaries |
+| `kg-communities` | GraphRAG communities and their reports (`--report`, `--dry-run`, `--level`, `--resolution`, `--no-llm`, `--budget`) |
 | `kg-freshness` | stale flags and conflicts for documents |
 | `kg-corrections` | list and apply approved corrections |
 | `kg-github` | pull requests, reviews, review comments |
@@ -670,6 +750,8 @@ signs people in through Keycloak and sends their token to the REST layer. See [w
 | `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`, `LLM_REASONING_EFFORT`, `KG_ASK`, `KG_ROUTER_LLM` | MCP (`ask`) | none (`ask` off), on, off |
 | `RERANK_URL`, `RERANK_MODEL`, `RERANK_API_KEY`, `RERANK_CANDIDATES` | MCP, search | none (off), `BAAI/bge-reranker-v2-m3`, 30 |
 | `SUMMARY_LLM`, `SUMMARY_BUDGET`, `FRESHNESS_LLM`, `FRESHNESS_LLM_BUDGET` | summaries, freshness | on, 300, off, 20 |
+| `KG_COMMUNITY_RESOLUTION`, `KG_COMMUNITY_LEVELS`, `KG_COMMUNITY_SEED`, `KG_COMMUNITY_MAX_NODES`, `KG_COMMUNITY_MAX_EDGES`, `KG_COMMUNITY_BACKEND` | communities (`kg-communities`, `graphrag_job`) | 1.0, 2 (1 to 4), 42, 200000, 2000000, `auto` |
+| `COMMUNITY_LLM`, `COMMUNITY_BUDGET` | community reports | on, 100 |
 | `KG_PII_MODE`, `KG_PII_ALLOW`, `KG_DUP_THRESHOLD`, `RECONCILE_FORCE` | data trust | `mask`, none, 0.8, off |
 | `GITHUB_TOKEN`, `GITHUB_API_URL`, `GITHUB_REPOSITORIES` | GitHub | none, `https://api.github.com`, the github.com URLs of `GIT_REPOSITORIES` when `GITHUB_TOKEN` is set |
 | `PEOPLE_ALIASES`, `PEOPLE_EMAIL_SALT` | people | none, `kg-people-v1` |

@@ -42,6 +42,7 @@ flowchart LR
 | Domain extraction (LLM per folder) | `kg-domain --repo R [--module path] [--max-modules N]` | `DomainConcept`, `BusinessRule`, `Capability`; `REALISES`, `IMPLEMENTED_BY`, `COVERS`, `USES_CONCEPT` |
 | Embeddings | `kg-embed --repo R` | `Chunk.embedding`, `DomainConcept.embedding` (vector indexes `chunk_embedding`, `concept_embedding`) |
 | Search | `kg-search "question" --repo R` | Nothing (read only) |
+| GraphRAG communities | `kg-communities [--report] [--dry-run] [--level N]` (extra `graphrag` for the Leiden library) | `Community`, `CommunityReport`; `IN_COMMUNITY`, `CHILD_OF`, `REPORTS_ON` |
 | Requirement check | `kg-verify --doc spec.md --repo R --out report.md` | `Requirement` with `verdict`; `IMPLEMENTED_BY`, `CONTRADICTED_BY`, `VALIDATED_BY` |
 
 The LLM must cite symbols that exist in the evidence; answers without valid citations are dropped
