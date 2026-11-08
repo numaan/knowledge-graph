@@ -267,3 +267,20 @@ def test_existing_schedules_and_asset_keys_unchanged():
             "doc_freshness", "people"} <= keys
     sensor = repo.get_sensor_def("due_sources")
     assert sensor.minimum_interval_seconds == 60
+
+
+def test_sensor_skips_a_source_with_a_blocked_host(engine, monkeypatch, caplog):
+    from kg_pipeline.control import probe
+    add_source(engine, "src_000000000001", "internal")
+    add_source(engine, "src_000000000002", "public")
+    with engine.begin() as conn:
+        conn.execute(db.sources.update().where(db.sources.c.id == "src_000000000001").values(
+            config={"url": "https://internal.example/a.git"}))
+        conn.execute(db.sources.update().where(db.sources.c.id == "src_000000000002").values(
+            config={"url": "https://public.example/b.git"}))
+    monkeypatch.setattr(probe, "resolve", lambda host: ["10.0.0.5"] if host.startswith("internal") else ["1.1.1.1"])
+    with caplog.at_level("WARNING"):
+        reqs = due_sources.due_requests(NOW)
+    assert [r.run_key for r in reqs] == [f"src_000000000002:{MINUTE}"]
+    assert "internal" in caplog.text and "SSRF guard" in caplog.text
+    assert {r.source_name for r in all_runs(engine)} == {"public"}

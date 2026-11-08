@@ -468,3 +468,36 @@ def test_manual_run_row_has_created_at(client, engine):
     assert client.post(f"/api/v1/sources/{sid}/run", json={}).status_code == 202
     with engine.connect() as conn:
         assert conn.execute(select(db.runs.c.created_at)).scalar() is not None
+
+
+# ---- FIX 4: the SSRF guard also runs before a launch ----
+@pytest.mark.parametrize("body,field", [
+    (GIT, "url"),
+    (JIRA, "base_url"),
+    (WIKI, "base_url"),
+])
+def test_run_to_blocked_host_is_400_without_row_or_launch(client, app, engine, monkeypatch, body, field):
+    from kg_pipeline.control import probe
+    sid = make(client, body)
+    monkeypatch.setattr(probe, "resolve", lambda host: ["10.0.0.5"])
+    r = client.post(f"/api/v1/sources/{sid}/run", json={})
+    assert r.status_code == 400, r.text
+    assert r.json()["error"].startswith("SSRF guard:")
+    assert app.state.dagster.launched == []
+    with engine.connect() as conn:
+        assert conn.execute(select(db.runs)).all() == []
+
+
+def test_run_s3_endpoint_is_guarded_and_allow_private_lets_it_pass(client, app, monkeypatch):
+    from kg_pipeline.control import probe
+    sid = make(client, {**S3, "config": {"bucket": "b", "endpoint": "https://minio.internal"}})
+    monkeypatch.setattr(probe, "resolve", lambda host: ["127.0.0.1"])
+    # s3 has no job yet (501), so test the helper directly
+    with pytest.raises(probe.Blocked, match="SSRF guard"):
+        probe.guard_source("s3", {"bucket": "b", "endpoint": "https://minio.internal"})
+    monkeypatch.setenv("KG_CONTROL_ALLOW_PRIVATE", "1")
+    probe.guard_source("s3", {"bucket": "b", "endpoint": "https://minio.internal"})
+    probe.guard_source("s3", {"bucket": "b"})  # no endpoint: nothing to check
+    gid = make(client, GIT)
+    assert client.post(f"/api/v1/sources/{gid}/run", json={}).status_code == 202
+    assert sid

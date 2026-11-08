@@ -78,6 +78,18 @@ def guard(url: str, resolver: Callable[[str], list[str]]) -> tuple[str, str, int
     return host, addresses[0], port
 
 
+def guard_source(kind: str, config: dict, resolver: Callable[[str], list[str]] | None = None) -> None:
+    """Run the SSRF guard on the stored URL of a source before a launch. Raise Blocked when it is refused.
+
+    Checks the git `url`, the Jira/Confluence `base_url` and the S3 `endpoint` (when set). `resolver` defaults to
+    `resolve`, looked up at call time. KG_CONTROL_ALLOW_PRIVATE=1 turns the private-address check off, as for a test.
+    """
+    key = {"git": "url", "jira": "base_url", "confluence": "base_url", "s3": "endpoint"}.get(kind)
+    url = config.get(key) if key else None
+    if url:
+        guard(url, resolver or resolve)
+
+
 class _Pinned(http.client.HTTPSConnection):
     """Connects to a fixed IP and uses the URL host for TLS name checks and SNI."""
     pinned_ip = ""

@@ -108,8 +108,11 @@ Contract fixtures (one JSON file per response) are in `web/tests/fixtures/contro
 
 Validation: unknown keys are rejected. URLs must be `https://` (`http://` only when `KG_CONTROL_ALLOW_HTTP=1`).
 The web form accepts `https://` only, always. `KG_CONTROL_ALLOW_HTTP=1` allows `http://` for direct API calls.
-Hosts that resolve to loopback, link-local or metadata addresses are refused for `test` (SSRF guard)
-unless `KG_CONTROL_ALLOW_PRIVATE=1`.
+Hosts that resolve to loopback, link-local or metadata addresses are refused for `test` and for a run (SSRF guard)
+unless `KG_CONTROL_ALLOW_PRIVATE=1`. `POST /sources/{id}/run` checks the stored git `url`, Jira/Confluence `base_url`
+and S3 `endpoint` and answers 400 `SSRF guard: ...` (no run row, no launch). The `due_sources` sensor skips such a
+source and logs a warning. Env-origin sources are checked the same way. A cluster-internal Git server needs
+`KG_CONTROL_ALLOW_PRIVATE=1` on the control API and on the Dagster user code.
 
 ## 6. Pipeline changes
 

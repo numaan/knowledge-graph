@@ -7,6 +7,7 @@ validates the expression in the control API, and one function (`cron_is_due`) is
 This module imports no fastapi. It reads the database when called, never at import.
 """
 import hashlib
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -14,8 +15,10 @@ import dagster as dg
 from dagster._utils.schedules import get_next_cron_tick, is_valid_cron_string
 from sqlalchemy import insert, select, update
 
-from .control import db
+from .control import db, probe
 from .control.dagster_client import ACTIVE, JOB_BY_KIND, launch_tags, map_status  # noqa: F401  (JOB_BY_KIND re-exported)
+
+log = logging.getLogger(__name__)
 
 FINAL = ("succeeded", "failed", "canceled")
 QUEUE_TIMEOUT_S = 600  # a queued row without a Dagster run after this many seconds failed to launch
@@ -65,6 +68,11 @@ def due_requests(now: datetime) -> list[dg.RunRequest]:
                     continue
                 if conn.execute(select(db.runs.c.id).where(
                         db.runs.c.source_id == src.id, db.runs.c.status.in_(ACTIVE))).first():
+                    continue
+                try:
+                    probe.guard_source(src.kind, src.config)
+                except probe.Blocked as e:
+                    log.warning("source %s skipped: %s", src.name, e)
                     continue
                 run_id = _run_id(src.id, minute)
                 if conn.execute(select(db.runs.c.id).where(db.runs.c.id == run_id)).first():

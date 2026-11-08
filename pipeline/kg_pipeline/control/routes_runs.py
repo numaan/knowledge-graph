@@ -179,6 +179,12 @@ def make_router() -> APIRouter:
                     raise HTTPException(501, "s3_documents asset not available yet")
                 if not src.enabled:
                     raise HTTPException(409, "source is disabled")
+                prober = getattr(request.app.state, "prober", None)
+                try:
+                    probe.guard_source(src.kind, src.config, getattr(prober, "resolver", None))
+                except probe.Blocked as e:
+                    msg = str(e)
+                    raise HTTPException(400, msg if msg.startswith("SSRF guard") else f"SSRF guard: {msg}") from None
                 active = _active_run(conn, source_id)
                 if active:
                     raise HTTPException(409, f"source already has an active run ({active.id})")
