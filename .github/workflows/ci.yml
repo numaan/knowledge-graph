@@ -198,7 +198,7 @@ jobs:
           cache-dependency-path: mcp/go.sum
       - name: install
         working-directory: pipeline
-        run: pip install -e ".[dev,otel]"
+        run: pip install -e ".[dev,dagster,control,otel]"
       - name: start the fake embedder
         run: |
           nohup kg-fake-embedder --port 8089 --dimensions 256 > fake-embedder.log 2>&1 &
