@@ -198,7 +198,7 @@ jobs:
           cache-dependency-path: mcp/go.sum
       - name: install
         working-directory: pipeline
-        run: pip install -e ".[dev,dagster,control,otel]"
+        run: pip install -e ".[dev,dagster,control,otel,graphrag]"
       - name: start the fake embedder
         run: |
           nohup kg-fake-embedder --port 8089 --dimensions 256 > fake-embedder.log 2>&1 &
@@ -223,6 +223,11 @@ jobs:
           kg-ingest-code --repo tests/fixtures/bookshop --name bookshop --scip off
           kg-domain --repo bookshop --no-llm
           kg-embed --repo bookshop
+      - name: build communities and extractive reports (LLM off)
+        working-directory: pipeline
+        env:
+          COMMUNITY_LLM: "off"
+        run: kg-communities --report
       - name: start the MCP server
         working-directory: mcp
         run: |
@@ -233,10 +238,13 @@ jobs:
         working-directory: pipeline
         # Measured on the fixture: hit@8 0.93, MRR 0.81, impact recall 1.00 (deterministic). Answer gates apply only when
         # the server has the ask tool; otherwise the answer cases are reported as skipped.
+        # The community gates (--min-communities 2, --min-acl-purity 1, --min-report-coverage 1) are provisional
+        # until the first CI run; replace them with the measured values.
         run: >
           kg-eval eval/fixture.yaml --json ../eval.json
           --min-hit 0.9 --min-mrr 0.7 --min-impact 1
           --min-citation-recall 0.5 --min-citation-validity 0.9
+          --min-communities 2 --min-acl-purity 1 --min-report-coverage 1
       - name: pytest with neo4j (writer, sources, backup, scale generator)
         working-directory: pipeline
         run: pytest -q

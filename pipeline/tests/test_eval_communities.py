@@ -1,5 +1,8 @@
 """Community metrics of kg-eval: pure helpers, the section runner on a fake graph, and the gates."""
+from pathlib import Path
 from types import SimpleNamespace
+
+import yaml
 
 from kg_pipeline import evaluate
 from kg_pipeline.evaluate import acl_purity, eval_communities, gate_failures, global_hit, report, report_coverage
@@ -112,3 +115,14 @@ def test_run_section_only_when_in_spec(monkeypatch):
     monkeypatch.setattr(evaluate, "eval_communities", lambda *a: {"communities_created": 1})
     assert "communities" not in evaluate.run(None, None, {"repo": "r"})
     assert evaluate.run(None, None, {"repo": "r", "communities": {}})["communities"] == {"communities_created": 1}
+
+
+def test_fixture_yaml_has_communities_section():
+    path = Path(__file__).resolve().parent.parent / "eval" / "fixture.yaml"
+    spec = yaml.safe_load(path.read_text(encoding="utf-8"))
+    section = spec["communities"]
+    assert section["min_communities"] >= 1
+    assert len(section["cases"]) >= 3
+    for case in section["cases"]:
+        assert case["question"].strip()
+        assert case["expect_any"] and all(str(x).strip() for x in case["expect_any"])
