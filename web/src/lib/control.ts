@@ -12,7 +12,7 @@ export type ControlResult<T> = (Extract<Result<T>, { ok: true }> & { status: num
 export const controlBase = () => (process.env.CONTROL_API_URL ?? "").trim().replace(/\/+$/, "");
 
 /** `path` is the control API path below the base, for example `api/v1/sources`. */
-export async function controlFetch<T>(path: string, init: RequestInit = {}): Promise<ControlResult<T>> {
+export async function controlFetch<T>(path: string, init: RequestInit & { timeoutMs?: number } = {}): Promise<ControlResult<T>> {
   const base = controlBase();
   if (!base) return { ok: false, status: 502, error: "control API not configured" };
   let url: URL;
@@ -28,7 +28,7 @@ export async function controlFetch<T>(path: string, init: RequestInit = {}): Pro
   if (token) headers.set("Authorization", `Bearer ${token}`);
   let res: Response;
   try {
-    res = await fetch(url, { method: init.method, body: init.body, headers, cache: "no-store", redirect: "manual", signal: AbortSignal.timeout(30_000) });
+    res = await fetch(url, { method: init.method, body: init.body, headers, cache: "no-store", redirect: "manual", signal: AbortSignal.timeout(init.timeoutMs ?? 30_000) });
   } catch {
     return { ok: false, status: 502, error: "control API not reachable" };
   }

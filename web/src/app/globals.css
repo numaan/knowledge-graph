@@ -181,3 +181,10 @@ table.data th { color: var(--muted); font-weight: 600; }
 .stat strong { display: block; font-size: 1.4rem; }
 
 details > summary { cursor: pointer; }
+
+/* Admin */
+.subnav { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 0 0 16px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+.subnav a { color: var(--muted); text-decoration: none; padding: 4px 0; min-height: 32px; }
+.subnav a:hover, .subnav a[aria-current="page"] { color: var(--text); text-decoration: underline; }
+.subnav a[aria-current="page"] { font-weight: 600; }
+@media (max-width: 760px) { .subnav { gap: 4px 12px; } }
