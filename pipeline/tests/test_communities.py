@@ -339,3 +339,117 @@ def test_edge_weights_table():
     for t in ("CALLS", "IMPORTS", "EXTENDS", "IMPLEMENTS", "OVERRIDES", "USES_TYPE", "DEFINES", "CONTAINS",
               "REALISES", "IMPLEMENTED_BY", "COVERS", "USES_CONCEPT", "MENTIONS", "PART_OF", "CHILD_OF"):
         assert t in EDGE_WEIGHTS
+
+
+# ---- load_partitions (Neo4j loader, faked) ---------------------------------------------------------------
+import re  # noqa: E402
+
+
+class _Rec(dict):
+    def data(self):
+        return dict(self)
+
+
+class _Result:
+    def __init__(self, rows):
+        self.records = [_Rec(r) for r in rows]
+
+
+class LoaderWriter:
+    """Interprets the three Cypher shapes of load_partitions over an in-memory graph."""
+
+    def __init__(self, nodes, rels, commits=()):
+        self.nodes, self.rels, self.commits = sorted(nodes, key=lambda n: n["id"]), rels, sorted(commits)
+        self.queries = []
+
+    def _run(self, query, **params):
+        self.queries.append((query, params))
+        if "RETURN n.id AS id" in query:
+            skip = set(params["skip"])
+            page = [n for n in self.nodes if n["id"] > params["after"] and not skip & set(n["labels"])]
+            return _Result([{"id": n["id"], "labels": n["labels"], "acl": n.get("acl"), "repo": n.get("repo")}
+                            for n in page[:params["limit"]]])
+        if "MODIFIES" in query:
+            page = [c for c in self.commits if c[0] > params["after"]][:params["limit"]]
+            return _Result([{"id": cid, "files": files[:50]} for cid, files in page if len(files[:50]) > 1])
+        typ = re.search(r"\[r:(\w+)\]", query).group(1)
+        ids = set(params["ids"])
+        return _Result([{"src": r["src"], "type": r["type"], "dst": r["dst"]}
+                        for r in self.rels if r["type"] == typ and r["src"] in ids])
+
+    def edge_queries(self):
+        return [(q, p) for q, p in self.queries if "[r:" in q]
+
+
+def _loader_graph():
+    nodes = [_n(f"a{i}", "Symbol", repo="big") for i in range(6)]
+    nodes += [_n("x1", "Symbol", repo="small"), _n("x2", "Symbol", repo="small"), _n("cm", "Commit", repo="small"),
+              _n("d", "Document", acl=["g"]), _n("k", "Chunk", acl=["g"]), _n("c", "DomainConcept", acl=["g"])]
+    rels = [_r("a0", "CALLS", "a1"), _r("x1", "CALLS", "x2"), _r("k", "PART_OF", "d"), _r("k", "MENTIONS", "c"),
+            _r("x1", "OWNS", "x2")]
+    return nodes, rels
+
+
+def test_load_partitions_skips_oversize_before_edges(monkeypatch, caplog):
+    monkeypatch.setenv("KG_COMMUNITY_MAX_NODES", "5")
+    nodes, rels = _loader_graph()
+    w = LoaderWriter(nodes, rels)
+    with caplog.at_level(logging.WARNING):
+        parts, stats = communities.load_partitions(w)
+    assert stats["skipped_too_large"] == 1 and stats["partitions"] == 2
+    assert ("repo:big",) not in parts
+    assert parts[("repo:small",)] == (["x1", "x2"], [("x1", "x2", 1.0)])
+    assert parts[("g",)] == (["c", "d"], [("c", "d", EDGE_WEIGHTS["MENTIONS"])])  # chunk folded into d
+    assert any("repo:big" in m for m in caplog.messages)
+    for _, p in w.edge_queries():  # no edge query ever names a node of the skipped partition
+        assert not any(i.startswith("a") for i in p["ids"])
+
+
+def test_load_partitions_cypher_uses_only_edge_weight_types():
+    nodes, rels = _loader_graph()
+    w = LoaderWriter(nodes, rels)
+    communities.load_partitions(w)
+    types = {re.search(r"\[r:(\w+)\]", q).group(1) for q, _ in w.edge_queries()}
+    assert types == set(EDGE_WEIGHTS)  # one query shape per relationship type, every weighted type
+    assert "OWNS" not in types and "MODIFIES" not in types
+    assert all("MATCH (a)-[r:" in q for q, _ in w.edge_queries())
+
+
+def test_load_partitions_keyset_paging(monkeypatch):
+    monkeypatch.setattr(communities, "PAGE", 4)
+    nodes = [_n(f"n{i:02d}", "Symbol", repo="r") for i in range(10)]
+    w = LoaderWriter(nodes, [])
+    parts, _ = communities.load_partitions(w)
+    assert parts[("repo:r",)][0] == [f"n{i:02d}" for i in range(10)]
+    pages = [p for q, p in w.queries if "RETURN n.id AS id" in q]
+    assert [p["after"] for p in pages] == ["", "n03", "n07"]
+    assert all("SKIP" not in q.upper().split() for q, _ in w.queries)
+
+
+def test_load_partitions_cochange_capped_at_50_files():
+    files = [f"f{i:03d}" for i in range(200)]
+    nodes = [_n(f, "File", repo="r") for f in files]
+    w = LoaderWriter(nodes, [], [("c1", files), ("c2", files[:2])])
+    parts, _ = communities.load_partitions(w)
+    edges = dict(((u, v), x) for u, v, x in parts[("repo:r",)][1])
+    assert ("f000", "f001") in edges and edges[("f000", "f001")] == pytest.approx(0.4)  # two commits
+    assert ("f000", "f049") in edges and ("f000", "f050") not in edges  # the 51st file is cut
+    q = next(q for q, _ in w.queries if "MODIFIES" in q)
+    assert "[..50]" in q and "Commit|PullRequest" in q
+
+
+def test_load_partitions_edge_cap_skips_partition(monkeypatch):
+    monkeypatch.setenv("KG_COMMUNITY_MAX_EDGES", "1")
+    nodes = [_n(i, "Symbol", repo="r") for i in ("a", "b", "c")]
+    rels = [_r("a", "CALLS", "b"), _r("b", "CALLS", "c")]
+    parts, stats = communities.load_partitions(LoaderWriter(nodes, rels))
+    assert parts == {} and stats["skipped_too_large"] == 1
+
+
+def test_extra_semantic_edge_weights():
+    for t in ("REFERENCES", "LINKS", "IMPLEMENTED_IN", "DEPENDS_ON"):
+        assert EDGE_WEIGHTS[t] == 0.5
+    for t in ("OWNS", "IN_RELEASE", "PROVIDES_API", "MODIFIES"):
+        assert t not in EDGE_WEIGHTS
+    nodes = [_n("t1", "Ticket", acl=["j"]), _n("t2", "Ticket", acl=["j"])]
+    assert project(nodes, [_r("t1", "LINKS", "t2")], [])[("j",)][1] == [("t1", "t2", 0.5)]

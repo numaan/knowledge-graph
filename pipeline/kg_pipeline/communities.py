@@ -11,6 +11,16 @@ lazily), `fallback` uses the pure-Python Louvain of `leiden_fallback`, `auto` us
 it is installed. Both are deterministic for a fixed seed. Nodes and edges are sorted before use.
 Community ids are numbered by the first member in sorted order.
 
+Memory model of `load_partitions(w)`: nodes are read in keyset pages (`id > $after ORDER BY id LIMIT`,
+no SKIP) and kept as small dicts. Members are counted per ACL partition BEFORE any edge is read, so a
+partition above KG_COMMUNITY_MAX_NODES is skipped without an edge query. Edges are read per relationship
+type (only the types of EDGE_WEIGHTS) and per batch of source ids of one partition, never as one big
+`MATCH ()-[r]-()`; reading stops and the partition is skipped when its edges pass KG_COMMUNITY_MAX_EDGES.
+Co-change comes from commits and pull requests in keyset pages, at most 50 files per commit. In Python,
+the adjacency of one partition costs about 100 bytes per edge (dict of dicts), so the default cap of
+2 000 000 edges needs a few hundred MB; nodes cost a few hundred bytes each. Partitions are skipped,
+never truncated.
+
 Env: KG_COMMUNITY_RESOLUTION (1.0), KG_COMMUNITY_LEVELS (2, clamp 1 to 4), KG_COMMUNITY_SEED (42),
 KG_COMMUNITY_MAX_NODES (200000), KG_COMMUNITY_MAX_EDGES (2000000), KG_COMMUNITY_BACKEND (auto).
 """
@@ -208,12 +218,14 @@ def partition_hash(key: tuple[str, ...]) -> str:
 # Domain layer: REALISES / IMPLEMENTED_BY / COVERS / USES_CONCEPT 1.0.
 # Sources: MENTIONS 0.7, PART_OF / CHILD_OF 0.5 (documents, sections, tickets).
 # MODIFIES is not listed: co-change weight is min(1, n/5) for n commits that touched both files.
-# Edge types such as REFERENCES, LINKS, IN_RELEASE, OWNS or DEPENDS_ON carry no weight in the spec.
+# Added after T5 from the real graph: REFERENCES, LINKS, IMPLEMENTED_IN, DEPENDS_ON 0.5 (semantic links).
+# Left out on purpose: OWNS, IN_RELEASE, PROVIDES_API (ownership and release bookkeeping, not topic).
 EDGE_WEIGHTS = {
     "CALLS": 1.0, "IMPORTS": 0.5, "EXTENDS": 1.0, "IMPLEMENTS": 1.0, "OVERRIDES": 1.0, "USES_TYPE": 0.5,
     "DEFINES": 0.3, "CONTAINS": 0.3,
     "REALISES": 1.0, "IMPLEMENTED_BY": 1.0, "COVERS": 1.0, "USES_CONCEPT": 1.0,
     "MENTIONS": 0.7, "PART_OF": 0.5, "CHILD_OF": 0.5,
+    "REFERENCES": 0.5, "LINKS": 0.5, "IMPLEMENTED_IN": 0.5, "DEPENDS_ON": 0.5,
 }
 COCHANGE_FULL = 5  # shared commits that give the full weight 1.0
 NOT_MEMBERS = frozenset({"Chunk", "Summary", "Folder", "Person", "Community", "CommunityReport", "Commit"})
@@ -266,3 +278,96 @@ def project(nodes, rel_rows, cochange_rows=None) -> dict:
     for (a, b), w in sorted(pairs.items(), key=lambda p: (str(p[0][0]), str(p[0][1]))):
         out[members[a]][1].append((a, b, w))
     return out
+
+
+PAGE = 5000  # nodes per keyset page
+EDGE_BATCH = 5000  # source ids per edge query
+COCHANGE_PAGE = 1000  # commits per keyset page
+COCHANGE_FILES = 50  # files per commit that count for co-change
+
+_NODES_Q = """
+MATCH (n) WHERE n.id IS NOT NULL AND n.id > $after AND none(l IN labels(n) WHERE l IN $skip)
+RETURN n.id AS id, labels(n) AS labels, n.acl AS acl, n.repo AS repo ORDER BY id LIMIT $limit"""
+_COCHANGE_Q = f"""
+MATCH (c:Commit|PullRequest) WHERE c.id > $after
+WITH c ORDER BY c.id LIMIT $limit
+MATCH (c)-[:MODIFIES]->(f:Code)
+WITH c, f ORDER BY f.id
+WITH c, collect(f.id)[..{COCHANGE_FILES}] AS files WHERE size(files) > 1
+RETURN c.id AS id, files ORDER BY id"""
+
+
+def _edge_query(rel_type: str) -> str:
+    assert rel_type in EDGE_WEIGHTS  # only constants of the weight table reach the Cypher text
+    return f"MATCH (a)-[r:{rel_type}]->(b) WHERE a.id IN $ids RETURN a.id AS src, type(r) AS type, b.id AS dst"
+
+
+def _pages(w, query: str, limit: int, **params):
+    """Keyset paging: yield pages of rows ordered by `id`, each query starts after the last id."""
+    after = ""
+    while True:
+        rows = [r.data() for r in w._run(query, after=after, limit=limit, **params).records]
+        if rows:
+            yield rows
+            after = rows[-1]["id"]
+        if len(rows) < limit:
+            return
+
+
+def load_partitions(w) -> tuple[dict, dict]:
+    """Read the graph from Neo4j and project it per ACL partition (see the module docstring).
+
+    Returns `(partitions, stats)`. `partitions` is the output of `project()`. `stats` has `partitions`
+    (kept), `skipped_too_large`, `nodes` and `edges` read. Chunks are read only to fold their edges
+    into their owner; they do not count toward KG_COMMUNITY_MAX_NODES.
+    """
+    skip = sorted(NOT_MEMBERS - {"Chunk"})
+    groups: dict = {}
+    for page in _pages(w, _NODES_Q, PAGE, skip=skip):
+        for n in page:
+            groups.setdefault(partition_key(n), []).append(n)
+
+    stats = {"partitions": 0, "skipped_too_large": 0, "nodes": 0, "edges": 0}
+    limit_nodes, limit_edges = max_nodes(), max_edges()
+    kept_nodes: list = []
+    rows: list = []
+    for key, nodes in sorted(groups.items()):
+        count = sum(1 for n in nodes if "Chunk" not in (n.get("labels") or ()))
+        if count == 0:
+            continue
+        if count > limit_nodes:  # counted before any edge is read
+            log.warning("partition %s skipped: %d nodes exceed KG_COMMUNITY_MAX_NODES=%d", list(key), count, limit_nodes)
+            stats["skipped_too_large"] += 1
+            continue
+        ids = sorted(n["id"] for n in nodes)
+        part_rows: list = []
+        too_big = False
+        for rel_type in EDGE_WEIGHTS:
+            query = _edge_query(rel_type)
+            for i in range(0, len(ids), EDGE_BATCH):
+                part_rows += [r.data() for r in w._run(query, ids=ids[i:i + EDGE_BATCH]).records]
+                if len(part_rows) > limit_edges:
+                    too_big = True
+                    break
+            if too_big:
+                break
+        if too_big:
+            log.warning("partition %s skipped: more than KG_COMMUNITY_MAX_EDGES=%d edges", list(key), limit_edges)
+            stats["skipped_too_large"] += 1
+            continue
+        kept_nodes += nodes
+        rows += part_rows
+        stats["nodes"] += count
+        stats["edges"] += len(part_rows)
+
+    cochange: list = []
+    if kept_nodes:
+        kept = {n["id"] for n in kept_nodes}
+        for page in _pages(w, _COCHANGE_Q, COCHANGE_PAGE):
+            for r in page:
+                files = [f for f in r["files"] if f in kept]
+                if len(files) > 1:
+                    cochange.append(files)
+    partitions = project(kept_nodes, rows, cochange)
+    stats["partitions"] = len(partitions)
+    return partitions, stats
