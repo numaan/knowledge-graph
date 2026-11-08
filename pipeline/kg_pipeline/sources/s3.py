@@ -11,12 +11,19 @@ reported as skipped and never downloaded.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
+import logging
 import os
+import re
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from posixpath import splitext
 
 from ..control.validate import ValidationError, _url
-from .documents import SUFFIXES
+from .documents import SUFFIXES, _write_document
+
+log = logging.getLogger("kg_pipeline.s3")
 
 DEFAULT_MAX_BYTES = 50 * 1024 * 1024
 MAX_OBJECT_BYTES = DEFAULT_MAX_BYTES
@@ -137,3 +144,90 @@ def list_objects(client, bucket: str, prefix: str, include: list[str], limit: in
         token = page.get("NextContinuationToken")
         if not token:
             raise RuntimeError("truncated S3 listing without NextContinuationToken")
+
+
+# ---- sync -----------------------------------------------------------------------------------------------------
+_STORED = ("MATCH (d:Document {collection: $name, source: 's3'}) RETURN d.id AS id, d.version AS version, "
+           "d.s3_etag AS etag, d.s3_size AS size, d.s3_last_modified AS lm")
+
+
+def _stored(w, name: str) -> dict[str, dict]:
+    return {r["id"]: r for r in w._run(_STORED, name=name).records}
+
+
+def _file_name(key: str) -> str:
+    """Last path part of a key as a safe local file name (keeps the suffix, which read_document needs)."""
+    base = re.sub(r"[^\w.\- ]", "_", key.replace("\\", "/").rsplit("/", 1)[-1])
+    return "object" if base.strip(". ") == "" else base
+
+
+def reconcile(w, name: str, listing: Listing, force: bool = False, stored: dict | None = None) -> int:
+    """Remove the Documents (with Sections) of source `name` whose key is gone. Returns how many.
+
+    Only a complete listing removes anything. Keys in `objects` and in `too_large` exist. The query filters on the
+    source name and on source 's3', so documents of other sources and of local folders are never touched.
+    """
+    from ..reconcile import _guard
+    if not listing.complete:
+        return 0
+    stored = _stored(w, name) if stored is None else stored
+    present = [f"s3:{name}:{o.key}" for o in listing.objects + listing.too_large]
+    gone = set(stored) - set(present)
+    if not gone:
+        return 0
+    _guard(len(gone), len(stored), f"S3 source {name}", force)
+    return w._run("MATCH (d:Document {collection: $name, source: 's3'}) WHERE NOT d.id IN $ids "
+                  "OPTIONAL MATCH (s:Section)-[:PART_OF]->(d) DETACH DELETE s, d RETURN count(DISTINCT d) AS n",
+                  name=name, ids=present).records[0]["n"]
+
+
+def sync(w, client, name: str, config: dict, full: bool = False, force: bool = False, read=None) -> dict:
+    """List the bucket, write new and changed objects as Documents, remove the Documents of deleted keys.
+
+    An object whose etag, size and last-modified equal the stored values is not downloaded (not in mode full).
+    A downloaded object whose content hash equals the stored version only gets the three stored fields refreshed.
+    One object that fails is counted in `failed`; a listing error raises before anything is written.
+    """
+    from ..requirements import read_document  # Docling for binary formats
+    read = read or read_document
+    bucket, prefix, endpoint = config["bucket"], config.get("prefix") or "", config.get("endpoint") or ""
+    listing = list_objects(client, bucket, prefix, config.get("include") or [])
+    stats = {**listing.stats(), "documents": 0, "sections": 0, "failed": 0}
+    stored = _stored(w, name)
+    with tempfile.TemporaryDirectory(prefix="kg-s3-") as tmp:
+        for i, o in enumerate(listing.objects):
+            doc_id = f"s3:{name}:{o.key}"
+            old = stored.get(doc_id)
+            if old and not full and (old["etag"], old["size"], old["lm"]) == (o.etag, o.size, o.last_modified):
+                stats["unchanged"] += 1
+                continue
+            try:
+                folder = Path(tmp) / str(i)
+                folder.mkdir()
+                path = folder / _file_name(o.key)
+                client.download_file(Bucket=bucket, Key=o.key, Filename=str(path))
+                data = path.read_bytes()
+                stats["bytes"] += len(data)
+                version = hashlib.sha256(data).hexdigest()[:16]
+                if old and not full and old["version"] == version:
+                    w._run("MATCH (d:Document {id: $id}) SET d.s3_etag = $etag, d.s3_size = $size, "
+                           "d.s3_last_modified = $lm", id=doc_id, etag=o.etag, size=o.size, lm=o.last_modified)
+                    stats["unchanged"] += 1
+                    continue
+                markdown = read(path)
+                rel = o.key[len(prefix):]
+                title = next((l.lstrip("# ").strip() for l in markdown.splitlines() if l.startswith("# ")), path.stem)
+                doc = {"id": doc_id, "name": rel.rsplit("/", 1)[-1], "title": title, "path": rel,
+                       "collection": name, "version": version, "format": splitext(o.key)[1].lower().lstrip("."),
+                       "source": "s3", "acl": [f"docs:{name}"], "url": f"s3://{bucket}/{o.key}",
+                       "s3_etag": o.etag, "s3_size": o.size, "s3_last_modified": o.last_modified,
+                       "s3_endpoint": endpoint, "source_updated_at": o.last_modified}
+                stats["sections"] += _write_document(w, doc, markdown)
+                stats["documents"] += 1
+                stats["changed" if old else "new"] += 1
+            except Exception as e:  # one broken object must not stop the bucket
+                log.warning("cannot process s3://%s/%s: %s", bucket, o.key, e)
+                stats["failed"] += 1
+    stats["removed"] = reconcile(w, name, listing, force, stored)
+    from .history import link_references
+    return {**stats, "references": link_references(w)}
