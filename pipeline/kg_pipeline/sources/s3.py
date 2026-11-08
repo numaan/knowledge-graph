@@ -231,3 +231,78 @@ def sync(w, client, name: str, config: dict, full: bool = False, force: bool = F
     stats["removed"] = reconcile(w, name, listing, force, stored)
     from .history import link_references
     return {**stats, "references": link_references(w)}
+
+
+# ---- CLI --------------------------------------------------------------------------------------------------------
+def default_name(bucket: str, prefix: str) -> str:
+    """Source name from bucket and prefix: lower case, other characters become `-`, at most 63 characters."""
+    slug = re.sub(r"[^a-z0-9]+", "-", f"{bucket}-{prefix}".lower()).strip("-")[:63].strip("-")
+    return slug or "s3"
+
+
+def dry_run(w, client, name: str, config: dict, full: bool = False) -> dict:
+    """Report what sync would do. Lists the bucket and reads the stored Documents; writes nothing."""
+    listing = list_objects(client, config["bucket"], config.get("prefix") or "", config.get("include") or [])
+    stats = {**listing.stats(), "dry_run": True}
+    stored = _stored(w, name)
+    for o in listing.objects:
+        old = stored.get(f"s3:{name}:{o.key}")
+        if not old:
+            stats["new"] += 1
+        elif not full and (old["etag"], old["size"], old["lm"]) == (o.etag, o.size, o.last_modified):
+            stats["unchanged"] += 1
+        else:
+            stats["changed"] += 1  # an upper bound: a download with an equal content hash is counted unchanged
+    if listing.complete:
+        present = {f"s3:{name}:{o.key}" for o in listing.objects + listing.too_large}
+        stats["removed"] = len(set(stored) - present)
+    return stats
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+    import json
+    import sys
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    ap = argparse.ArgumentParser(
+        description="Sync an S3-compatible bucket into the graph as Documents. The CLI is a local operator tool: it "
+                    "uses ui_origin=False semantics, so AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (and the default "
+                    "boto3 credential chain) are used. Neo4j: NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD.")
+    ap.add_argument("--bucket", required=True)
+    ap.add_argument("--prefix", default="", help="key prefix (default: whole bucket)")
+    ap.add_argument("--endpoint", help="custom endpoint URL (https; MinIO, Ceph, ...)")
+    ap.add_argument("--include", action="append", default=[], metavar="GLOB",
+                    help="glob on the key relative to the prefix; repeatable (default: all supported suffixes)")
+    ap.add_argument("--name", help="source name, [a-z0-9][a-z0-9-]{0,62} (default: derived from bucket and prefix)")
+    ap.add_argument("--region")
+    ap.add_argument("--full", action="store_true", help="download and rewrite every object, ignore stored etags")
+    ap.add_argument("--force", action="store_true", help="remove deleted objects even when it is more than half")
+    ap.add_argument("--dry-run", action="store_true", help="list and report what would change; write nothing")
+    args = ap.parse_args(argv)
+    name = args.name or default_name(args.bucket, args.prefix)
+    config = {"bucket": args.bucket, "prefix": args.prefix, "include": args.include, "endpoint": args.endpoint or ""}
+    if args.region:
+        config["region"] = args.region
+    try:
+        from ..control.validate import validate_name
+        validate_name(name)
+        env = os.environ
+        secret = ({"access_key_id": env["AWS_ACCESS_KEY_ID"], "secret_access_key": env["AWS_SECRET_ACCESS_KEY"]}
+                  if env.get("AWS_ACCESS_KEY_ID") and env.get("AWS_SECRET_ACCESS_KEY") else None)
+        client = build_client(config, secret, ui_origin=False)
+        from ..graph.neo4j_writer import Neo4jWriter
+        with Neo4jWriter(env.get("NEO4J_URI", "bolt://localhost:7687"), env.get("NEO4J_USER", "neo4j"),
+                         env["NEO4J_PASSWORD"]) as w:
+            if args.dry_run:
+                res = dry_run(w, client, name, config, args.full)
+            else:
+                res = sync(w, client, name, config, full=args.full, force=args.force)
+    except Exception as e:
+        print(f"kg-s3: {e}", file=sys.stderr)
+        return 1
+    print(json.dumps(res, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
