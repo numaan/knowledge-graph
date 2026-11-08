@@ -61,7 +61,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
           cache-dependency-path: pipeline/pyproject.toml
-      - run: pip install -e ".[dev,dagster,otel]"
+      - run: pip install -e ".[dev,dagster,control,otel]"
       - run: ruff check .
       - run: pytest -q
 
