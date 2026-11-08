@@ -176,7 +176,7 @@ def test_audit_needs_admin(monkeypatch, engine):
     c = TestClient(create_app(auth=auth, engine=engine))
 
     def tok(groups):
-        claims = {"iss": issuer, "exp": int(time.time()) + 300, "preferred_username": "bob", "groups": groups}
+        claims = {"iss": issuer, "aud": "kg-mcp", "exp": int(time.time()) + 300, "preferred_username": "bob", "groups": groups}
         return {"Authorization": "Bearer " + jwt.encode(claims, key, algorithm="RS256", headers={"kid": "k1"})}
     assert c.get(f"{BASE}/audit").status_code == 401
     assert c.get(f"{BASE}/audit", headers=tok(["staff"])).status_code == 403

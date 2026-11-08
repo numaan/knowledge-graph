@@ -68,7 +68,7 @@ spec:
             - name: KG_OIDC_ISSUER
               value: {{ $c.oidc.issuer | quote }}
             - name: KG_OIDC_AUDIENCE
-              value: {{ $c.oidc.audience | quote }}
+              value: {{ required "control.oidc.audience must not be empty when control.oidc.issuer is set" $c.oidc.audience | quote }}
             - name: KG_OIDC_GROUPS_CLAIM
               value: {{ $c.oidc.groupsClaim | default "groups" | quote }}
             {{- with $c.oidc.adminGroup }}

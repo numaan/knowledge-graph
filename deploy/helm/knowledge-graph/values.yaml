@@ -254,7 +254,7 @@ control:
   allowLocalMode: false
   oidc:
     issuer: ""           # e.g. https://keycloak.example.com/realms/kg
-    audience: ""         # aud claim the access token must carry (empty: not checked)
+    audience: kg-mcp     # aud claim the access token must carry (checked; empty is not allowed)
     groupsClaim: groups
     adminGroup: ""       # optional; sets KG_CONTROL_ADMIN_GROUP (the API requires kg-admins by default)
   dagster:

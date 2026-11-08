@@ -86,7 +86,7 @@ pod then gets `CONTROL_API_URL=http://<name>-control:8090`.
 | `control.secretKey.key` | `KG_SECRET_KEY` | Key name in that Secret. |
 | `control.oidc.issuer` | `""` | Keycloak realm URL. Required when `control.enabled=true`, unless `control.allowLocalMode=true`. |
 | `control.allowLocalMode` | `false` | Allow an empty `control.oidc.issuer`. Local mode has no login and every caller is admin, and the web proxy exposes the API. Use it only for a local or kind install. |
-| `control.oidc.audience` | `""` | The `aud` claim of the token. Empty: not checked. Use `kg-mcp` with the dev realm. |
+| `control.oidc.audience` | `kg-mcp` | The `aud` claim the token must carry. Always checked when the issuer is set. Empty is not allowed. |
 | `control.oidc.groupsClaim` | `groups` | Claim that holds the groups. |
 | `control.oidc.adminGroup` | `""` | Sets `KG_CONTROL_ADMIN_GROUP`. Empty: the API uses `kg-admins`. |
 | `control.dagster.host` | `""` | Empty: `<release>-dagster-webserver`. |

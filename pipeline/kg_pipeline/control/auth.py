@@ -1,6 +1,6 @@
 """Keycloak JWT validation (JWKS) and the `kg-admins` group check.
 
-Environment: KG_OIDC_ISSUER (unset = local mode), KG_OIDC_AUDIENCE (checked when set),
+Environment: KG_OIDC_ISSUER (unset = local mode), KG_OIDC_AUDIENCE (default `kg-mcp` when the issuer is set; empty is refused),
 KG_OIDC_GROUPS_CLAIM (default `groups`, dotted paths work), KG_CONTROL_ADMIN_GROUP (default
 `kg-admins`), KG_OIDC_JWKS_URL (optional;
 default `<issuer>/protocol/openid-connect/certs`).
@@ -13,6 +13,7 @@ import jwt
 from fastapi import Depends, HTTPException, Request
 
 ADMIN_GROUP = "kg-admins"
+DEFAULT_AUDIENCE = "kg-mcp"  # same default as the Go MCP server
 
 
 @dataclass
@@ -34,7 +35,12 @@ class Authenticator:
 
     @classmethod
     def from_env(cls, key_resolver: Callable[[str], object] | None = None) -> "Authenticator":
-        return cls(os.environ.get("KG_OIDC_ISSUER", ""), os.environ.get("KG_OIDC_AUDIENCE", ""),
+        issuer = os.environ.get("KG_OIDC_ISSUER", "")
+        audience = os.environ.get("KG_OIDC_AUDIENCE", DEFAULT_AUDIENCE).strip()
+        if issuer.strip() and not audience:
+            raise SystemExit("control API cannot start: KG_OIDC_AUDIENCE is set but empty. "
+                             f"Unset it (default {DEFAULT_AUDIENCE}) or set the audience of your tokens.")
+        return cls(issuer, audience,
                    os.environ.get("KG_OIDC_GROUPS_CLAIM", "groups"), os.environ.get("KG_OIDC_JWKS_URL", ""),
                    key_resolver, os.environ.get("KG_CONTROL_ADMIN_GROUP", "").strip())
 

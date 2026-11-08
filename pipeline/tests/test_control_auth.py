@@ -15,8 +15,8 @@ ISSUER = "https://sso.example.com/realms/kg"
 KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
 
-def token(groups=("kg-admins",), aud="kg-control", iss=ISSUER, exp_in=300, user="alice", claim="groups", key=KEY):
-    claims = {"iss": iss, "aud": aud, "exp": int(time.time()) + exp_in, "preferred_username": user, claim: list(groups)}
+def token(groups=("kg-admins",), aud="kg-mcp", iss=ISSUER, exp_in=300, user="alice", claim="groups", key=KEY):
+    claims = {"iss": iss, **({"aud": aud} if aud else {}), "exp": int(time.time()) + exp_in, "preferred_username": user, claim: list(groups)}
     return jwt.encode(claims, key, algorithm="RS256", headers={"kid": "k1"})
 
 
@@ -178,3 +178,21 @@ def test_oidc_mode_logs_no_local_warning(caplog):
     with caplog.at_level("WARNING"):
         create_app(auth=Authenticator(issuer="https://sso/realms/kg", audience="kg-mcp"))
     assert "KG_OIDC_ISSUER is not set" not in caplog.text
+
+
+# ---- FIX 6: the audience is checked by default ----
+def test_audience_defaults_to_kg_mcp(monkeypatch):
+    c = client(monkeypatch)
+    assert c.get("/api/v1/me", headers=bearer(token(aud=None))).status_code == 401  # no aud claim
+    assert c.get("/api/v1/me", headers=bearer(token(aud="other"))).status_code == 401
+    assert c.get("/api/v1/me", headers=bearer(token(aud="kg-mcp"))).status_code == 200
+
+
+def test_explicit_empty_audience_refuses_start(monkeypatch):
+    for value in ("", "  "):
+        with pytest.raises(SystemExit, match="KG_OIDC_AUDIENCE"):
+            client(monkeypatch, KG_OIDC_AUDIENCE=value)
+
+
+def test_local_mode_ignores_empty_audience(monkeypatch):
+    client(monkeypatch, issuer=None, KG_OIDC_AUDIENCE="")

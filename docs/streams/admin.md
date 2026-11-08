@@ -178,11 +178,12 @@ script `kg-control` runs the same function.
   tool: to change the key, set the new key and enter all secrets again.
 - Missing `KG_SECRET_KEY`: when `DATABASE_URL` is set and the key is missing or not a valid Fernet key, the
   control API refuses to start (exit with a message that names `KG_SECRET_KEY`). There is no 400-on-save path.
-- Auth variables: `KG_OIDC_ISSUER` (empty = local mode), `KG_OIDC_AUDIENCE` (checked when set),
+- Auth variables: `KG_OIDC_ISSUER` (empty = local mode), `KG_OIDC_AUDIENCE` (default `kg-mcp` when the
+  issuer is set, as in the Go MCP server; an empty value stops the start),
   `KG_OIDC_GROUPS_CLAIM` (default `groups`), `KG_OIDC_JWKS_URL` (optional), `KG_CONTROL_ADMIN_GROUP`
   (default `kg-admins`).
 - Keycloak: the dev realm has the confidential client `kg-web` with the default scope `kg-mcp`. That scope
-  adds the audience `kg-mcp` and the `groups` claim. Set `control.oidc.audience=kg-mcp` to match.
+  adds the audience `kg-mcp` and the `groups` claim. The chart default `control.oidc.audience=kg-mcp` matches.
 
 ## 9. Out of scope here
 
