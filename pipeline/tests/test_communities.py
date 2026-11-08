@@ -734,3 +734,89 @@ def test_build_communities_runs_schema_and_returns_stats(monkeypatch):
     w.queries.clear()
     assert communities.build_communities(w, levels=2, backend="fallback")["written"] == 0
     assert all("MERGE" not in q for q in w.queries)
+
+
+# ---- T13: CLI ----
+import json  # noqa: E402
+import tomllib  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+
+class _CliWriter(StoreWriter):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _cli_setup(monkeypatch, capsys_env=True):
+    w = _CliWriter()
+    monkeypatch.setenv("NEO4J_PASSWORD", "x")
+    monkeypatch.setenv("KG_COMMUNITY_BACKEND", "fallback")
+    monkeypatch.setattr(communities, "Neo4jWriter", lambda *a, **k: w)
+    monkeypatch.setattr(communities, "load_partitions",
+                        lambda _w: (_t9_parts(), {"partitions": 2, "skipped_too_large": 0}))
+    monkeypatch.setattr(communities, "load_member_hashes", lambda _w: {})
+    return w
+
+
+def test_cli_dry_run_sends_no_write_and_prints_json(monkeypatch, capsys):
+    w = _cli_setup(monkeypatch)
+    import kg_pipeline.community_reports as cr
+    monkeypatch.setattr(cr, "build_reports", lambda *a, **k: pytest.fail("reports must not run"))
+    communities.main(["--dry-run", "--report"])
+    assert w.writes() == []
+    assert not any("CREATE" in q for q in w.queries)
+    out = json.loads(capsys.readouterr().out)
+    assert out["dry_run"] is True and out["partitions"] == 2 and "skipped_too_large" in out
+    assert sum(out["communities_by_level"].values()) > 0
+    assert w.comm == {}
+
+
+def test_cli_without_report_does_not_build_reports(monkeypatch, capsys):
+    w = _cli_setup(monkeypatch)
+    import kg_pipeline.community_reports as cr
+    monkeypatch.setattr(cr, "build_reports", lambda *a, **k: pytest.fail("reports must not run"))
+    communities.main([])
+    assert w.comm
+    assert "reports" not in json.loads(capsys.readouterr().out)
+
+
+def test_cli_report_passes_options(monkeypatch, capsys, tmp_path):
+    _cli_setup(monkeypatch)
+    import kg_pipeline.community_reports as cr
+    seen = {}
+
+    def fake(w, llm=None, emb=None, level=None, budget=None, cache=None):
+        seen.update(llm=llm, emb=emb, level=level, budget=budget, cache=cache)
+        return {"total": 1}
+
+    monkeypatch.setattr(cr, "build_reports", fake)
+    monkeypatch.setattr("kg_pipeline.models.Embedder", lambda: "EMB")
+    monkeypatch.setattr("kg_pipeline.models.LLM", lambda: "LLM")
+    communities.main(["--report", "--level", "0", "--budget", "3", "--cache", str(tmp_path)])
+    assert seen == {"llm": "LLM", "emb": "EMB", "level": 0, "budget": 3, "cache": tmp_path}
+    out = json.loads(capsys.readouterr().out)
+    assert out["reports"] == {"total": 1} and set(out["communities_by_level"]) <= {"0"}
+    communities.main(["--report", "--no-llm"])
+    assert seen["llm"] is None
+
+
+def test_cli_resolution_overrides_env(monkeypatch, capsys):
+    _cli_setup(monkeypatch)
+    monkeypatch.setenv("KG_COMMUNITY_RESOLUTION", "0.5")
+    got = []
+    real = communities.detect
+    monkeypatch.setattr(communities, "detect", lambda *a, **k: (got.append(k.get("resolution")), real(*a, **k))[1])
+    communities.main(["--dry-run", "--resolution", "2.5"])
+    assert got and set(got) == {2.5}
+    got.clear()
+    communities.main(["--dry-run"])
+    assert got and set(got) == {None}
+
+
+def test_pyproject_has_kg_communities_script():
+    p = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    scripts = tomllib.loads(p.read_text(encoding="utf-8"))["project"]["scripts"]
+    assert scripts["kg-communities"] == "kg_pipeline.communities:main"

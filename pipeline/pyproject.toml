@@ -48,6 +48,7 @@ kg-permissions = "kg_pipeline.sources.permissions:main"
 kg-review = "kg_pipeline.review:main"
 kg-fake-embedder = "kg_pipeline.fake_embed:main"
 kg-backup = "kg_pipeline.backup:main"
+kg-communities = "kg_pipeline.communities:main"
 
 [build-system]
 requires = ["setuptools>=69"]

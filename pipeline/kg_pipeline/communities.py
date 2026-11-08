@@ -43,6 +43,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 
+from kg_pipeline.graph.neo4j_writer import Neo4jWriter
 from kg_pipeline.leiden_fallback import louvain
 
 log = logging.getLogger("kg_pipeline.communities")
@@ -634,3 +635,40 @@ def build_communities(w, resolution: float | None = None, levels: int | None = N
     if not dry_run:
         write(w, rows)
     return stats
+
+
+def main(argv: list[str] | None = None) -> None:
+    import argparse
+    from pathlib import Path
+
+    ap = argparse.ArgumentParser(prog="kg-communities", description="Build GraphRAG communities and, with --report, "
+                                 "their reports. Prints the stats as JSON.")
+    ap.add_argument("--report", action="store_true", help="also build the community reports")
+    ap.add_argument("--dry-run", action="store_true", help="detect and compare only: no write, no schema, no LLM, no embedder")
+    ap.add_argument("--level", type=int, default=None, help="limit reports and printed counts to this level")
+    ap.add_argument("--resolution", type=float, default=None, help="override KG_COMMUNITY_RESOLUTION")
+    ap.add_argument("--no-llm", action="store_true", help="extractive reports only")
+    ap.add_argument("--budget", type=int, default=None, help="maximum LLM calls for reports (default COMMUNITY_BUDGET or 100)")
+    ap.add_argument("--cache", type=Path, default=Path(os.environ.get("LLM_CACHE_DIR", ".kg-cache/llm")))
+    args = ap.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    with Neo4jWriter(os.environ.get("NEO4J_URI", "bolt://localhost:7687"), os.environ.get("NEO4J_USER", "neo4j"),
+                     os.environ["NEO4J_PASSWORD"]) as w:
+        stats = build_communities(w, resolution=args.resolution, dry_run=args.dry_run)
+        if args.level is not None:
+            stats["communities_by_level"] = {k: v for k, v in stats["communities_by_level"].items() if k == args.level}
+        stats["dry_run"] = args.dry_run
+        if args.report and not args.dry_run:
+            from kg_pipeline import community_reports
+            from kg_pipeline.models import LLM, Embedder
+
+            llm = None if args.no_llm else LLM()
+            stats["reports"] = community_reports.build_reports(w, llm=llm, emb=Embedder(), level=args.level,
+                                                               budget=args.budget, cache=args.cache)
+        elif args.report:
+            stats["reports"] = "skipped (dry run)"
+    print(json.dumps(stats, indent=2))
+
+
+if __name__ == "__main__":
+    main()
