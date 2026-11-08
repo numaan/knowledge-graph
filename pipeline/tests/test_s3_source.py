@@ -242,7 +242,8 @@ def test_region_hint_second_redirect_is_an_error_naming_region(monkeypatch):
     assert len(built) == 2
 
 
-@pytest.mark.parametrize("bad", ["evil.example/x", "EU-WEST-1", "eu-west-1\r\nHost: x", "", "a-b", "eu-west-12"])
+@pytest.mark.parametrize("bad", ["evil.example/x", "EU-WEST-1", "eu-west-1\r\nHost: x", "", "a-b", "eu-west-12",
+                                 "eu-west-٣"])   # Arabic-Indic digit
 def test_region_hint_with_an_invalid_region_is_not_used(monkeypatch, bad):
     built, fn = retry_fixture(monkeypatch, [bad])
     with pytest.raises(s3.RedirectRefused, match="region"):

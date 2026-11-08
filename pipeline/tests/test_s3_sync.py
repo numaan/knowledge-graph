@@ -336,5 +336,8 @@ def test_listing_over_the_cap_writes_and_removes_nothing(monkeypatch):
 def test_max_objects_default_and_bad_value(monkeypatch):
     monkeypatch.delenv("KG_S3_MAX_OBJECTS", raising=False)
     assert s3.max_objects() == 500000
-    monkeypatch.setenv("KG_S3_MAX_OBJECTS", "abc")
-    assert s3.max_objects() == 500000
+    for bad in ("abc", "0", "-5"):
+        monkeypatch.setenv("KG_S3_MAX_OBJECTS", bad)
+        assert s3.max_objects() == 500000
+    monkeypatch.setenv("KG_S3_MAX_OBJECTS", "1")
+    assert s3.max_objects() == 1

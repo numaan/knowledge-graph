@@ -35,7 +35,7 @@ MAX_ATTEMPTS = 3
 _ANON = "anonymous"  # placeholder keys: with explicit keys boto3 never walks the credential chain
 
 
-_REGION = re.compile(r"[a-z]{2}(-[a-z]+)+-\d")   # used with fullmatch
+_REGION = re.compile(r"[a-z]{2}(-[a-z]+)+-\d", re.ASCII)   # used with fullmatch; ASCII: no Unicode digits
 
 
 class RedirectRefused(Exception):
@@ -61,7 +61,8 @@ def max_bytes() -> int:
 def max_objects() -> int:
     raw = os.environ.get("KG_S3_MAX_OBJECTS")
     try:
-        return int(raw) if raw else DEFAULT_MAX_OBJECTS
+        value = int(raw) if raw else DEFAULT_MAX_OBJECTS
+        return value if value >= 1 else DEFAULT_MAX_OBJECTS
     except ValueError:
         return DEFAULT_MAX_OBJECTS
 
