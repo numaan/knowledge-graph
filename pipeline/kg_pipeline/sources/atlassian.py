@@ -21,12 +21,13 @@ class Atlassian:
     """Basic auth with an account email and API token (env), retries on 429/5xx with Retry-After."""
 
     def __init__(self, base_url: str | None = None, email: str | None = None, token: str | None = None,
-                 fetch: Fetch | None = None, prefix: str = "JIRA"):
+                 fetch: Fetch | None = None, prefix: str = "JIRA", use_env: bool = True):
         self.base = (base_url or os.environ.get(f"{prefix}_BASE_URL", "")).rstrip("/")
         if not self.base:
             raise ValueError(f"{prefix}_BASE_URL is not set")
-        email = email or os.environ.get(f"{prefix}_EMAIL") or os.environ.get("ATLASSIAN_EMAIL", "")
-        token = token or os.environ.get(f"{prefix}_API_TOKEN") or os.environ.get("ATLASSIAN_API_TOKEN", "")
+        if use_env:  # False for a UI source: it must not send the platform credentials
+            email = email or os.environ.get(f"{prefix}_EMAIL") or os.environ.get("ATLASSIAN_EMAIL", "")
+            token = token or os.environ.get(f"{prefix}_API_TOKEN") or os.environ.get("ATLASSIAN_API_TOKEN", "")
         self._auth = "Basic " + base64.b64encode(f"{email}:{token}".encode()).decode() if email and token else None
         self._fetch = fetch or self._http
 

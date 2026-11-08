@@ -14,6 +14,8 @@ dependencies = [
 [project.optional-dependencies]
 # dagster-postgres and dagster-k8s: run pods read the instance from PostgreSQL and use the K8s launcher
 dagster = ["dagster==1.13.28", "dagster-postgres==0.29.28", "dagster-k8s==0.29.28", "sqlalchemy>=2.0,<2.1"]  # 2.1 switches postgresql:// to psycopg 3
+# Control API (kg_pipeline/control): FastAPI app, Fernet secrets, Keycloak JWT, Dagster GraphQL client
+control = ["fastapi>=0.115", "uvicorn>=0.30", "cryptography>=43", "PyJWT[crypto]>=2.9", "dagster-graphql==1.13.28", "httpx>=0.27", "sqlalchemy>=2.0,<2.1"]
 dev = ["pytest>=8", "ruff>=0.14"]
 # OpenTelemetry tracing (kg_pipeline/telemetry.py); off unless OTEL_EXPORTER_OTLP_ENDPOINT is set
 otel = ["opentelemetry-sdk>=1.38,<2", "opentelemetry-exporter-otlp-proto-http>=1.38,<2"]
@@ -23,6 +25,7 @@ kg-ingest-code = "kg_pipeline.code.ingest:main"
 kg-domain = "kg_pipeline.domain.extract:main"
 kg-embed = "kg_pipeline.vectors:main"
 kg-search = "kg_pipeline.search:main"
+kg-control = "kg_pipeline.control.__main__:main"
 kg-verify = "kg_pipeline.requirements:main"
 kg-eval = "kg_pipeline.evaluate:main"
 kg-jira = "kg_pipeline.sources.jira:main"

@@ -42,7 +42,7 @@ def service_catalog_asset(partitions_def, code_snapshot, repos: dict, branch: st
     def service_catalog(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
         """Backstage catalog-info.yaml entities and CODEOWNERS of one repository."""
         name = context.partition_key
-        mirror_path = git.mirror(repos[name], archive)
+        mirror_path = git.mirror(repos[name], archive, **getattr(repos, "mirror_kwargs", lambda n: {})(name))
         with git.checkout(mirror_path, git.head(mirror_path, branch)) as work, _writer() as w:
             stats = catalog.sync(w, work, name)
         return dg.MaterializeResult(metadata={k: v for k, v in stats.items() if isinstance(v, (int, bool))})

@@ -614,6 +614,7 @@ MCP server (`/api/*`), so a person sees exactly what their groups allow.
 | Entity | `/entity?id=` | properties, code, neighbours, change history, graph explorer, feedback buttons |
 | Domain | `/domain?repo=` | capabilities, concepts, rules, endpoints |
 | Requirements | `/requirements` | verdicts and evidence |
+| Admin | `/admin` | sources, runs and audit; only with `control.enabled` and group `kg-admins` (see [admin.md](streams/admin.md)) |
 
 Run it locally:
 

@@ -1,0 +1,8 @@
+{
+  "details": {
+    "branch": "main",
+    "host": "git.example.com"
+  },
+  "message": "branch main found on git.example.com",
+  "ok": true
+}
