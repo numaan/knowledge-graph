@@ -230,7 +230,8 @@ def s3_documents(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
                 probe.guard_source("s3", src.config)   # SSRF guard, as in POST /run
                 # A ui source never uses the platform credentials: without a secret the client is anonymous.
                 client = s3.build_client(src.config, sources_registry.get_secret(src), ui_origin=src.origin != "env")
-                out[src.name] = s3.sync(w, client, src.name, src.config, full=_full(context))
+                # Mode full is an explicit admin action (the UI asks for a confirmation): it lifts the removal guard.
+                out[src.name] = s3.sync(w, client, src.name, src.config, full=_full(context), force=_full(context))
             except Exception as e:   # the other sources still run; the asset fails at the end
                 context.log.error("s3 source %s failed: %s: %s", src.name, type(e).__name__, e)
                 errors[src.name] = f"{type(e).__name__}: {e}"

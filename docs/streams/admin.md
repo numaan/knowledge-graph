@@ -123,7 +123,7 @@ S3 sources (asset `s3_documents`, code in `kg_pipeline/sources/s3.py`):
   `s3://<bucket>/<key>` and ACL group `docs:<source name>`. A user needs that group to see it.
 - Reconcile removes the Documents of keys that are gone, only after a complete listing. Objects over the size
   limit count as existing and are never removed. The guard `TooManyRemovals` stops a run that would remove more
-  than half of the Documents of a source (when more than 20); the asset has no force switch, use `kg-s3 --force`.
+  than half of the Documents of a source (when more than 20); a run with mode `full` (the UI asks for a confirmation) passes `force` to the sync and lifts the guard; incremental and scheduled runs keep it. The CLI equivalent is `kg-s3 --force`.
 - Run stats (top-level, plain integers): `listed`, `new`, `changed`, `unchanged`, `skipped`, `removed`, `bytes`
   (downloaded bytes only), `failed`. Per-source results are in the `sources` JSON.
 - A failing source (SSRF guard, listing error, `TooManyRemovals`) does not stop the other sources. The asset fails

@@ -182,7 +182,7 @@ def reconcile(w, name: str, listing: Listing, force: bool = False, stored: dict 
     Only a complete listing removes anything. Keys in `objects` and in `too_large` exist. The query filters on the
     source name and on source 's3', so documents of other sources and of local folders are never touched.
     """
-    from ..reconcile import _guard
+    from ..reconcile import TooManyRemovals, _guard
     if not listing.complete:
         return 0
     stored = _stored(w, name) if stored is None else stored
@@ -191,7 +191,11 @@ def reconcile(w, name: str, listing: Listing, force: bool = False, stored: dict 
     del present
     if not gone:
         return 0
-    _guard(len(gone), len(stored), f"S3 source {name}", force)   # before any deletion, from the stored total
+    try:
+        _guard(len(gone), len(stored), f"S3 source {name}", force)   # before any deletion, from the stored total
+    except TooManyRemovals as e:
+        raise TooManyRemovals(f"{e}; to accept it, start a Full run of the source in the admin UI or run "
+                              f"kg-s3 --force") from None
     removed = 0
     # Batches: a failure between two batches leaves a consistent graph; the next run finds the rest as gone.
     for i in range(0, len(gone), DELETE_BATCH):

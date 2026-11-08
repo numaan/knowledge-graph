@@ -479,8 +479,9 @@ def s3fx(monkeypatch):
     monkeypatch.setattr(d.s3, "build_client", lambda cfg, secret, ui_origin=False: calls["client"].append(
         (cfg["bucket"], secret, ui_origin)) or cfg["bucket"])
 
-    def sync(w, client, name, cfg, full=False, **kw):
+    def sync(w, client, name, cfg, full=False, force=False, **kw):
         calls["sync"].append((name, client, full))
+        calls.setdefault("force", []).append(force)
         if name == "bad":
             raise RuntimeError("listing failed")
         return {**s3mod.new_stats(), "listed": 2, "new": 1, "unchanged": 1, "bytes": 5, "failed": 0}
@@ -501,6 +502,14 @@ def test_s3_documents_runs_every_enabled_source_with_its_own_secret(s3fx, regist
     assert (res.metadata["listed"], res.metadata["new"], res.metadata["bytes"]) == (4, 2, 10)
     assert set(res.metadata["sources"].value) == {"one", "two"}
     assert "s1" not in str(res.metadata)
+
+
+def test_s3_documents_full_run_forces_reconcile_incremental_keeps_the_guard(s3fx, registry_db):
+    add_rows(registry_db, ("s3", "one", {"bucket": "b1"}, None, True))
+    d.s3_documents(ctx({"kg/mode": "full"}))
+    d.s3_documents(ctx({"kg/mode": "incremental"}))
+    d.s3_documents(ctx())
+    assert s3fx["force"] == [True, False, False]
 
 
 def test_s3_documents_env_origin_is_not_ui_origin(s3fx, registry_db):

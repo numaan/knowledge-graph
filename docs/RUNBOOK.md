@@ -524,7 +524,7 @@ An S3 source reads documents from a bucket of AWS S3, MinIO, SeaweedFS or Ceph i
 | Change detection | The same ETag, size and last-modified: not downloaded. Downloaded with the same content hash: only the stored fields change. |
 | Mode `full` | Downloads and rewrites every object. The embedding cache stays. |
 | Reconcile | Documents of deleted keys are removed after a complete listing. Objects over the size limit are never removed. |
-| `TooManyRemovals` | A run that would remove more than half of the Documents (and more than 20) stops. Check the bucket, then run the CLI with `--force`. |
+| `TooManyRemovals` | A run that would remove more than half of the Documents (and more than 20) stops. Check the bucket. If the removal is right (for example after a change of the prefix), start a **Full** run of the source in the admin UI (it asks for a confirmation and removes the Documents of deleted objects without the guard), or run the CLI with `--force`. An incremental or scheduled run keeps the guard. |
 | Access | Each Document has the ACL group `docs:<source name>`. A user needs that group in `KG_ACL_MAPPING` or the token claims. Group `*` (`kg-admins`) sees all. |
 | Run stats | `listed`, `new`, `changed`, `unchanged`, `skipped`, `removed`, `bytes`, `failed` |
 

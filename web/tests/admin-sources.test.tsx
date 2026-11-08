@@ -92,6 +92,21 @@ describe("row actions", () => {
     await userEvent.click(screen.getByRole("button", { name: "Confirm full run" }));
     expect(api.post).toHaveBeenCalledWith("sources/s1/run", { mode: "full" });
   });
+  it("the full confirmation of an S3 source says that deleted objects are removed in any case", async () => {
+    cf.mockResolvedValue({ ok: true, status: 200, data: { items: [src({ kind: "s3", name: "bucket-a", config: { bucket: "b" } })] } });
+    render(await AdminPage());
+    await userEvent.selectOptions(screen.getByLabelText(/Mode for bucket-a/), "full");
+    await userEvent.click(screen.getByRole("button", { name: /^Run/ }));
+    const text = screen.getByRole("alertdialog").textContent ?? "";
+    expect(text).toMatch(/removes the documents of deleted objects/i);
+    expect(text).toMatch(/more than half/i);
+  });
+  it("the full confirmation of a git source has no S3 text", async () => {
+    await renderRow();
+    await userEvent.selectOptions(screen.getByLabelText(/Mode for repo-a/), "full");
+    await userEvent.click(screen.getByRole("button", { name: /^Run/ }));
+    expect(screen.getByRole("alertdialog").textContent).not.toMatch(/deleted objects/i);
+  });
   it("cancelling the confirmation does not run", async () => {
     await renderRow();
     await userEvent.selectOptions(screen.getByLabelText(/Mode for repo-a/), "full");

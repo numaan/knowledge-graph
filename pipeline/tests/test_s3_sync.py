@@ -243,7 +243,7 @@ def test_reconcile_guard_and_force():
     w = MemWriter()
     seed(w, "s", [f"docs/{i}.md" for i in range(30)])
     listing = s3.Listing([s3.S3Object("docs/0.md", 1, "e", "m")], [], True)
-    with pytest.raises(reconcile.TooManyRemovals):
+    with pytest.raises(reconcile.TooManyRemovals, match=r"Full run.*kg-s3 --force"):
         s3.reconcile(w, "s", listing)
     assert len(w.docs) == 30
     assert s3.reconcile(w, "s", listing, force=True) == 29 and len(w.docs) == 1
