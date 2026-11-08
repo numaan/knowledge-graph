@@ -133,7 +133,25 @@ def test_get_logs_keeps_last_200_over_pages():
 class FakeDagster:
     def __init__(self, launch_error=None):
         self.launched = []
+        self.terminated = []
         self.launch_error = launch_error
+        self.status = "STARTED"
+        self.logs = []
+        self.status_error = None
+        self.logs_error = None
+
+    def get_status(self, run_id):
+        if self.status_error:
+            raise self.status_error
+        return self.status
+
+    def get_logs(self, run_id, limit=200):
+        if self.logs_error:
+            raise self.logs_error
+        return self.logs
+
+    def terminate(self, run_id):
+        self.terminated.append(run_id)
 
     def launch(self, job_name, tags=None, run_config=None):
         if self.launch_error:
@@ -275,3 +293,101 @@ def test_source_last_run_shows_the_run(client):
     sid = make(client, GIT)
     run = client.post(f"/api/v1/sources/{sid}/run").json()
     assert client.get(f"/api/v1/sources/{sid}").json()["last_run"]["id"] == run["id"]
+
+
+# ---- T6: list, detail, cancel ----
+def start_run(client, sid, **kw):
+    return client.post(f"/api/v1/sources/{sid}/run", json=kw).json()
+
+
+def test_runs_routes_exist(client):
+    assert client.get("/api/v1/runs").json() == {"items": []}
+    assert client.get("/api/v1/runs/run_000000000000").status_code == 404
+    assert client.post("/api/v1/runs/run_000000000000/cancel").status_code == 404
+
+
+def test_list_newest_first_filters_and_limits(client, engine):
+    from datetime import datetime, timedelta, timezone
+    a, b = make(client, GIT), make(client, JIRA)
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    with engine.begin() as conn:
+        for i in range(60):
+            conn.execute(db.runs.insert().values(
+                id=f"run_{i:012d}", source_id=a if i % 2 == 0 else b, source_name="x", kind="git",
+                status="succeeded" if i < 50 else "failed", trigger="manual", mode="incremental",
+                started_at=base + timedelta(minutes=i)))
+    items = client.get("/api/v1/runs").json()["items"]
+    assert len(items) == 50 and items[0]["id"] == "run_000000000059" and items[1]["id"] == "run_000000000058"
+    assert len(client.get("/api/v1/runs?limit=500").json()["items"]) == 60
+    assert len(client.get("/api/v1/runs?limit=3").json()["items"]) == 3
+    assert {i["source_id"] for i in client.get(f"/api/v1/runs?source_id={a}").json()["items"]} == {a}
+    assert len(client.get("/api/v1/runs?status=failed").json()["items"]) == 10
+    for bad in ("abc", "0", "-1"):
+        assert client.get(f"/api/v1/runs?limit={bad}").status_code == 400
+
+
+def test_detail_refresh_sets_started_then_final(client, app):
+    run = start_run(client, make(client, GIT))
+    app.state.dagster.status = "STARTED"
+    d = client.get(f"/api/v1/runs/{run['id']}").json()
+    assert d["status"] == "running" and d["started_at"] and d["ended_at"] is None and d["log_tail"] == []
+    first = d["started_at"]
+    app.state.dagster.status = "SUCCESS"
+    d = client.get(f"/api/v1/runs/{run['id']}").json()
+    assert d["status"] == "succeeded" and d["started_at"] == first and d["ended_at"]
+    assert d["stats"] is None
+
+
+def test_detail_copies_stats_when_client_can_read(client, app):
+    app.state.dagster.get_stats = lambda rid: {"chunks": 3}
+    run = start_run(client, make(client, GIT))
+    app.state.dagster.status = "FAILURE"
+    d = client.get(f"/api/v1/runs/{run['id']}").json()
+    assert d["status"] == "failed" and d["stats"] == {"chunks": 3}
+
+
+def test_list_refreshes_active_runs(client, app):
+    run = start_run(client, make(client, GIT))
+    app.state.dagster.status = "SUCCESS"
+    assert client.get("/api/v1/runs").json()["items"][0]["status"] == "succeeded"
+    assert client.get(f"/api/v1/runs/{run['id']}").json()["status"] == "succeeded"
+
+
+def test_log_tail_capped_and_scrubbed(client, app):
+    run = start_run(client, make(client, GIT))
+    app.state.dagster.logs = [f"line {i}" for i in range(300)] + [f"auth {SECRET} used"]
+    r = client.get(f"/api/v1/runs/{run['id']}")
+    tail = r.json()["log_tail"]
+    assert len(tail) == 200 and tail[-1] == "auth *** used" and SECRET not in r.text
+
+
+def test_dagster_unreachable_returns_stored_run(client, app):
+    run = start_run(client, make(client, GIT))
+    app.state.dagster.status_error = dc.DagsterUnavailable("dagster is unreachable")
+    app.state.dagster.logs_error = dc.DagsterUnavailable("dagster is unreachable")
+    r = client.get(f"/api/v1/runs/{run['id']}")
+    assert r.status_code == 200 and r.json()["status"] == "queued" and r.json()["log_tail"] == []
+    assert client.get("/api/v1/runs").status_code == 200
+
+
+def test_cancel_terminates_audits_and_frees_source(client, app, engine):
+    sid = make(client, GIT)
+    run = start_run(client, sid)
+    r = client.post(f"/api/v1/runs/{run['id']}/cancel")
+    assert r.status_code == 200 and r.json()["status"] == "canceled" and r.json()["ended_at"]
+    assert app.state.dagster.terminated == ["dagster-1"]
+    with engine.connect() as conn:
+        rows = conn.execute(select(db.audit).where(db.audit.c.action == "run.cancel")).all()
+    assert len(rows) == 1 and rows[0].target == run["id"] and rows[0].actor == "local"
+    assert client.post(f"/api/v1/runs/{run['id']}/cancel").status_code == 409
+    assert client.post(f"/api/v1/sources/{sid}/run").status_code == 202
+
+
+def test_cancel_dagster_down_gives_502_and_keeps_status(client, app):
+    run = start_run(client, make(client, GIT))
+
+    def boom(rid):
+        raise dc.DagsterUnavailable("dagster is unreachable")
+    app.state.dagster.terminate = boom
+    assert client.post(f"/api/v1/runs/{run['id']}/cancel").status_code == 502
+    assert client.get(f"/api/v1/runs/{run['id']}").json()["status"] in ("queued", "running")
