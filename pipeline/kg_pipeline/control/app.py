@@ -1,4 +1,5 @@
 """FastAPI app factory for the control API. Errors are `{"error": "text"}`."""
+import logging
 import os
 
 from fastapi import APIRouter, Depends, FastAPI, Request
@@ -10,6 +11,8 @@ from sqlalchemy.engine import Engine
 
 from . import db, routes_audit, routes_runs, routes_sources, secrets
 from .auth import Authenticator, User, require_user
+
+log = logging.getLogger(__name__)
 
 
 def check_startup() -> None:
@@ -26,6 +29,10 @@ def create_app(auth: Authenticator | None = None, engine: Engine | None = None) 
     check_startup()
     app = FastAPI(title="kg control API", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.auth = auth or Authenticator.from_env()
+    if app.state.auth.local:
+        log.warning("WARNING: KG_OIDC_ISSUER is not set. The control API runs in LOCAL MODE without authentication: "
+                    "every caller is admin and can create sources, store secrets and start runs. "
+                    "Use this only for local development.")
     if engine is None and os.environ.get("DATABASE_URL", "").strip():
         engine = db.get_engine()
     app.state.engine = engine

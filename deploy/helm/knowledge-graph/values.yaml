@@ -248,8 +248,10 @@ control:
   secretKey:
     existingSecret: ""
     key: KG_SECRET_KEY
-  # Token checks (the same Keycloak as the web app). Empty issuer = local mode without authentication:
-  # keep the Service internal in that case.
+  # Token checks (the same Keycloak as the web app). An empty issuer is local mode without authentication:
+  # every caller is admin. The chart refuses to render control.enabled=true with an empty issuer unless
+  # allowLocalMode is true. Set it only for a local or kind install whose web app and Service are not public.
+  allowLocalMode: false
   oidc:
     issuer: ""           # e.g. https://keycloak.example.com/realms/kg
     audience: ""         # aud claim the access token must carry (empty: not checked)

@@ -163,3 +163,18 @@ def test_admin_group_defaults_to_kg_admins(monkeypatch):
 def test_empty_admin_group_env_uses_default(monkeypatch):
     c = client(monkeypatch, KG_CONTROL_ADMIN_GROUP="")
     assert c.get("/api/v1/me", headers=bearer(token())).json()["is_admin"] is True
+
+
+# ---- FIX 5: local mode is loud ----
+def test_local_mode_logs_a_warning_at_start(caplog):
+    from kg_pipeline.control.app import create_app
+    with caplog.at_level("WARNING"):
+        create_app(auth=Authenticator())
+    assert "KG_OIDC_ISSUER is not set" in caplog.text and "every caller is admin" in caplog.text
+
+
+def test_oidc_mode_logs_no_local_warning(caplog):
+    from kg_pipeline.control.app import create_app
+    with caplog.at_level("WARNING"):
+        create_app(auth=Authenticator(issuer="https://sso/realms/kg", audience="kg-mcp"))
+    assert "KG_OIDC_ISSUER is not set" not in caplog.text

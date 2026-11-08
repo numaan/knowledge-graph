@@ -84,7 +84,8 @@ pod then gets `CONTROL_API_URL=http://<name>-control:8090`.
 | `control.port` | `8090` | Port of the container and the Service. |
 | `control.secretKey.existingSecret` | `""` | Secret with the Fernet key. Empty: the chart makes `<name>-control` and keeps the key on upgrade. |
 | `control.secretKey.key` | `KG_SECRET_KEY` | Key name in that Secret. |
-| `control.oidc.issuer` | `""` | Keycloak realm URL. Empty: local mode without login. Keep the Service internal then. |
+| `control.oidc.issuer` | `""` | Keycloak realm URL. Required when `control.enabled=true`, unless `control.allowLocalMode=true`. |
+| `control.allowLocalMode` | `false` | Allow an empty `control.oidc.issuer`. Local mode has no login and every caller is admin, and the web proxy exposes the API. Use it only for a local or kind install. |
 | `control.oidc.audience` | `""` | The `aud` claim of the token. Empty: not checked. Use `kg-mcp` with the dev realm. |
 | `control.oidc.groupsClaim` | `groups` | Claim that holds the groups. |
 | `control.oidc.adminGroup` | `""` | Sets `KG_CONTROL_ADMIN_GROUP`. Empty: the API uses `kg-admins`. |

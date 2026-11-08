@@ -1,6 +1,9 @@
 {{- if .Values.control.enabled }}
 {{- $name := include "kg.name" . -}}
 {{- $c := .Values.control -}}
+{{- if and (not $c.oidc.issuer) (not $c.allowLocalMode) }}
+{{- fail "control.enabled=true needs control.oidc.issuer (Keycloak realm URL). Without it the control API runs in local mode and every caller is admin. Set control.allowLocalMode=true only if the Service is not reachable by untrusted users." }}
+{{- end }}
 {{- $sel := dict "ctx" $ "component" "control" -}}
 {{- /* Service of the Dagster chart webserver: <release>-dagster-webserver, port dagster.dagsterWebserver.service.port (chart default 80). */ -}}
 {{- $dagsterHost := $c.dagster.host | default (printf "%s-dagster-webserver" .Release.Name) -}}

@@ -154,7 +154,15 @@ jobs:
           grep -q 'DAGSTER_CLI_API_GRPC_CONTAINER_CONTEXT' "$out"
           grep -q -F '\"name\":\"KG_SECRET_KEY\"' "$out"
           grep -q -F '\"name\":\"DATABASE_URL\"' "$out"
-          helm lint . --set control.enabled=true --set control.image=kg-pipeline:ci --set web.enabled=true --set web.image=kg-web:ci
+          helm lint . --set control.enabled=true --set control.image=kg-pipeline:ci --set web.enabled=true --set web.image=kg-web:ci --set control.oidc.issuer=https://sso.example.com/realms/kg
+      - name: control API refuses local mode unless allowed
+        run: |
+          if helm template kg . --set control.enabled=true --set control.image=kg-pipeline:ci > "$RUNNER_TEMP/nolocal.yaml" 2> "$RUNNER_TEMP/nolocal.err"; then
+            echo "control.enabled=true without an issuer must fail to render"
+            exit 1
+          fi
+          grep -q 'control.oidc.issuer' "$RUNNER_TEMP/nolocal.err"
+          helm template kg . --set control.enabled=true --set control.image=kg-pipeline:ci --set control.allowLocalMode=true > /dev/null
 
   integration:
     name: ingest fixture and evaluate
