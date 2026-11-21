@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from "next";
 import Link from "next/link";
 import { auth, oidcEnabled } from "@/auth";
 import { Nav } from "@/components/Nav";
+import { getMe } from "@/lib/me";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import "./globals.css";
 
@@ -18,6 +19,7 @@ const themeScript = `try{var t=localStorage.getItem("kg-theme");if(t==="light"||
 
 export default async function RootLayout({ children }: { children: React.ReactNode }) {
   const session = oidcEnabled ? await auth() : null;
+  const showAdmin = (await getMe(2000)).state === "admin";
   return (
     <html lang="en" suppressHydrationWarning>
       <head>
@@ -27,7 +29,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
         <a className="skip" href="#main">Skip to content</a>
         <header className="header">
           <Link href="/" className="brand">Knowledge base</Link>
-          <Nav />
+          <Nav showAdmin={showAdmin} />
           <form action="/search" role="search" className="header-search">
             <label htmlFor="q-header" className="skip">Search</label>
             <input id="q-header" type="search" name="q" placeholder="Search code, tickets, docs…" />

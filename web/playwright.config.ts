@@ -9,6 +9,9 @@ export default defineConfig({
   testDir: "e2e",
   timeout: 30_000,
   retries: 0,
+  // One worker: with 4 workers the desktop and phone admin specs together time out in page.goto
+  // (each group passes alone; all 18 specs pass with 1 or 2 workers). Root cause not found; see the PR.
+  workers: 1,
   reporter: [["list"]],
   use: { baseURL: `http://127.0.0.1:${APP}`, trace: "retain-on-failure" },
   projects: [
@@ -22,7 +25,7 @@ export default defineConfig({
       port: APP,
       reuseExistingServer: false,
       timeout: 60_000,
-      env: { KG_API_URL: `http://127.0.0.1:${MOCK}`, NEXT_TELEMETRY_DISABLED: "1" },
+      env: { KG_API_URL: `http://127.0.0.1:${MOCK}`, CONTROL_API_URL: `http://127.0.0.1:${MOCK}`, NEXT_TELEMETRY_DISABLED: "1" },
     },
   ],
 });

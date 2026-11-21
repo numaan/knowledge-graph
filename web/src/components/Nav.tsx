@@ -9,12 +9,14 @@ const LINKS = [
   ["/domain", "Domain"],
   ["/requirements", "Requirements"],
 ] as const;
+const ADMIN = ["/admin", "Admin"] as const;
 
-export function Nav() {
+export function Nav({ showAdmin = false }: { showAdmin?: boolean }) {
   const path = usePathname();
+  const links = showAdmin ? [...LINKS, ADMIN] : LINKS;
   return (
     <nav className="nav" aria-label="Main">
-      {LINKS.map(([href, label]) => (
+      {links.map(([href, label]) => (
         <Link key={href} href={href} aria-current={path.startsWith(href) ? "page" : undefined}>
           {label}
         </Link>

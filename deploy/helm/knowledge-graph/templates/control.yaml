@@ -1,0 +1,107 @@
+{{- if .Values.control.enabled }}
+{{- $name := include "kg.name" . -}}
+{{- $c := .Values.control -}}
+{{- if and (not $c.oidc.issuer) (not $c.allowLocalMode) }}
+{{- fail "control.enabled=true needs control.oidc.issuer (Keycloak realm URL). Without it the control API runs in local mode and every caller is admin. Set control.allowLocalMode=true only if the Service is not reachable by untrusted users." }}
+{{- end }}
+{{- $sel := dict "ctx" $ "component" "control" -}}
+{{- /* Service of the Dagster chart webserver: <release>-dagster-webserver, port dagster.dagsterWebserver.service.port (chart default 80). */ -}}
+{{- $dagsterHost := $c.dagster.host | default (printf "%s-dagster-webserver" .Release.Name) -}}
+{{- $dagsterPort := $c.dagster.port | default (dig "dagsterWebserver" "service" "port" 80 .Values.dagster) -}}
+{{- $keySecret := $c.secretKey.existingSecret | default (printf "%s-control" $name) -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-control
+  labels: {{- include "kg.labels" . | nindent 4 }}
+spec:
+  selector: {{- include "kg.selector" $sel | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $c.port }}
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}-control
+  labels: {{- include "kg.labels" . | nindent 4 }}
+spec:
+  replicas: {{ $c.replicas }}
+  selector:
+    matchLabels: {{- include "kg.selector" $sel | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "kg.selector" $sel | nindent 8 }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: control
+          image: {{ required "control.image is required when control.enabled=true" $c.image }}
+          command: ["python", "-m", "kg_pipeline.control"]
+          env:
+            - name: PORT
+              value: {{ $c.port | quote }}
+            - name: HOME
+              value: /tmp
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $name }}-control
+                  key: DATABASE_URL
+            - name: KG_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $keySecret }}
+                  key: {{ $c.secretKey.key | default "KG_SECRET_KEY" }}
+            - name: DAGSTER_GRAPHQL_HOST
+              value: {{ $dagsterHost | quote }}
+            - name: DAGSTER_GRAPHQL_PORT
+              value: {{ $dagsterPort | quote }}
+            {{- with $c.dagster.webserverUrl }}
+            - name: DAGSTER_WEBSERVER_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if $c.oidc.issuer }}
+            - name: KG_OIDC_ISSUER
+              value: {{ $c.oidc.issuer | quote }}
+            - name: KG_OIDC_AUDIENCE
+              value: {{ required "control.oidc.audience must not be empty when control.oidc.issuer is set" $c.oidc.audience | quote }}
+            - name: KG_OIDC_GROUPS_CLAIM
+              value: {{ $c.oidc.groupsClaim | default "groups" | quote }}
+            {{- with $c.oidc.adminGroup }}
+            - name: KG_CONTROL_ADMIN_GROUP
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- range $k, $v := $c.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ $c.port }}
+          readinessProbe:
+            httpGet:
+              path: /api/v1/healthz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/v1/healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources: {{- toYaml $c.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+{{- end }}

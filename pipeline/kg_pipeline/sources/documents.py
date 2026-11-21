@@ -196,7 +196,8 @@ def fetch_pages(api: Atlassian, space_key: str):
         params = dict(urllib.parse.parse_qsl(query))
 
 
-def sync_confluence(w: Neo4jWriter, api: Atlassian, space_key: str) -> dict:
+def sync_confluence(w: Neo4jWriter, api: Atlassian, space_key: str, full: bool = False) -> dict:
+    """Pages of a space. full=True ignores the stored version and writes every page again."""
     if not re.fullmatch(r"[A-Za-z0-9~_]{1,255}", space_key):
         raise ValueError(f"invalid space key {space_key!r}")
     seen, parents, stats = [], [], {"documents": 0, "unchanged": 0, "sections": 0}
@@ -206,7 +207,7 @@ def sync_confluence(w: Neo4jWriter, api: Atlassian, space_key: str) -> dict:
         if p.get("parentId"):
             parents.append({"src": doc_id, "dst": f"confluence:{space_key}:{p['parentId']}"})
         version = str((p.get("version") or {}).get("number", ""))
-        if _unchanged(w, doc_id, version):
+        if not full and _unchanged(w, doc_id, version):
             stats["unchanged"] += 1
             continue
         markdown = f"# {p['title']}\n\n" + storage_to_markdown(((p.get("body") or {}).get("storage") or {}).get("value", ""))

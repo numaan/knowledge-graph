@@ -52,6 +52,16 @@
       "optionalClientScopes": ["kg:write"]
     },
     {
+      "clientId": "kg-web",
+      "name": "Web app login (authorization code); its access token goes to the MCP server and the control API",
+      "publicClient": false,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["http://localhost:3000/*", "http://127.0.0.1:3000/*"],
+      "defaultClientScopes": ["kg-mcp", "basic", "profile", "email"],
+      "optionalClientScopes": ["kg:write"]
+    },
+    {
       "clientId": "kg-agent-admin",
       "publicClient": false,
       "serviceAccountsEnabled": true,

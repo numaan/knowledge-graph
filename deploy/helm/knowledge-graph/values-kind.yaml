@@ -93,6 +93,13 @@ dagster:
         envSecrets:
           - name: kg-credentials
           - name: kg-source-credentials
+        env:
+          - name: DATABASE_URL
+            valueFrom:
+              secretKeyRef: { name: kg-control, key: DATABASE_URL, optional: true }
+          - name: KG_SECRET_KEY
+            valueFrom:
+              secretKeyRef: { name: kg-control, key: KG_SECRET_KEY, optional: true }
         volumes:
           - name: source-archive
             persistentVolumeClaim:

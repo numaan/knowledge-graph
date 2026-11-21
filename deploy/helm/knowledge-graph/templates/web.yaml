@@ -39,6 +39,11 @@ spec:
             # The web app calls the REST layer of the MCP server (same pod network, no browser access needed).
             - name: KG_API_URL
               value: {{ $w.apiUrl | default (printf "http://%s-mcp:%v" $name .Values.mcp.port) | quote }}
+            {{- if .Values.control.enabled }}
+            # Admin UI: the proxy route /api/admin forwards to the control API.
+            - name: CONTROL_API_URL
+              value: {{ printf "http://%s-control:%v" $name .Values.control.port | quote }}
+            {{- end }}
             {{- if $w.oidc.issuer }}
             - name: OIDC_ISSUER
               value: {{ $w.oidc.issuer | quote }}

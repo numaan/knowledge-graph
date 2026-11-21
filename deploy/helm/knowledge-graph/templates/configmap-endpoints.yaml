@@ -66,6 +66,14 @@ data:
   {{- with (.Values.sources.people).aliasesFile }}
   PEOPLE_ALIASES: {{ . | quote }}
   {{- end }}
+  {{- if .Values.control.enabled }}
+  {{- /* The sensor in the Dagster user code runs the same SSRF guard as the control API; give it the same switches. */}}
+  {{- range $k := list "KG_CONTROL_ALLOW_PRIVATE" "KG_CONTROL_ALLOW_HTTP" }}
+  {{- with index $.Values.control.env $k }}
+  {{ $k }}: {{ . | quote }}
+  {{- end }}
+  {{- end }}
+  {{- end }}
   {{- with .Values.observability.otlpEndpoint }}
   OTEL_EXPORTER_OTLP_ENDPOINT: {{ . | quote }}
   {{- end }}
