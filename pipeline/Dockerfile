@@ -50,7 +50,7 @@ RUN if [ "$WITH_DOTNET" = "1" ]; then \
 WORKDIR /app
 COPY pyproject.toml ./
 COPY kg_pipeline ./kg_pipeline
-RUN pip install --no-cache-dir ".[dagster,control]"
+RUN pip install --no-cache-dir ".[dagster,control,s3]"
 
 # /opt/dagster/dagster_home: the Helm chart sets DAGSTER_HOME there; run pods write compute logs under it
 RUN useradd --create-home --uid 10001 kg && git config --system --add safe.directory '*' \

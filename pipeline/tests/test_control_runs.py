@@ -265,10 +265,23 @@ def test_disabled_source_gives_409(client, app):
     assert app.state.dagster.launched == []
 
 
-def test_s3_gives_501(client, app):
+def test_s3_run_launches_s3_job(client, app):
     sid = make(client, S3)
     r = client.post(f"/api/v1/sources/{sid}/run")
-    assert r.status_code == 501 and "s3_documents asset not available yet" in r.json()["error"]
+    assert r.status_code == 202, r.text
+    assert len(app.state.dagster.launched) == 1
+    launched = app.state.dagster.launched[0]
+    assert launched["job"] == dc.S3_JOB == "s3_job"
+    assert dc.JOB_BY_KIND["s3"] == "s3_job"
+    assert launched["tags"] == {"kg/source": "docs", "kg/source_id": sid, "kg/run_id": r.json()["id"],
+                                "kg/mode": "incremental"}
+    assert "dagster/partition" not in launched["tags"]
+
+
+def test_disabled_s3_source_gives_409(client, app):
+    sid = make(client, S3)
+    client.patch(f"/api/v1/sources/{sid}", json={"enabled": False})
+    assert client.post(f"/api/v1/sources/{sid}/run").status_code == 409
     assert app.state.dagster.launched == []
 
 
@@ -492,12 +505,16 @@ def test_run_s3_endpoint_is_guarded_and_allow_private_lets_it_pass(client, app, 
     from kg_pipeline.control import probe
     sid = make(client, {**S3, "config": {"bucket": "b", "endpoint": "https://minio.internal"}})
     monkeypatch.setattr(probe, "resolve", lambda host: ["127.0.0.1"])
-    # s3 has no job yet (501), so test the helper directly
+    r = client.post(f"/api/v1/sources/{sid}/run", json={})
+    assert r.status_code == 400 and r.json()["error"].startswith("SSRF guard")
+    assert app.state.dagster.launched == []
     with pytest.raises(probe.Blocked, match="SSRF guard"):
         probe.guard_source("s3", {"bucket": "b", "endpoint": "https://minio.internal"})
     monkeypatch.setenv("KG_CONTROL_ALLOW_PRIVATE", "1")
     probe.guard_source("s3", {"bucket": "b", "endpoint": "https://minio.internal"})
     probe.guard_source("s3", {"bucket": "b"})  # no endpoint: nothing to check
+    r = client.post(f"/api/v1/sources/{sid}/run", json={})
+    assert r.status_code == 202, r.text
+    assert app.state.dagster.launched[0]["job"] == dc.S3_JOB
     gid = make(client, GIT)
     assert client.post(f"/api/v1/sources/{gid}/run", json={}).status_code == 202
-    assert sid

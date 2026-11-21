@@ -50,7 +50,7 @@ export default async function AdminPage() {
                   </td>
                   <td>{s.schedule ? <code>{s.schedule}</code> : "manual"}</td>
                   <td><EnabledToggle id={s.id} name={s.name} enabled={s.enabled} /></td>
-                  <td><SourceRowActions id={s.id} name={s.name} /></td>
+                  <td><SourceRowActions id={s.id} name={s.name} kind={s.kind} /></td>
                 </tr>
               ))}
             </tbody>

@@ -168,7 +168,7 @@ export function SourceForm({ source }: { source?: Source }) {
       <fieldset>
         <legend>Connection</legend>
         {kind === "s3" && (
-          <p role="note" className="notice">The S3 pipeline is not available yet. You can save and test an S3 source, but Run returns 501 (not implemented).</p>
+          <p role="note" className="notice">Without access keys the source uses anonymous access. A custom endpoint must use https. Hosts inside the cluster need KG_CONTROL_ALLOW_PRIVATE on the server (see the runbook).</p>
         )}
         {CONFIG_FIELDS[kind].map((f) => (
           <TextField key={f.name} id={f.name} label={f.label} value={values[f.name] ?? ""} onChange={(v) => set(f.name, v)}
