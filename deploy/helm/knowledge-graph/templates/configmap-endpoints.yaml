@@ -46,6 +46,8 @@ data:
   LLM_CONTEXT_TOKENS: {{ .Values.llm.contextTokens | quote }}
   SUMMARY_LLM: {{ ternary "on" "off" .Values.llm.enabled | quote }}
   SUMMARY_BUDGET: {{ .Values.llm.summaryBudget | default 300 | quote }}
+  COMMUNITY_LLM: {{ ternary "on" "off" .Values.llm.enabled | quote }}
+  COMMUNITY_BUDGET: {{ .Values.llm.communityBudget | default 100 | quote }}
   FRESHNESS_LLM: {{ ternary "on" "off" (and .Values.llm.enabled .Values.llm.freshnessCheck) | quote }}
   FRESHNESS_LLM_BUDGET: {{ .Values.llm.freshnessBudget | default 20 | quote }}
   SOURCE_ARCHIVE_PATH: {{ .Values.archive.mountPath | quote }}

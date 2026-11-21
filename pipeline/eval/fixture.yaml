@@ -50,3 +50,19 @@ answer:
   - question: How is the order total computed?
     expect: [order_total]
     facts: [discount, tax]
+
+# Global questions for GraphRAG communities (kg-communities --report, extractive reports, fake embedder).
+# A case passes when one expect_any text appears (case-insensitive) in the title, summary or findings of
+# the top 5 reports. The names are functions of the fixture; titles and findings list member names.
+# min_communities is documentation: the gate itself is --min-communities in ci.yml.
+communities:
+  min_communities: 2
+  cases:
+    - question: How does checkout place, cancel and refund an order?
+      expect_any: [place_order, cancel_order, refund_order, order_total]
+    - question: How does the warehouse keep track of stock and supplier deliveries?
+      expect_any: [reserve_stock, release_stock, restock_book, low_stock_report]
+    - question: How are prices, discounts, tax and loyalty points worked out?
+      expect_any: [apply_discount, compute_tax, order_total, award_loyalty_points]
+    - question: How do customers sign in, sign out and reset a password?
+      expect_any: [login, logout, request_password_reset, reset_password]

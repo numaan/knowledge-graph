@@ -18,6 +18,8 @@ dagster = ["dagster==1.13.28", "dagster-postgres==0.29.28", "dagster-k8s==0.29.2
 control = ["fastapi>=0.115", "uvicorn>=0.30", "cryptography>=43", "PyJWT[crypto]>=2.9", "dagster-graphql==1.13.28", "httpx>=0.27", "sqlalchemy>=2.0,<2.1"]
 # S3-compatible object storage source (kg_pipeline/sources/s3.py); boto3 is imported lazily
 s3 = ["boto3==1.43.110"]
+# Leiden community detection for GraphRAG (kg_pipeline/communities.py); imported lazily, a pure-Python fallback runs without it
+graphrag = ["graspologic-native==1.3.1"]
 dev = ["pytest>=8", "ruff>=0.14"]
 # OpenTelemetry tracing (kg_pipeline/telemetry.py); off unless OTEL_EXPORTER_OTLP_ENDPOINT is set
 otel = ["opentelemetry-sdk>=1.38,<2", "opentelemetry-exporter-otlp-proto-http>=1.38,<2"]
@@ -46,6 +48,7 @@ kg-permissions = "kg_pipeline.sources.permissions:main"
 kg-review = "kg_pipeline.review:main"
 kg-fake-embedder = "kg_pipeline.fake_embed:main"
 kg-backup = "kg_pipeline.backup:main"
+kg-communities = "kg_pipeline.communities:main"
 
 [build-system]
 requires = ["setuptools>=69"]

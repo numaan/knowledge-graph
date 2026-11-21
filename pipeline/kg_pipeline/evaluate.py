@@ -79,6 +79,63 @@ def eval_requirements(w: Neo4jWriter, repo: str, cases: list[dict]) -> dict:
             "accuracy": round(sum(r["got"] == r["expected"] for r in checked) / max(1, len(checked)), 3), "rows": rows}
 
 
+def acl_purity(rows: list[dict]) -> float:
+    """Share of communities whose members all sit in one ACL partition. rows: {id, keys: [partition keys]}."""
+    if not rows:
+        return 1.0
+    return round(sum(len(set(map(tuple, r["keys"]))) <= 1 for r in rows) / len(rows), 3)
+
+
+def report_coverage(communities: list[str], reports: list[dict]) -> float:
+    """Share of communities that have a report. reports: dicts with `community_id`."""
+    if not communities:
+        return 1.0
+    have = {r["community_id"] for r in reports}
+    return round(sum(c in have for c in communities) / len(communities), 3)
+
+
+def global_hit(expect_any: list[str], reports: list[dict]) -> bool:
+    """True when any expected text occurs (case-insensitive) in the title, summary or findings of a report."""
+    text = "\n".join(" ".join([str(r.get("title") or ""), str(r.get("summary") or ""),
+                              " ".join(map(str, r.get("findings") or []))]) for r in reports).lower()
+    return any(str(x).lower() in text for x in expect_any if str(x))
+
+
+GLOBAL_TOP = 5
+
+
+def eval_communities(w: Neo4jWriter, emb: Embedder, repo: str, spec) -> dict:
+    """Community metrics: ACL purity, report coverage and global-question hits. `spec` is the
+    `communities:` section (a dict with `cases` of {question, expect_any}, or the list itself).
+    Communities are global (partitioned by ACL, not by repo), so `repo` is not a filter."""
+    cases = spec if isinstance(spec, list) else (spec or {}).get("cases", [])
+    communities = [r.data() if hasattr(r, "data") else dict(r) for r in w._run(
+        "MATCH (c:Community) RETURN c.id AS id, c.level AS level, c.acl AS acl ORDER BY c.id").records]
+    if not communities:
+        return {"communities_created": 0, "skipped": "no communities", "cases": len(cases), "rows": []}
+    from .communities import partition_key
+
+    keys: dict[str, list] = {}
+    for r in w._run("MATCH (m)-[:IN_COMMUNITY]->(c:Community) RETURN DISTINCT c.id AS cid, m.acl AS acl, m.repo AS repo").records:
+        keys.setdefault(r["cid"], []).append(partition_key({"acl": r["acl"], "repo": r["repo"]}))
+    reports = [{"community_id": r["community_id"]} for r in w._run(
+        "MATCH (r:CommunityReport) RETURN r.community_id AS community_id").records]
+    rows = []
+    for c in cases:
+        vec = emb.query(c["question"])
+        top = [{"community_id": r["community_id"], "title": r["title"], "summary": r["summary"], "findings": r["findings"]}
+               for r in w._run(
+                   "CALL db.index.vector.queryNodes('community_report_embedding', $n, $v) YIELD node, score "
+                   "RETURN node.community_id AS community_id, node.title AS title, node.summary AS summary, "
+                   "node.findings AS findings ORDER BY score DESC", n=GLOBAL_TOP, v=vec).records]
+        rows.append({"question": c["question"], "hit": global_hit(c.get("expect_any", []), top),
+                     "top": [t["title"] for t in top[:3]]})
+    return {"communities_created": len(communities),
+            "acl_purity": acl_purity([{"id": c["id"], "keys": keys.get(c["id"], [])} for c in communities]),
+            "report_coverage": report_coverage([c["id"] for c in communities], reports),
+            "global_hits": round(sum(r["hit"] for r in rows) / max(1, len(rows)), 3), "rows": rows}
+
+
 def report(name: str, res: dict) -> str:
     s, i, q = res["search"], res["impact"], res["requirements"]
     out = [f"# Evaluation: {name}", "",
@@ -107,6 +164,17 @@ def report(name: str, res: dict) -> str:
                 f"| Seconds per question | {a['seconds_per_question']} |", ""]
         out += [f"- {r['question']}: missing citations {r['missing_citations']}, missing facts {r['missing_facts']}"
                 for r in a["rows"] if r["missing_citations"] or r["missing_facts"] or r["invalid_citations"]] or ["- no misses"]
+    g = res.get("communities")
+    if g and g.get("skipped"):
+        out += ["", "## Communities", "", f"- skipped: {g['skipped']}"]
+    elif g:
+        out += ["", "## Communities", "", "| Metric | Value |", "|---|---|",
+                f"| Communities | {g['communities_created']} |",
+                f"| ACL purity | {g['acl_purity']:.0%} |",
+                f"| Report coverage | {g['report_coverage']:.0%} |"]
+        if g["rows"]:
+            out += [f"| Global question hits | {g['global_hits']:.0%} ({len(g['rows'])} questions) |", ""]
+            out += [f"- {r['question']} → top: {', '.join(map(str, r['top']))}" for r in g["rows"] if not r["hit"]] or ["- no misses"]
     return "\n".join(out) + "\n"
 
 
@@ -118,11 +186,14 @@ def run(w: Neo4jWriter, emb: Embedder, spec: dict, judge: str = "string", mcp_ur
 
         llm = LLM()
     cache = Path(os.environ["LLM_CACHE_DIR"]) if os.environ.get("LLM_CACHE_DIR") else None
-    return {"repo": repo, "k": k,
-            "search": eval_search(w, emb, repo, spec.get("search", []), k),
-            "impact": eval_impact(w, repo, spec.get("impact", [])),
-            "requirements": eval_requirements(w, repo, spec.get("requirements", [])),
-            "answer": eval_answers(w, repo, spec.get("answer", []), mcp_url, judge, llm, cache)}
+    res = {"repo": repo, "k": k,
+           "search": eval_search(w, emb, repo, spec.get("search", []), k),
+           "impact": eval_impact(w, repo, spec.get("impact", [])),
+           "requirements": eval_requirements(w, repo, spec.get("requirements", [])),
+           "answer": eval_answers(w, repo, spec.get("answer", []), mcp_url, judge, llm, cache)}
+    if "communities" in spec:  # optional section; absent keeps the result shape unchanged
+        res["communities"] = eval_communities(w, emb, repo, spec["communities"])
+    return res
 
 
 def gate_failures(res: dict, gates: dict[str, float]) -> list[str]:
@@ -133,6 +204,11 @@ def gate_failures(res: dict, gates: dict[str, float]) -> list[str]:
     if a.get("cases") and not a.get("skipped"):
         values |= {"min_citation_recall": a["citation_recall"], "min_citation_validity": a["citation_validity"],
                    "min_fact_coverage": a["fact_coverage"]}
+    c = res.get("communities")
+    if c is not None:  # only when the section ran; zero communities fails min_communities only
+        values["min_communities"] = c.get("communities_created", 0)
+        if c.get("communities_created") and not c.get("skipped"):
+            values |= {"min_acl_purity": c["acl_purity"], "min_report_coverage": c["report_coverage"]}
     return [f"{name[4:]} {values[name]} < {limit}" for name, limit in gates.items()
             if limit and values.get(name) is not None and values[name] < limit]
 
@@ -147,10 +223,15 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--min-citation-recall", type=float, default=0.0)
     ap.add_argument("--min-citation-validity", type=float, default=0.0)
     ap.add_argument("--min-fact-coverage", type=float, default=0.0)
+    ap.add_argument("--min-communities", type=float, default=0.0, help="exit 1 below this number of communities")
+    ap.add_argument("--min-acl-purity", type=float, default=0.0, help="exit 1 below this share of ACL-pure communities")
+    ap.add_argument("--min-report-coverage", type=float, default=0.0, help="exit 1 below this share of communities with a report")
     ap.add_argument("--judge", choices=["string", "llm"], default="string", help="fact check for answer cases")
     ap.add_argument("--mcp-url", help="MCP endpoint for answer cases (default: KG_MCP_URL)")
     args = ap.parse_args(argv)
     spec = yaml.safe_load(args.spec.read_text(encoding="utf-8"))
+    if (args.min_communities or args.min_acl_purity or args.min_report_coverage) and "communities" not in spec:
+        spec["communities"] = {}  # a community gate runs the section even when the spec has none
     with Neo4jWriter(os.environ.get("NEO4J_URI", "bolt://localhost:7687"), os.environ.get("NEO4J_USER", "neo4j"),
                      os.environ["NEO4J_PASSWORD"]) as w:
         res = run(w, Embedder(), spec, args.judge, args.mcp_url)
